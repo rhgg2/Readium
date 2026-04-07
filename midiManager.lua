@@ -1,5 +1,5 @@
 --------------------
--- newTakeManager(take)
+-- newMidiManager(take)
 --
 -- Creates an abstraction layer over REAPER's MIDI take API, providing
 -- UUID-based note identity, persistent per-note metadata via take
@@ -7,34 +7,34 @@
 -- and sysex/text events.
 --
 -- CONSTRUCTION
---   local mgr = newTakeManager(take)   -- load immediately
---   local mgr = newTakeManager(nil)    -- create empty, call mgr:load(take) later
+--   local mm = newMidiManager(take)   -- load immediately
+--   local mm = newMidiManager(nil)    -- create empty, call mm:load(take) later
 --
 -- LIFECYCLE
---   mgr:load(take)                     -- (re)initialise from a REAPER take
---   mgr:reload()                       -- reloads from mgr.take
+--   mm:load(take)                     -- (re)initialise from a REAPER take
+--   mm:reload()                       -- reloads active take, if present
 --
 -- MESSAGING
---   mgr:addCallback(fn)                -- add a callback function
+--   mm:addCallback(fn)                -- add a callback function
 --     On any mutation or reload, the manager will call 'fn' with the
---     signature fn(changes, mgr), where mgr is a reference to the manager,
+--     signature fn(changes, mm), where mm is a reference to the manager,
 --     and changes is a table of the form { take = false, data = true }
 --     where the boolean values indicate whether the take and/or the
 --     take data (notes, cc, sysex) have changed.
---   mgr:removeCallback(fn)             -- remove a callback function
+--   mm:removeCallback(fn)             -- remove a callback function
 --
 -- MUTATION
 --   All mutations (assign*, add*, delete*) must be performed inside a
---   mgr:modify(fn) call. modify() acquires a lock, disables MIDI sort,
+--   mm:modify(fn) call. modify() acquires a lock, disables MIDI sort,
 --   calls fn(), re-sorts, and then reloads. Calling any mutation
 --   function outside of modify() will print an error and return nil.
 --   Exception: assignNote calls which ONLY assign metadata are
 --   permitted outside of a modify() call.
 --
---   mgr:modify(function()
---     mgr:addNote({ppq=0, endppq=960, chan=0, pitch=60, vel=100})
---     mgr:assignNote(0, {vel=80})
---     mgr:deleteCC(3)
+--   mm:modify(function()
+--     mm:addNote({ppq=0, endppq=960, chan=0, pitch=60, vel=100})
+--     mm:assignNote(0, {vel=80})
+--     mm:deleteCC(3)
 --   end)
 --
 -- CONVENTIONS
@@ -47,48 +47,47 @@
 --   - velocity/values are 0..127 except where otherwise noted
 --
 -- NOTES  (location-based access, identified internally by uuid)
---   mgr:getNote(loc)                   -- returns a copy of the note at location, or nil
---   mgr:getNoteByUUID(uuid)            -- returns a copy of the note with uuid, or nil
---   mgr:notes()                        -- iterator: for loc, note in mgr:notes() do ... end
---   mgr:assignNote(loc, t)             -- update existing note at location
+--   mm:getNote(loc)                   -- returns a copy of the note at location, or nil
+--   mm:getNoteByUUID(uuid)            -- returns a copy of the note with uuid, or nil
+--   mm:notes()                        -- iterator: for loc, note in mm:notes() do ... end
+--   mm:assignNote(loc, t)             -- update existing note at location
 --     Only provided fields in t are changed (ppq, endppq, chan, pitch,
 --     vel, plus any custom metadata fields). Automatically updates the
 --     notation event if ppq, chan, or pitch changed.
 --     Assigning util.REMOVE to a metadata field removes it entirely.
---   mgr:addNote(t)                     -- create a new note
+--   mm:addNote(t)                     -- create a new note
 --     t must contain ppq, endppq, chan, pitch, and vel.
 --     A new UUID is assigned automatically. Returns the new location.
---   mgr:deleteNote(loc)                -- delete note at location
+--   mm:deleteNote(loc)                -- delete note at location
 --     Removes both the MIDI note and its notation-event UUID marker.
 --
 -- CCs  (location-based access)
---   mgr:getCC(loc)                     -- returns a copy of the CC at location, or nil
---   mgr:ccs()                          -- iterator: for loc, cc in mgr:ccs() do ... end
---   mgr:assignCC(loc, t)               -- update existing CC at location
+--   mm:getCC(loc)                     -- returns a copy of the CC at location, or nil
+--   mm:ccs()                          -- iterator: for loc, cc in mm:ccs() do ... end
+--   mm:assignCC(loc, t)               -- update existing CC at location
 --     Supports msgType change; val is decoded per type:
 --       cc  -> t.cc, t.val       pb -> t.val (-8192..8191)
 --       pa  -> t.pitch, t.val    pc/at -> t.val
---   mgr:addCC(t)                       -- create a new CC event
+--   mm:addCC(t)                       -- create a new CC event
 --     t must contain ppq, chan, and val. Defaults to msgType 'cc'.
 --     Returns the new location.
---   mgr:deleteCC(loc)                  -- delete CC at location
+--   mm:deleteCC(loc)                  -- delete CC at location
 --
 -- SYSEX / TEXT  (location-based access)
---   mgr:getSysex(loc)                  -- returns a copy of the sysex entry at location, or nil
---   mgr:sysexes()                      -- iterator: for loc, sx in mgr:sysexes() do ... end
---   mgr:assignSysex(loc, t)            -- update existing sysex/text event at location
---   mgr:addSysex(t)                    -- create a new sysex/text event
+--   mm:getSysex(loc)                  -- returns a copy of the sysex entry at location, or nil
+--   mm:sysexes()                      -- iterator: for loc, sx in mm:sysexes() do ... end
+--   mm:assignSysex(loc, t)            -- update existing sysex/text event at location
+--   mm:addSysex(t)                    -- create a new sysex/text event
 --     t must contain ppq, msgType, and val.
 --     msgType is one of: sysex, text, copyright, trackname,
 --     instrument, lyric, marker, cuepoint, notation.
 --     Returns the new location.
---   mgr:deleteSysex(loc)               -- delete sysex/text event at location
+--   mm:deleteSysex(loc)               -- delete sysex/text event at location
 --
 -- TAKE DATA
---   mgr:take()                         -- the current REAPER take (read-only)
---   mgr:reso()                         -- the MIDI resolution in ppq
---   mgr:length()                       -- the take length in ppq
---   mgr:editCursor()                   -- edit cursor position in ppq relative to take
+--   mm:take()                         -- the current REAPER take (read-only)
+--   mm:reso()                         -- the MIDI resolution in ppq
+--   mm:length()                       -- the take length in ppq
 --
 -- ACCESSORS
 --   All get* functions and iterators return shallow copies. Modifying a
@@ -100,7 +99,7 @@
 --   Any fields on a note table beyond the standard note-event fields
 --   (ppq, endppq, chan, pitch, vel, uuid) are treated as
 --   custom metadata and persisted to the take's extension data. These
---   survive project save/load and are restored on mgr:load().
+--   survive project save/load and are restored on mm:load().
 --------------------
 
 loadModule('util')
@@ -111,12 +110,11 @@ end
 
 --------------------
 
-function newTakeManager(take)
+function newMidiManager(take)
 
   ---------- PUBLIC DATA
 
-  local rv = {}
-  rv.take  = nil
+  local mm = {}
 
   ---------- PRIVATE DATA & FUNCTIONS
  
@@ -132,7 +130,7 @@ function newTakeManager(take)
   local callbacks = {}
 
   local function copyEntry(entry, exceptions)
-    if not entry then return nil end
+    if not entry then return end
     local val = util:assign({}, entry)
     if exceptions then
       for k,_ in pairs(exceptions) do
@@ -143,8 +141,7 @@ function newTakeManager(take)
   end
   
   local function loadMetadata()
-    if not rv.take then return nil end
-    local take = rv.take
+    if not take then return end
 
     local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_keys", "", false)
     if not (ok and keysText and keysText ~= "") then return {} end
@@ -168,8 +165,7 @@ function newTakeManager(take)
   end
 
   local function saveMetadatum(uuid)
-    if not rv.take then return nil end
-    local take = rv.take
+    if not take then return end
     
     local uuidTxt = util:toBase36(uuid)
     local data = uuidTbl[uuid]
@@ -196,8 +192,7 @@ function newTakeManager(take)
   end
 
   local function saveMetadata()
-    if not rv.take then return nil end
-    local take = rv.take
+    if not take then return end
     
     -- Collect the set of uuids we're about to write
     local newKeys = {}
@@ -227,11 +222,10 @@ function newTakeManager(take)
   end
 
   local function removeDuplicateEvents()
-    if not rv.take then return nil end
-    local take = rv.take
+    if not take then return end
     
     local ok, noteCount, ccCount, textCount = reaper.MIDI_CountEvts(take)
-    if not ok then return nil end
+    if not ok then return end
 
     local notesSeen = {}
     local notesToDelete = {}
@@ -291,22 +285,22 @@ function newTakeManager(take)
   ---------- PUBLIC FUNCTIONS
 
   -- Add callback function
-  function rv:addCallback(fn)
+  function mm:addCallback(fn)
     callbacks[fn] = true
   end
 
   -- Remove callback function
-  function rv:removeCallback(fn)
+  function mm:removeCallback(fn)
     callbacks[fn] = nil
   end
 
   -- Load take and initialise tables
-  function rv:load(take)
-    if not take then return nil end
+  function mm:load(newTake)
+    if not newTake then return end
 
     local changed = { take = false, data = true }
-    if self.take ~= take then
-      self.take = take
+    if take ~= newTake then
+      take = newTake
       changed.take = true
     end
 
@@ -330,7 +324,7 @@ function newTakeManager(take)
 
     -- get note data
     local ok, noteCount, ccCount, textCount = reaper.MIDI_CountEvts(take)
-    if not ok then return nil end
+    if not ok then return end
 
     for i = 0, noteCount-1 do
       local ok, selected, muted, ppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
@@ -515,46 +509,42 @@ function newTakeManager(take)
     end
   end
 
-  function rv:reload()
-    if not self.take then return nil end
-    self:load(self.take)
+  function mm:reload()
+    if not take then return end
+    self:load(take)
   end
 
 
   --- LOCKING
 
   local function checkLock()
-    if not lock then
-      print("Error! You must call modification functions via modify()!")
-      return false
-    end
-    return true
+    assert(lock, "Error! You must call modification functions via modify()!")
   end
 
-  function rv:modify(fn)
-    if not self.take then return nil end
+  function mm:modify(fn)
+    if not take then return end
       
     lock = true
-    reaper.MIDI_DisableSort(self.take)
+    reaper.MIDI_DisableSort(take)
     pcall(fn)
-    reaper.MIDI_Sort(self.take)
+    reaper.MIDI_Sort(take)
     self:reload()
     lock = false
   end
 
   --- NOTE FUNCTIONS. 
 
-  function rv:getNote(loc)
+  function mm:getNote(loc)
     local note = noteTbl[loc]
     return copyEntry(note, { idx = true, uuidIdx = true })
   end
 
-  function rv:getNoteByUUID(uuid)
+  function mm:getNoteByUUID(uuid)
     local note = uuidTbl[uuid]
     return copyEntry(note, { idx = true, uuidIdx = true })
   end
 
-  function rv:notes()
+  function mm:notes()
     local i = 0
     return function()
       i = i + 1
@@ -565,13 +555,11 @@ function newTakeManager(take)
     end
   end
 
-  function rv:deleteNote(loc)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:deleteNote(loc)
+    if not (take and checkLock()) then return end
 
     local note = loc and noteTbl[loc]
-    if not note then return nil end
+    if not note then return end
 
     -- remove the notation event first
     reaper.MIDI_DeleteTextSysexEvt(take, note.uuidIdx)
@@ -582,14 +570,13 @@ function newTakeManager(take)
     noteTbl[loc] = nil
   end
 
-  function rv:assignNote(loc, t)
-    local take = self.take
-    if not take then return nil end
+  function mm:assignNote(loc, t)
+    if not take then return end
 
     if not (t.ppq or t.endppq or t.pitch or t.vel) then
       -- just metadata, allow without lock
       local note = loc and noteTbl[loc]
-      if not note then return nil end
+      if not note then return end
 
       util:assign(note, t)
 
@@ -597,10 +584,10 @@ function newTakeManager(take)
       return
     end
     
-    if not checkLock() then return nil end
+    if not checkLock() then return end
 
     local note = loc and noteTbl[loc]
-    if not note then return nil end
+    if not note then return end
 
     local chan
     if t.chan then chan = t.chan - 1 end
@@ -619,10 +606,8 @@ function newTakeManager(take)
     saveMetadatum(note.uuid)
   end
 
-  function rv:addNote(t)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:addNote(t)
+    if not (take and checkLock()) then return end
 
     if t.ppq == nil or t.endppq == nil or t.chan == nil or t.pitch == nil or t.vel == nil then
       print('Error! Underspecified new note')
@@ -650,12 +635,12 @@ function newTakeManager(take)
 
   --- CC FUNCTIONS
   
-  function rv:getCC(loc)
+  function mm:getCC(loc)
     local msg = ccTbl[loc]
     return copyEntry(msg, { idx = true })
   end
 
-  function rv:ccs()
+  function mm:ccs()
     local i = 0
     return function()
       i = i + 1
@@ -666,13 +651,11 @@ function newTakeManager(take)
     end
   end
 
-  function rv:deleteCC(loc)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:deleteCC(loc)
+    if not (take and checkLock()) then return end
 
     local msg = loc and ccTbl[loc]
-    if not msg then return nil end
+    if not msg then return end
 
     reaper.MIDI_DeleteCC(take, msg.idx)
     ccTbl[loc] = nil
@@ -681,7 +664,7 @@ function newTakeManager(take)
   -- reconstruct msg2/msg3 from semantic fields depending on type
   local function reconstruct(tbl)
     local msgType = tbl.msgType
-    if not msgType then return nil end
+    if not msgType then return end
     
     local msg2, msg3
     if msgType == 'pb' then
@@ -701,13 +684,11 @@ function newTakeManager(take)
     return msg2, msg3
   end
 
-  function rv:assignCC(loc, t)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:assignCC(loc, t)
+    if not (take and checkLock()) then return end
 
     local msg = loc and ccTbl[loc]
-    if not msg then return nil end
+    if not msg then return end
     
     local chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
 
@@ -736,10 +717,8 @@ function newTakeManager(take)
     if msg.msgType ~= 'pa' then msg.pitch = nil end
   end
 
-  function rv:addCC(t)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:addCC(t)
+    if not (take and checkLock()) then return end
 
     if t.msgType == nil then t.msgType = 'cc' end
 
@@ -772,12 +751,12 @@ function newTakeManager(take)
 
   --- SYSEX FUNCTIONS
 
-  function rv:getSysex(loc)
+  function mm:getSysex(loc)
     local sysex = sysexTbl[loc]
     return copyEntry(sysex, { idx = true })
   end
 
-  function rv:sysexes()
+  function mm:sysexes()
     local i = 0
     return function()
       i = i + 1
@@ -788,25 +767,21 @@ function newTakeManager(take)
     end
   end
 
-  function rv:deleteSysex(loc)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:deleteSysex(loc)
+    if not (take and checkLock()) then return end
 
     local sysex = loc and sysexTbl[loc]
-    if not sysex then return nil end
+    if not sysex then return end
 
     reaper.MIDI_DeleteTextSysexEvt(take, sysex.idx)
     sysexTbl[loc] = nil
   end
 
-  function rv:assignSysex(loc, t)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:assignSysex(loc, t)
+    if not (take and checkLock()) then return end
 
     local sysex = loc and sysexTbl[loc]
-    if not sysex then return nil end
+    if not sysex then return end
 
     -- resolve eventtype from msgType
     local eventTypeLUT = {
@@ -829,10 +804,8 @@ function newTakeManager(take)
     util:assign(sysex, t)
   end
 
-  function rv:addSysex(t)
-    local take = self.take
-    if not take then return nil end
-    if not checkLock() then return nil end
+  function mm:addSysex(t)
+    if not (take and checkLock()) then return end
 
     -- resolve eventtype from msgType
     local eventTypeLUT = {
@@ -872,30 +845,26 @@ function newTakeManager(take)
 
   --- TAKE DATA
 
-  function rv:take()
-    return self.take
-  end
-  
-  function rv:reso()
-    if not self.take then return end
-    return reaper.MIDI_GetPPQPosFromProjQN(self.take, 1) - reaper.MIDI_GetPPQPosFromProjQN(self.take, 0)
+  function mm:take()
+    return take
   end
 
-  function rv:length()
-    if not self.take then return end
+  -- resolution in PPQ per QN
+  function mm:reso()
+    if not take then return end
+    return reaper.MIDI_GetPPQPosFromProjQN(take, 1) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
+  end
+
+  -- length in PPQ (discounting looping)
+  function mm:length()
+    if not take then return end
     local source = reaper.GetMediaItemTake_Source(take)
     local sourceLengthQN = reaper.GetMediaSourceLength(source)
-    return reaper.MIDI_GetPPQPosFromProjQN(self.take, sourceLengthQN) - reaper.MIDI_GetPPQPosFromProjQN(self.take, 0)
-  end
-
-  function rv:editCursor()
-    if not self.take then return end
-    local editCursorTime = reaper.GetCursorPosition()
-    return reaper.MIDI_GetPPQPosFromProjTime(self.take, editCursorTime)
+    return reaper.MIDI_GetPPQPosFromProjQN(take, sourceLengthQN) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
   end
 
   ---------- FACTORY BODY
 
-  if take then rv:load(take) end
-  return rv
+  if take then mm:load(take) end
+  return mm
 end

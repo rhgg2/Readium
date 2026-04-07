@@ -1,22 +1,37 @@
 --------------------
--- newTakeParser(takeManager, opts)
+-- newTrackerManager(midiManager, opts)
 --
--- Factory that attaches to a TakeManager, parses its MIDI data into
--- the channel/column data structure, and rebuilds on any change.
+-- Factory that attaches to a MIDIManager, parses its MIDI data into
+-- a tracker data structure, and provides functionality for updating
+-- that data. Reparses automatically on any mutation of the MIDI data.
 --
--- opts:
---   overlapThreshold  (number) max overlap in quarter notes before
---                     a note is pushed to a new column. Default: 0
---   trackOpts         (table)  optional trackOpts to attach
+-- CONSTRUCTION
+--   local tm = newTrackerManager(mm)
+--     attach to MIDIManger mm
+--   local tm = newTrackerManager(nil)
+--     create empty, call tm:attach(mm) later
 --
--- Returns a parser object with:
---   parser.take        -- the built take data structure
---   parser:rebuild()   -- manually trigger a rebuild
---   parser:detach()    -- remove callback from the manager
+-- LIFECYCLE
+--   tm:rebuild()    -- manually trigger a rebuild
+--   tm:detach()     -- remove callback from the manager
+--   tm:attach(mm)   -- attach to new MIDI manager mm
+--
+-- MESSAGING
+--   tm:addCallback(fn)                -- add a callback function
+--     On any mutation or reload, the manager will call 'fn' with the
+--     signature fn(changes, tm), where tm is a reference to the manager,
+--     and changes is a table of the form { take = false, data = true }
+--     where the boolean values indicate whether the underlying take and/or
+--     the take data (notes, cc, sysex) have changed.
+--   tm:removeCallback(fn)             -- remove a callback function
+--
+-- PUBLIC DATA
+--   tm:state()         -- the built tracker state table
+
 --------------------
 
 loadModule('util')
-loadModule('takeManager')
+loadModule('midiManager')
 
 local function print(...)
   return util:print(...)
@@ -24,15 +39,17 @@ end
 
 --------------------
 
-function newTakeParser(mgr, opts)
-  opts = opts or {}
-  local parser = {}
+-- mm = midiManager to attach
 
-  local res = mgr:reso()
-  local overlapThreshold = math.floor((opts.overlapThreshold or 0) * res)
-  local trackOpts = opts.trackOpts or { pitchbendRange = 2, microtuningMode = 'pitchbend' }
+function newTrackerManager(mm)
 
-  parser.take = nil
+  ---------- PUBLIC DATA
+
+  local tm = {}
+
+  ---------- PRIVATE DATA & FUNCTIONS
+
+  local state = {}
 
   --------------------
   -- Column ID scheme:
@@ -102,7 +119,8 @@ function newTakeParser(mgr, opts)
   -- will always be spilled.
   --------------------
 
-  local function noteColumnAccepts(col, notePpq, noteEndPpq)
+  local function noteColumnAccepts(col, notePpq, noteEndPpq, overlapThreshold)
+    overlapThreshold = overlapThreshold or 0
     local dominated = 0
     for _, evt in ipairs(col.events) do
       if notePpq == evt.ppq then return false end
@@ -196,7 +214,7 @@ function newTakeParser(mgr, opts)
           local nextNote
       
           -- Iterate over raw pb messages for this channel
-          for _, cc in mgr:ccs() do
+          for _, cc in mm:ccs() do
             if cc.chan == chan and cc.msgType == "pb" then
               -- iterate over all notes up to this pitchbend message
               nextNote = col.events[loc]
@@ -240,21 +258,21 @@ function newTakeParser(mgr, opts)
     end
     
     if #toInsert > 0 then
-      mgr:modify(function()
+      mm:modify(function()
           for _, ins in ipairs(needsInsert) do
-            mgr:addCC(ins)
+            mm:addCC(ins)
           end
       end)
     end
   end
-  
+
   --------------------
   -- Core rebuild
   --------------------
 
   local rebuilding = false
 
-  function parser:rebuild()
+  function tm:rebuild()
     if rebuilding then return end
     rebuilding = true
 
@@ -270,18 +288,18 @@ function newTakeParser(mgr, opts)
     end
 
     -- 1) Assign missing metadata to notes
-    for loc, note in mgr:notes() do
+    for loc, note in mm:notes() do
       if not note.detune then
-        mgr:assignNote(loc, { detune = 0 })
+        mm:assignNote(loc, { detune = 0 })
       end
     end
 
     -- 2) Assign notes to note columns
-    for loc, note in mgr:notes() do
+    for loc, note in mm:notes() do
       local channel = channels[note.chan]
       local col  = allocateNoteColumn(channel, note)
       if not note.colID or note.colID ~= col.id then
-        mgr:assignNote(loc, { colID = col.id })
+        mm:assignNote(loc, { colID = col.id })
       end
       util:assign(note, {loc = loc, chan = util.REMOVE, colID = util.REMOVE })
       col.events[#col.events + 1] = note
@@ -289,7 +307,7 @@ function newTakeParser(mgr, opts)
     
     -- 3) Pitchbend: build logical pitchbend lane per channel
     --    Note lane 1 is used 
-    local pbRange = trackOpts.pitchbendRange or 2
+    local pbRange = 2
 
     addMissingPitchbends(channels, pbRange)
 
@@ -309,7 +327,7 @@ function newTakeParser(mgr, opts)
       end
 
       if notes then
-        for loc, cc in mgr:ccs() do
+        for loc, cc in mm:ccs() do
           if cc.chan == chan and cc.msgType == "pb" then
             if not col then
               col = getOrCreateTypedColumn(channel, "pb")
@@ -344,7 +362,7 @@ function newTakeParser(mgr, opts)
     end
 
         -- 3) CCs, aftertouch, program change
-    for loc, cc in mgr:ccs() do
+    for loc, cc in mm:ccs() do
       local channel = channels[cc.chan]
 
       if cc.msgType == "pa" then
@@ -384,7 +402,7 @@ function newTakeParser(mgr, opts)
 
 
     -- 4) Sysex / text events
-    for loc, sx in mgr:sysexes() do
+    for loc, sx in mm:sysexes() do
       local midiChan = (sx.chan or 0) + 1
       local chan = channels[midiChan]
       local col = getOrCreateTypedColumn(chan, "sx")
@@ -418,38 +436,56 @@ function newTakeParser(mgr, opts)
     end
     
     -- 7) Assemble the take structure
-    self.take = {
-      opts     = trackOpts,
+    state = {
       channels = channels,
       ppq      = ppq,
-      swing    = {},
-      timeSig  = {},
+      reso     = mm:reso(),
+      length   = mm:length(),
     }
 
     rebuilding = false
   end
 
-  --------------------
-  -- Callback wiring
-  --------------------
+  -- Attach to/detach from midiManager
+  
+  function tm:attach(mm)
+    if not mm then return end
+  
+    -- local overlapThreshold = 0 -- math.floor((opts.overlapThreshold or 0) * res)
+    -- local trackOpts = opts.trackOpts or { pitchbendRange = 2, microtuningMode = 'pitchbend' }
 
-  local function onChange(changes, _mgr)
-    if changes.data or changes.take then
-      parser:rebuild()
+    local function onChange(changes, _mm)
+      if changes.data or changes.take then
+        tm:rebuild()
+      end
     end
+
+    tm:detach()
+    mm:addCallback(onChange)
+    tm._callback = onChange
+    tm:rebuild()
   end
 
-  mgr:addCallback(onChange)
-  parser._callback = onChange
-
-  function parser:detach()
-    mgr:removeCallback(self._callback)
+  function tm:detach()
+    if self._callback then mm:removeCallback(self._callback) end
+    self._callback = nil
   end
 
-  -- Initial build
-  if mgr.take then
-    parser:rebuild()
+  --- STATE DATA
+
+  function tm:state()
+    return state
   end
 
-  return parser
+  -- edit cursor position in PPQ from start of take
+  function tm:editCursor()
+    if not mm:take() then return end
+    local editCursorTime = reaper.GetCursorPosition()
+    return reaper.MIDI_GetPPQPosFromProjTime(mm:take(), editCursorTime)
+  end
+
+  -- FACTORY BODY
+  
+  if mm then tm:attach(mm) end
+  return tm
 end

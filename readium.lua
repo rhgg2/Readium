@@ -9,9 +9,9 @@ local function print(...)
 end
 
 loadModule('util')
-loadModule('takeManager')
-loadModule('takeParser')
-loadModule('trackerView')
+loadModule('midiManager')
+loadModule('trackerManager')
+loadModule('viewManager')
 
 ---
 
@@ -36,13 +36,13 @@ function Main()
   end
 
   local take = reaper.GetActiveTake(item)
-  local tm = newTakeManager(take)
-  local tp = newTakeParser(tm)
-  util:print_r(tp.take)
+  local mm = newMidiManager(take)
+  local tm = newTrackerManager(mm)
+  util:print_r(tm:state())
 
-  local tracker = newTrackerView()
+  local tracker = newViewManager()
   tracker:init()
-  tracker:setSource(tm, tp)
+  tracker:setSource(mm, tm)
 
   local function loop()
     if tracker:loop() then

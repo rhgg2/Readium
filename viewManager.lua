@@ -1,10 +1,10 @@
 -- trackerView.lua
 -- Tracker-style MIDI viewer for ReaImGui
--- Exposes: newTrackerView()
+-- Exposes: newViewManager()
 
 loadModule('util')
-loadModule('takeManager')
-loadModule('takeParser')
+loadModule('midiManager')
+loadModule('trackerManager')
 
 local function print(...)
   return util:print(...)
@@ -21,7 +21,7 @@ local ImGui = require 'imgui' '0.10'
 -- Factory
 --------------------
 
-function newTrackerView()
+function newViewManager()
 
   ---------
   -- Config
@@ -60,8 +60,8 @@ function newTrackerView()
 
   -- take manager, take parser, ImGui context, font
   
+  local mm   = nil
   local tm   = nil
-  local tp   = nil
   local ctx  = nil
   local font = nil
   
@@ -84,7 +84,7 @@ function newTrackerView()
   
   --------------------
   -- Build row grid from parser data
-  -- Guarantees: tm, tp, tp.take, render.dx, render.dy are defined
+  -- Guarantees: mm, tm, tm:state(), render.dx, render.dy are defined
   --------------------
 
 
@@ -147,8 +147,7 @@ function newTrackerView()
       end
     end
     
-    local take = tp.take
-    local channel = take.channels[chan]
+    local channel = tm:state() and tm:state().channels and tm:state().channels[chan]
     if not channel then return end
 
     local numRows = math.ceil(state.length * state.rowPerQN / state.ppqPerQN)
@@ -255,16 +254,18 @@ function newTrackerView()
   --------------------
 
   local function drawTracker(ctx)
-    if not (tm and tp and tp.take and ctx) then return end
+    if not (mm and tm and tm:state() and ctx) then return end
 
-    local take = tp.take
+    local tmState = tm:state()
+    local channels = tmState.channels
+
     local chan = state.activeChan
-    local channel = take.channels[chan]
+    local channel = channels[chan]
     if not channel then return end
 
-    state.ppqPerQN  = tm:reso()
+    state.ppqPerQN  = tmState.reso
     state.ppqPerRow = math.floor(state.ppqPerQN / state.rowPerQN)
-    state.length    = tm:length()
+    state.length    = tmState.length
 
     if not render.dx then
       render.dx, render.dy = ImGui.CalcTextSize(ctx, "W")
@@ -276,7 +277,7 @@ function newTrackerView()
     if ImGui.BeginTabBar(ctx, "channels") then
       for c = 1, 16 do
         local hasEvents = false
-        for _, col in ipairs(take.channels[c].columns) do
+        for _, col in ipairs(channels[c].columns) do
           if #col.events > 0 then hasEvents = true; break end
         end
         if hasEvents then
@@ -444,9 +445,9 @@ function newTrackerView()
     ImGui.Attach(ctx, font)
   end
 
-  function view:setSource(takeManager, parser)
-    tm = takeManager
-    tp = parser
+  function view:setSource(newMM, newTM)
+    mm = newMM
+    tm = newTM
   end
 
   function view:loop()
@@ -465,13 +466,12 @@ function newTrackerView()
       local item = reaper.GetSelectedMediaItem(0, 0)
       if item then
         local take = reaper.GetActiveTake(item)
-        if take and tm and tm.take ~= take then
-          tm:load(take)
-          tp = newTakeParser(tm)
+        if take and mm and mm:take() ~= take then
+          mm:load(take)
         end
       end
 
-      if tp then
+      if tm then
         drawToolbar(ctx)
         drawTracker(ctx)
         drawStatusBar(ctx)
