@@ -33,10 +33,17 @@ function util:print_r(root)
   print(_dump(root, "",""))
 end
 
-function util:assign(t1,t2)
+util.REMOVE = { }
+
+function util:assign(t1,t2,createIfNil)
+  t1 = t1 or (createIfNil and { })
   if t2 then
     for k, v in pairs(t2) do
-      t1[k] = v
+      if v == util.REMOVE then
+        t1[k] = nil
+      else
+        t1[k] = v
+      end
     end
   end
   return t1
@@ -61,15 +68,15 @@ function util:serialise(value, exclude, seen)
   elseif t == "table" then
     seen = seen or {}
     if seen[value] then
-      error("cycle detected during serialization")
+      error("cycle detected during serialisation")
     end
     seen[value] = true
 
     local parts = {}
     for k, v in pairs(value) do
       if not exclude[k] then
-        local key_str = serialize(k, nil, seen)
-        local val_str = serialize(v, nil, seen)
+        local key_str = util:serialise(k, nil, seen)
+        local val_str = util:serialise(v, nil, seen)
         parts[#parts+1] = key_str .. "=" .. val_str
       end
     end
