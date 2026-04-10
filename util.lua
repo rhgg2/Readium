@@ -49,6 +49,36 @@ function util:assign(t1,t2,createIfNil)
   return t1
 end
 
+util.IDX = { }
+
+local function fillIdx(arg, val)
+  if arg == util.IDX then return val end
+  if type(arg) == 'table' then
+    local rv = {}
+    for k,v in pairs(arg) do
+      rv[k] = fillIdx(v,val)
+    end
+    return rv
+  end
+  return arg
+end
+
+
+function util:add(tbl, val)
+  local idx = #tbl+1
+  local obj = fillIdx(val, idx)
+  tbl[idx] = obj
+  return obj
+end
+
+function util:pick(src, keys)
+  local dst = {}
+  for k in keys:gmatch("%S+") do
+    dst[k] = src[k]
+  end
+  return dst
+end
+
 local function escape_string(s)
   return (s:gsub("[\\{},=]", function(c)
     return "\\" .. c

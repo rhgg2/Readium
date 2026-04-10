@@ -1,33 +1,75 @@
 --------------------
--- newTrackerManager(midiManager, opts)
+-- newTrackerManager
 --
--- Factory that attaches to a MIDIManager, parses its MIDI data into
--- a tracker data structure, and provides functionality for updating
--- that data. Reparses automatically on any mutation of the MIDI data.
+-- Factory that attaches to a midiManager, parses its MIDI data into a
+-- tracker-style data structure with channels and typed columns, and
+-- rebuilds automatically whenever the underlying MIDI data changes.
 --
 -- CONSTRUCTION
---   local tm = newTrackerManager(mm)
---     attach to MIDIManger mm
---   local tm = newTrackerManager(nil)
---     create empty, call tm:attach(mm) later
+--   local tm = newTrackerManager(mm)   -- attach to midiManager mm
+--   local tm = newTrackerManager(nil)  -- create empty, call tm:attach(mm) later
 --
 -- LIFECYCLE
---   tm:rebuild()    -- manually trigger a rebuild
---   tm:detach()     -- remove callback from the manager
---   tm:attach(mm)   -- attach to new MIDI manager mm
+--   tm:attach(mm)     -- attach to a midiManager; triggers an immediate rebuild
+--   tm:detach()       -- remove callback from the attached midiManager
+--   tm:rebuild(changed) -- manually trigger a full rebuild
 --
 -- MESSAGING
---   tm:addCallback(fn)                -- add a callback function
---     On any mutation or reload, the manager will call 'fn' with the
---     signature fn(changes, tm), where tm is a reference to the manager,
---     and changes is a table of the form { take = false, data = true }
---     where the boolean values indicate whether the underlying take and/or
---     the take data (notes, cc, sysex) have changed.
---   tm:removeCallback(fn)             -- remove a callback function
+--   tm:addCallback(fn)                -- register a callback
+--   tm:removeCallback(fn)             -- unregister a callback
+--     On rebuild, registered callbacks are called with the signature
+--     fn(changed, tm), where changed is a table of the form
+--     { take = bool, data = bool } forwarded from the midiManager.
 --
--- PUBLIC DATA
---   tm:state()         -- the built tracker state table
-
+-- REBUILD PROCESS
+--   rebuild() is guarded against re-entrant calls via a `rebuilding`
+--   flag. The rebuild process:
+--
+--   1) Initialises 16 channels, each with one empty note column.
+--   2) Iterates all notes from the midiManager. Notes missing a `detune`
+--      metadata field are assigned detune=0 via mm:assignNote() (metadata-
+--      only, does not trigger a reload). Notes are allocated to columns
+--      using an overlap-aware algorithm: a column accepts a note unless
+--      it shares a start tick with an existing note, overlaps with two or more
+--      existing notes, or overlaps more than the threshold with any note.
+--      If no existing column fits, a new note column is created. The assigned
+--      colID is persisted as note metadata.
+--   3) Runs addMissingPitchbends() to insert pitchbend events where
+--      microtuning (detune) changes between notes. This calls mm:modify()
+--      if inserts are needed; the rebuilding guard prevents the resulting
+--      reload callback from causing re-entry.
+--   4) Builds logical pitchbend columns per channel by iterating raw
+--      pitchbend CC events and compensating for per-note detune values.
+--      Hidden events (where the logical value hasn't changed) are flagged.
+--   5) Distributes remaining CC events (cc, at, pc) into typed columns
+--      per channel. Poly aftertouch events are attached to the note
+--      column containing the target pitch where possible.
+--   6) Distributes sysex/text events into per-channel sx columns.
+--   7) Sorts all column events by ppq.
+--   8) Reorders columns within each channel: note columns first, then
+--      all others, preserving relative order within each group.
+--   9) Fires callbacks.
+--
+-- CHANNEL DATA
+--   tm:getChannel(chan)               -- returns the channel table for chan (1..16)
+--   tm:channels()                     -- iterator: for chan, channel in tm:channels()
+--
+--   Each channel table contains:
+--     chan    : number (1..16)
+--     label   : string ("Channel 1", etc.)
+--     columns : array of column tables
+--
+--   Each column table contains:
+--     order  : number (position within the channel after sorting)
+--     type   : string ("note", "cc", "pb", "at", "pa", "pc", "sx")
+--     id     : number or nil (note columns: 1, 2, ...; cc columns: CC number)
+--     label  : string ("Note", "Note 2", "CC74", "PB", etc.)
+--     events : array of event tables, sorted by ppq
+--
+-- GLOBAL DATA
+--   tm:length()       -- take length in PPQ (delegated to midiManager)
+--   tm:reso()         -- PPQ per quarter note (delegated to midiManager)
+--   tm:editCursor()   -- edit cursor position in PPQ relative to the take start
 --------------------
 
 loadModule('util')
@@ -39,17 +81,21 @@ end
 
 --------------------
 
--- mm = midiManager to attach
-
-function newTrackerManager(mm)
-
-  ---------- PUBLIC DATA
-
-  local tm = {}
+function newTrackerManager(mm, cm)
 
   ---------- PRIVATE DATA & FUNCTIONS
 
-  local state = {}
+  local channels = {}
+
+  local callbacks = {}
+
+  local function cfg(key, default)
+    if cm then
+      local val = cm:get(key)
+      if val ~= nil then return val end
+    end
+    return default
+  end
 
   --------------------
   -- Column ID scheme:
@@ -59,33 +105,23 @@ function newTrackerManager(mm)
   --------------------
 
   local function addColumn(channel, type, id)
-    if type == "note" then
-      if id > 1 then label = ("Note " .. id)
-      else label = "Note"
-      end
-    elseif type == "cc" then
-      label = "CC" .. (id or "")
-    elseif type == "pb" then
-        label = "PB"
-    elseif type == "at" then
-      label = "AT"
-    elseif type == "pa" then
-      label = "PA"
-    elseif colDef.type == "pc" then
-      label = "PC"
-    else
-      label = ""
-    end
+    local colLabels = {
+      note = id and id > 1 and ("Note " .. id) or "Note",
+      cc   = "CC" .. (id or ""),
+      pb   = "PB",
+      at   = "AT",
+      pa   = "PA",
+      pc   = "PC",
+      sx   = "SX"
+    }
 
-    local col = {
+    return util:add(channel.columns, {
       order  = #channel.columns + 1,
       type   = type,
       id     = id,
-      label  = label,
+      label  = colLabels[type] or "",
       events = {},
-    }
-    channel.columns[#channel.columns + 1] = col
-    return col
+    })
   end
   
   local function addNoteColumn(channel)
@@ -119,14 +155,13 @@ function newTrackerManager(mm)
   -- will always be spilled.
   --------------------
 
-  local function noteColumnAccepts(col, notePpq, noteEndPpq, overlapThreshold)
-    overlapThreshold = overlapThreshold or 0
+  local function noteColumnAccepts(col, notePpq, noteEndPpq)
+    local overlapThreshold = cfg("overlapOffset", 0) * mm:reso()
     local dominated = 0
     for _, evt in ipairs(col.events) do
       if notePpq == evt.ppq then return false end
       if notePpq < evt.endppq and evt.ppq < noteEndPpq then
-        local overlapAmount = math.min(evt.endppq, noteEndPpq)
-          - math.max(evt.ppq, notePpq)
+        local overlapAmount = math.min(evt.endppq, noteEndPpq) - math.max(evt.ppq, notePpq)
         if overlapAmount > overlapThreshold then
           return false
         end
@@ -195,8 +230,8 @@ function newTrackerManager(mm)
   -- Precondition: all events have a "detune" parameter
   --------------------
 
-  local function addMissingPitchbends(channels, pbRange)
-    pbRange = pbRange or 2
+  local function addMissingPitchbends()
+    local pbRange = cfg("pbRange", 2)
 
     local toInsert = {}
     
@@ -259,7 +294,7 @@ function newTrackerManager(mm)
     
     if #toInsert > 0 then
       mm:modify(function()
-          for _, ins in ipairs(needsInsert) do
+          for _, ins in ipairs(toInsert) do
             mm:addCC(ins)
           end
       end)
@@ -267,21 +302,30 @@ function newTrackerManager(mm)
   end
 
   --------------------
+  -- PUBLIC FUNCTIONS
+  --------------------
+
+  local tm = {}
+
+  --------------------
   -- Core rebuild
   --------------------
 
   local rebuilding = false
 
-  function tm:rebuild()
+  -- argument tracks whether take and/or underlying data have changed
+  function tm:rebuild(changed)
     if rebuilding then return end
     rebuilding = true
 
+    changed = changed or { take = false, data = true }
+
     -- All 16 channels always exist, always contain a note column
-    local channels = {}
+    channels = {}
     for i = 1, 16 do
       channels[i] = {
         chan = i,
-        label = 'Channel ' .. i,
+        label = 'Ch ' .. i,
         columns = { },
       }
       addNoteColumn(channels[i])
@@ -306,10 +350,10 @@ function newTrackerManager(mm)
     end
     
     -- 3) Pitchbend: build logical pitchbend lane per channel
-    --    Note lane 1 is used 
-    local pbRange = 2
+    --    Note lane 1 is used
 
-    addMissingPitchbends(channels, pbRange)
+    local pbRange = cfg("pbRange", 2)
+    addMissingPitchbends()
 
     for chan = 1, 16 do
       local notes = nil
@@ -320,7 +364,7 @@ function newTrackerManager(mm)
       local channel = channels[chan]
 
       for _, c in ipairs(channel.columns) do
-        if c.id == "note:1" then
+        if c.id == 1 then
           notes = c.events
           break
         end
@@ -349,13 +393,13 @@ function newTrackerManager(mm)
             currentCents = (cc.val / 8192) * pbRange * 100
             local logicalCents = currentCents - currentDetune
 
-            col.events[#col.events + 1] = {
+            util:add(col.events, {
               ppq      = cc.ppq,
               val      = logicalCents,
               rawVal   = cc.val,
               detune   = currentDetune,
               hidden   = (logicalCents == lastLogicalCents),
-            }
+            })
           end
         end
       end
@@ -369,34 +413,21 @@ function newTrackerManager(mm)
         -- Poly AT → attach to the note column owning that pitch
         local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
         if noteCol then
-          noteCol.events[#noteCol.events + 1] = {
-            ppq = cc.ppq, type = "pa", pitch = cc.pitch, val = cc.val, loc = loc,
-          }
+          util:add(noteCol.events,{
+            ppq = cc.ppq, type = "pa", pitch = cc.pitch, vel = cc.val, loc = loc
+          })
         else
           -- Orphaned poly AT → dedicated column
           local col = getOrCreateTypedColumn(channel, "pa")
-          col.events[#col.events + 1] = {
-            ppq = cc.ppq, pitch = cc.pitch, val = cc.val,
-          }
+          util:add(col.events, {
+            ppq = cc.ppq, pitch = cc.pitch, vel = cc.val,
+          })
         end
-
-      elseif cc.msgType == "cc" then
+      else
         local col = getOrCreateTypedColumn(channel, "cc", cc.cc)
-        col.events[#col.events + 1] = {
+        util:add(col.events, {
           ppq = cc.ppq, val = cc.val, loc = loc,
-        }
-
-      elseif cc.msgType == "at" then
-        local col = getOrCreateTypedColumn(channel, "at")
-        col.events[#col.events + 1] = {
-          ppq = cc.ppq, val = cc.val, loc = loc,
-        }
-
-      elseif cc.msgType == "pc" then
-        local col = getOrCreateTypedColumn(channel, "pc")
-        col.events[#col.events + 1] = {
-          ppq = cc.ppq, val = cc.val, loc = loc,
-        }
+        })
       end
     end
 
@@ -406,12 +437,12 @@ function newTrackerManager(mm)
       local midiChan = (sx.chan or 0) + 1
       local chan = channels[midiChan]
       local col = getOrCreateTypedColumn(chan, "sx")
-      col.events[#col.events + 1] = {
+      util:add(col.events, {
         ppq     = sx.ppq,
         msgType = sx.msgType,
         val     = sx.val,
         loc     = loc,
-      }
+      })
     end
 
     -- 5) Sort every column's events by ppq
@@ -435,57 +466,91 @@ function newTrackerManager(mm)
       end
     end
     
-    -- 7) Assemble the take structure
-    state = {
-      channels = channels,
-      ppq      = ppq,
-      reso     = mm:reso(),
-      length   = mm:length(),
-    }
-
     rebuilding = false
+    
+    -- callbacks
+    for fn,_ in pairs(callbacks) do
+      fn(changed, tm)
+    end
   end
 
-  -- Attach to/detach from midiManager
+  --- ACCESSORS
   
-  function tm:attach(mm)
-    if not mm then return end
-  
-    -- local overlapThreshold = 0 -- math.floor((opts.overlapThreshold or 0) * res)
-    -- local trackOpts = opts.trackOpts or { pitchbendRange = 2, microtuningMode = 'pitchbend' }
+  function tm:getChannel(chan)
+    return channels and channels[chan]
+  end
 
-    local function onChange(changes, _mm)
-      if changes.data or changes.take then
-        tm:rebuild()
+  function tm:channels()
+    local i = 0
+    return function()
+      i = i + 1
+      local channel = channels[i]
+      if channel then
+        return i, channel
       end
     end
-
-    tm:detach()
-    mm:addCallback(onChange)
-    tm._callback = onChange
-    tm:rebuild()
   end
 
-  function tm:detach()
-    if self._callback then mm:removeCallback(self._callback) end
-    self._callback = nil
-  end
+  -- GLOBAL DATA ACCESSORS
 
-  --- STATE DATA
-
-  function tm:state()
-    return state
-  end
-
-  -- edit cursor position in PPQ from start of take
   function tm:editCursor()
-    if not mm:take() then return end
+    if not (mm and mm:take()) then return end
     local editCursorTime = reaper.GetCursorPosition()
     return reaper.MIDI_GetPPQPosFromProjTime(mm:take(), editCursorTime)
   end
 
+  function tm:length()
+    return mm and mm:length()
+  end
+
+  function tm:reso()
+    return mm and mm:reso()
+  end
+
+  -- LIFECYCLE
+
+  local callback = function(changed, _mm)
+    if changed.data or changed.take then
+      tm:rebuild(changed)
+    end
+  end
+
+  local configCallback = function(changed, _cm)
+    if changed.config then
+      tm:rebuild({ take = false, data = true })
+    end
+  end
+
+  function tm:attach(newMM, newCM)
+    if not (newMM and newCM) then return end
+
+    self:detach()
+    mm = newMM
+    cm = newCM
+    mm:addCallback(callback)
+    cm:addCallback(configCallback)
+    self:rebuild({ take = true, data = true })
+  end
+
+  function tm:detach()
+    if mm then mm:removeCallback(callback) end
+    if cm then cm:removeCallback(configCallback) end
+  end
+
+  --- MESSAGING
+
+    -- Add callback function
+  function tm:addCallback(fn)
+    callbacks[fn] = true
+  end
+
+  -- Remove callback function
+  function tm:removeCallback(fn)
+    callbacks[fn] = nil
+  end
+
   -- FACTORY BODY
   
-  if mm then tm:attach(mm) end
+  if mm and cm then tm:attach(mm, cm) end
   return tm
 end

@@ -1,10 +1,14 @@
 --------------------
--- newMidiManager(take)
+-- newMidiManager
 --
 -- Creates an abstraction layer over REAPER's MIDI take API, providing
 -- UUID-based note identity, persistent per-note metadata via take
 -- extension data, and a clean read/write interface for notes, CCs,
 -- and sysex/text events.
+--
+-- On load, duplicate MIDI events are removed, every note is assigned
+-- a unique UUID (stored as a REAPER notation event), and per-note
+-- metadata is restored from the take's extension data.
 --
 -- CONSTRUCTION
 --   local mm = newMidiManager(take)   -- load immediately
@@ -12,82 +16,86 @@
 --
 -- LIFECYCLE
 --   mm:load(take)                     -- (re)initialise from a REAPER take
---   mm:reload()                       -- reloads active take, if present
+--   mm:reload()                       -- reloads the active take, if present
 --
 -- MESSAGING
---   mm:addCallback(fn)                -- add a callback function
---     On any mutation or reload, the manager will call 'fn' with the
---     signature fn(changes, mm), where mm is a reference to the manager,
---     and changes is a table of the form { take = false, data = true }
---     where the boolean values indicate whether the take and/or the
---     take data (notes, cc, sysex) have changed.
---   mm:removeCallback(fn)             -- remove a callback function
+--   mm:addCallback(fn)                -- register a callback
+--   mm:removeCallback(fn)             -- unregister a callback
+--     On any reload (including after modify()), registered callbacks are
+--     called with the signature fn(changed, mm), where changed is a
+--     table of the form { take = bool, data = bool }. take is true when
+--     a different REAPER take has been loaded; data is always true on
+--     reload.
 --
 -- MUTATION
 --   All mutations (assign*, add*, delete*) must be performed inside a
 --   mm:modify(fn) call. modify() acquires a lock, disables MIDI sort,
---   calls fn(), re-sorts, and then reloads. Calling any mutation
---   function outside of modify() will print an error and return nil.
---   Exception: assignNote calls which ONLY assign metadata are
---   permitted outside of a modify() call.
+--   calls fn(), re-sorts, and then reloads (which fires callbacks).
+--   Calling any mutation function outside of modify() will error.
+--
+--   Exception: assignNote calls that ONLY set metadata fields (i.e. none
+--   of ppq, endppq, pitch, or vel are present in the update table) are
+--   permitted outside of modify(). These write directly to extension data
+--   via saveMetadatum() and do not trigger a reload or fire callbacks.
 --
 --   mm:modify(function()
---     mm:addNote({ppq=0, endppq=960, chan=0, pitch=60, vel=100})
---     mm:assignNote(0, {vel=80})
+--     mm:addNote({ppq=0, endppq=960, chan=1, pitch=60, vel=100})
+--     mm:assignNote(1, {vel=80})
 --     mm:deleteCC(3)
 --   end)
 --
 -- CONVENTIONS
---   in the data returned by the following functions:
---   - locations are indexed from 1
---   - location ordering is guaranteed to coincide with REAPER
---     MIDI event ordering
---   - iterators are guaranteed to return events in location ordering
---   - MIDI channels are indexed 1, .., 16
---   - velocity/values are 0..127 except where otherwise noted
+--   - Locations are 1-indexed integers assigned in REAPER event order
+--   - Location ordering is guaranteed to match REAPER MIDI event ordering
+--   - Iterators return events in location order
+--   - MIDI channels are 1..16 (offset by +1 from REAPER's 0..15)
+--   - Velocity and CC values are 0..127 except where noted
+--   - Pitchbend values are -8192..8191 (centred on 0)
 --
--- NOTES  (location-based access, identified internally by uuid)
---   mm:getNote(loc)                   -- returns a copy of the note at location, or nil
---   mm:getNoteByUUID(uuid)            -- returns a copy of the note with uuid, or nil
---   mm:notes()                        -- iterator: for loc, note in mm:notes() do ... end
---   mm:assignNote(loc, t)             -- update existing note at location
---     Only provided fields in t are changed (ppq, endppq, chan, pitch,
---     vel, plus any custom metadata fields). Automatically updates the
---     notation event if ppq, chan, or pitch changed.
---     Assigning util.REMOVE to a metadata field removes it entirely.
---   mm:addNote(t)                     -- create a new note
+-- NOTES  (location-based access, identified internally by UUID)
+--   mm:getNote(loc)                   -- returns a copy of the note, or nil
+--   mm:getNoteByUUID(uuid)            -- returns a copy of the note, or nil
+--   mm:notes()                        -- iterator: for loc, note in mm:notes()
+--   mm:assignNote(loc, t)             -- update note at location
+--     Only provided fields in t are changed. Supports ppq, endppq, chan,
+--     pitch, vel, plus any custom metadata fields. If ppq, chan, or pitch
+--     change, the associated notation event is updated to match.
+--     Assigning util.REMOVE to a metadata field removes it.
+--   mm:addNote(t)                     -- insert a new MIDI note
 --     t must contain ppq, endppq, chan, pitch, and vel.
---     A new UUID is assigned automatically. Returns the new location.
---   mm:deleteNote(loc)                -- delete note at location
---     Removes both the MIDI note and its notation-event UUID marker.
+--     A UUID is assigned automatically. Returns the new location.
+--   mm:deleteNote(loc)                -- delete note and its notation event
 --
 -- CCs  (location-based access)
---   mm:getCC(loc)                     -- returns a copy of the CC at location, or nil
---   mm:ccs()                          -- iterator: for loc, cc in mm:ccs() do ... end
---   mm:assignCC(loc, t)               -- update existing CC at location
---     Supports msgType change; val is decoded per type:
---       cc  -> t.cc, t.val       pb -> t.val (-8192..8191)
---       pa  -> t.pitch, t.val    pc/at -> t.val
---   mm:addCC(t)                       -- create a new CC event
---     t must contain ppq, chan, and val. Defaults to msgType 'cc'.
+--   mm:getCC(loc)                     -- returns a copy of the CC, or nil
+--   mm:ccs()                          -- iterator: for loc, cc in mm:ccs()
+--   mm:assignCC(loc, t)               -- update CC at location
+--     Supports msgType change. val is decoded per type:
+--       cc -> t.cc, t.val       pb -> t.val (-8192..8191)
+--       pa -> t.pitch, t.val    pc/at -> t.val
+--   mm:addCC(t)                       -- insert a new CC event
+--     t must contain ppq, chan, and val. Defaults msgType to 'cc'.
 --     Returns the new location.
 --   mm:deleteCC(loc)                  -- delete CC at location
 --
 -- SYSEX / TEXT  (location-based access)
---   mm:getSysex(loc)                  -- returns a copy of the sysex entry at location, or nil
---   mm:sysexes()                      -- iterator: for loc, sx in mm:sysexes() do ... end
---   mm:assignSysex(loc, t)            -- update existing sysex/text event at location
---   mm:addSysex(t)                    -- create a new sysex/text event
+--   mm:getSysex(loc)                  -- returns a copy, or nil
+--   mm:sysexes()                      -- iterator: for loc, sx in mm:sysexes()
+--     NOTE: the sysex iterator currently has a bug — the continuation
+--     check reads `if note then` instead of `if sysex then`, so it
+--     will never yield results.
+--   mm:assignSysex(loc, t)            -- update sysex/text event at location
+--   mm:addSysex(t)                    -- insert a new sysex/text event
 --     t must contain ppq, msgType, and val.
---     msgType is one of: sysex, text, copyright, trackname,
+--     Valid msgType values: sysex, text, copyright, trackname,
 --     instrument, lyric, marker, cuepoint, notation.
 --     Returns the new location.
 --   mm:deleteSysex(loc)               -- delete sysex/text event at location
 --
 -- TAKE DATA
 --   mm:take()                         -- the current REAPER take (read-only)
---   mm:reso()                         -- the MIDI resolution in ppq
---   mm:length()                       -- the take length in ppq
+--   mm:reso()                         -- PPQ per quarter note
+--   mm:length()                       -- take length in PPQ (excludes looping)
 --
 -- ACCESSORS
 --   All get* functions and iterators return shallow copies. Modifying a
@@ -96,10 +104,11 @@
 --   calls; collect entries first, then mutate inside a single modify().
 --
 -- METADATA
---   Any fields on a note table beyond the standard note-event fields
---   (ppq, endppq, chan, pitch, vel, uuid) are treated as
---   custom metadata and persisted to the take's extension data. These
---   survive project save/load and are restored on mm:load().
+--   Any fields on a note table beyond the standard event fields
+--   (idx, ppq, endppq, chan, pitch, vel, uuid, uuidIdx) are treated as
+--   custom metadata and persisted to the take's extension data via
+--   util:serialise(). These survive project save/load and are restored
+--   on mm:load(). Standard event fields are stripped before saving.
 --------------------
 
 loadModule('util')
@@ -111,10 +120,6 @@ end
 --------------------
 
 function newMidiManager(take)
-
-  ---------- PUBLIC DATA
-
-  local mm = {}
 
   ---------- PRIVATE DATA & FUNCTIONS
  
@@ -153,12 +158,6 @@ function newMidiManager(take)
       local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_" .. uuidTxt, "", false)
       if entryOk and fields then
         tbl[uuid] = util:unserialise(fields)
-        -- for kv in fields:gmatch("[^,]+") do
-        --   local k, v = kv:match("([^=]+)=([^=]+)")
-        --   if k then
-        --     tbl[uuid][k] = tonumber(v) or v
-        --   end
-        -- end
       end
     end
     return tbl
@@ -284,15 +283,7 @@ function newMidiManager(take)
 
   ---------- PUBLIC FUNCTIONS
 
-  -- Add callback function
-  function mm:addCallback(fn)
-    callbacks[fn] = true
-  end
-
-  -- Remove callback function
-  function mm:removeCallback(fn)
-    callbacks[fn] = nil
-  end
+  local mm = {}
 
   -- Load take and initialise tables
   function mm:load(newTake)
@@ -505,7 +496,7 @@ function newMidiManager(take)
 
     -- callbacks
     for fn,_ in pairs(callbacks) do
-      fn(changed, self)
+      fn(changed, mm)
     end
   end
 
@@ -761,7 +752,7 @@ function newMidiManager(take)
     return function()
       i = i + 1
       local sysex = sysexTbl[i]
-      if note then
+      if sysex then
         return i, copyEntry(sysex, { idx = true })
       end
     end
@@ -861,6 +852,18 @@ function newMidiManager(take)
     local source = reaper.GetMediaItemTake_Source(take)
     local sourceLengthQN = reaper.GetMediaSourceLength(source)
     return reaper.MIDI_GetPPQPosFromProjQN(take, sourceLengthQN) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
+  end
+
+  --- MESSAGING
+
+  -- Add callback function
+  function mm:addCallback(fn)
+    callbacks[fn] = true
+  end
+
+  -- Remove callback function
+  function mm:removeCallback(fn)
+    callbacks[fn] = nil
   end
 
   ---------- FACTORY BODY
