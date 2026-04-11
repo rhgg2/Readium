@@ -32,7 +32,7 @@
 --
 --   Each column table contains:
 --     order  : number (position within the channel after sorting)
---     type   : string ("note", "cc", "pb", "at", "pa", "pc", "sx")
+--     type   : string ("note", "cc", "pb", "at", "pa", "pc")
 --     id     : number or nil (note columns: 1, 2, ...; cc columns: CC number)
 --     label  : string ("Note", "Note 2", "CC74", "PB", etc.)
 --     events : array of event tables, sorted by ppq
@@ -83,7 +83,6 @@ function newTrackerManager(mm, cm)
       at   = "AT",
       pa   = "PA",
       pc   = "PC",
-      sx   = "SX"
     }
 
     return util:add(channel.columns, {
@@ -320,6 +319,31 @@ function newTrackerManager(mm, cm)
       col.events[#col.events + 1] = note
     end
     
+    -- 2b) Compact note columns: remove empties, close gaps in IDs
+    for _, channel in ipairs(channels) do
+      local kept = {}
+      for _, col in ipairs(channel.columns) do
+        if col.type ~= "note" or #col.events > 0 then
+          kept[#kept + 1] = col
+        end
+      end
+      channel.columns = kept
+
+      local newId = 0
+      for _, col in ipairs(channel.columns) do
+        if col.type == "note" then
+          newId = newId + 1
+          if col.id ~= newId then
+            col.id = newId
+            col.label = newId > 1 and ("Note " .. newId) or " Note"
+            for _, evt in ipairs(col.events) do
+              mm:assignNote(evt.loc, { colID = newId })
+            end
+          end
+        end
+      end
+    end
+
     -- 3) Pitchbend: build logical pitchbend lane per channel
     --    Note lane 1 is used
 
@@ -365,6 +389,7 @@ function newTrackerManager(mm, cm)
             local logicalCents = currentCents - currentDetune
 
             util:add(col.events, {
+              loc      = loc,
               ppq      = cc.ppq,
               val      = logicalCents,
               rawVal   = cc.val,
@@ -403,27 +428,14 @@ function newTrackerManager(mm, cm)
     end
 
 
-    -- 5) Sysex / text events (sysex is channel-agnostic; all assigned to channel 1)
-    for loc, sx in mm:sysexes() do
-      local midiChan = (sx.chan or 0) + 1
-      local chan = channels[midiChan]
-      local col = getOrCreateTypedColumn(chan, "sx")
-      util:add(col.events, {
-        ppq     = sx.ppq,
-        msgType = sx.msgType,
-        val     = sx.val,
-        loc     = loc,
-      })
-    end
-
-    -- 6) Sort every column's events by ppq
+    -- 5) Sort every column's events by ppq
     for _, chan in ipairs(channels) do
       for _, col in ipairs(chan.columns) do
         table.sort(col.events, function(a, b) return a.ppq < b.ppq end)
       end
     end
 
-    -- 7) Reorder columns: notes first, then everything else
+    -- 6) Reorder columns: notes first, then everything else
     for _, chan in ipairs(channels) do
       table.sort(chan.columns, function(a, b)
         local aNote = a.type == "note" and 0 or 1
@@ -478,34 +490,68 @@ function newTrackerManager(mm, cm)
     return mm and mm:reso()
   end
 
-  -- EDITING
-
-  function tm:addEvent(type, data)
-    if type == 'note' then
-      mm:modify(function ()
-        mm:addNote(data)
-      end)
-    elseif type == 'pa' or 'cc' or 'at' or 'pc' then 
-      mm:modify(function ()
-        mm:addCC(data)
-      end)
-    end
+  function tm:timeSigs()
+    return mm and mm:timeSigs() or {}
   end
 
-  function tm:assignEvent(type, evt, data)
-    if type == 'note' then
-      mm:modify(function ()
-        mm:assignNote(evt.loc, data)
-      end)
-    elseif type == 'pa' or 'cc' or 'at' or 'pc' then 
-      mm:modify(function ()
-        mm:assignCC(evt.loc, data)
-      end)
-    end
+  -- EDITING
+
+  function tm:deleteEvent(type, evt)
+    mm:modify(function ()
+      if type == 'note' then mm:deleteNote(evt.loc)
+      else mm:deleteCC(evt.loc) end
+    end)
+  end
+
+  function tm:addEvent(type, evt)
+    mm:modify(function ()
+      if type == 'note' then mm:addNote(evt)
+      else mm:addCC(evt) end
+    end)
+  end
+
+  function tm:assignEvent(type, evt, update)
+    mm:modify(function ()
+      if type == 'note' then mm:assignNote(evt.loc, update)
+      else mm:assignCC(evt.loc, update) end
+    end)
   end
   
   function tm:editCell(type, evt, field, value)
     print("editCell", type, "at", evt.loc or 0, "time", evt.ppq, field .. "=" .. value)
+  end
+
+  function tm:addEvents(type, evts)
+    mm:modify(function()
+      for _, evt in ipairs(evts) do
+        if type == 'note' then mm:addNote(evt)
+        else mm:addCC(evt) end
+      end
+    end)
+  end
+
+  function tm:assignEvents(type, evts)
+    mm:modify(function()
+      for _, pair in ipairs(evts) do
+        local evt, update = pair[1], pair[2]
+        if update.loc == util.REMOVE then
+          if type == 'note' then mm:deleteNote(evt.loc)
+          else mm:deleteCC(evt.loc) end
+        else
+          if type == 'note' then mm:assignNote(evt.loc, update)
+          else mm:assignCC(evt.loc, update) end
+        end
+      end
+    end)
+  end
+
+  function tm:deleteEvents(type, evts)
+    mm:modify(function()
+      for _, evt in ipairs(evts) do
+        if type == 'note' then mm:deleteNote(evt.loc)
+        else mm:deleteCC(evt.loc) end
+      end
+    end)
   end
 
   

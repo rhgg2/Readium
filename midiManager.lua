@@ -825,6 +825,50 @@ function newMidiManager(take)
     return reaper.MIDI_GetPPQPosFromProjQN(take, sourceLengthQN) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
   end
 
+  -- time signatures within the take's range
+  -- returns array of { ppq, num, denom } sorted by ppq,
+  -- starting with the time sig in effect at the take's start
+  function mm:timeSigs()
+    if not take then return {} end
+
+    local item = reaper.GetMediaItemTake_Item(take)
+    local startTime = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local itemLength = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local endTime = startTime + itemLength
+    local basePPQ = reaper.MIDI_GetPPQPosFromProjTime(take, startTime)
+
+    local result = {}
+    local count = reaper.CountTempoTimeSigMarkers(0)
+
+    -- find the last marker at or before the take start for the initial time sig
+    local initNum, initDenom
+    for i = 0, count - 1 do
+      local _, pos, _, _, _, num, denom, _ = reaper.GetTempoTimeSigMarker(0, i)
+      if num > 0 and pos <= startTime then
+        initNum, initDenom = num, denom
+      end
+    end
+
+    -- fall back to project default if no marker precedes the take
+    if not initNum then
+      local num, denom, _ = reaper.TimeMap_GetTimeSigAtTime(0, startTime)
+      initNum, initDenom = num, denom
+    end
+
+    result[1] = { ppq = 0, num = initNum, denom = initDenom }
+
+    -- collect any time sig changes within the take
+    for i = 0, count - 1 do
+      local _, pos, _, _, _, num, denom, _ = reaper.GetTempoTimeSigMarker(0, i)
+      if num > 0 and pos > startTime and pos < endTime then
+        local ppq = reaper.MIDI_GetPPQPosFromProjTime(take, pos) - basePPQ
+        result[#result + 1] = { ppq = ppq, num = num, denom = denom }
+      end
+    end
+
+    return result
+  end
+
   --- MESSAGING
 
   -- Add callback function
