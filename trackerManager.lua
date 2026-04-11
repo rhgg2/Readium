@@ -21,35 +21,6 @@
 --     fn(changed, tm), where changed is a table of the form
 --     { take = bool, data = bool } forwarded from the midiManager.
 --
--- REBUILD PROCESS
---   rebuild() is guarded against re-entrant calls via a `rebuilding`
---   flag. The rebuild process:
---
---   1) Initialises 16 channels, each with one empty note column.
---   2) Iterates all notes from the midiManager. Notes missing a `detune`
---      metadata field are assigned detune=0 via mm:assignNote() (metadata-
---      only, does not trigger a reload). Notes are allocated to columns
---      using an overlap-aware algorithm: a column accepts a note unless
---      it shares a start tick with an existing note, overlaps with two or more
---      existing notes, or overlaps more than the threshold with any note.
---      If no existing column fits, a new note column is created. The assigned
---      colID is persisted as note metadata.
---   3) Runs addMissingPitchbends() to insert pitchbend events where
---      microtuning (detune) changes between notes. This calls mm:modify()
---      if inserts are needed; the rebuilding guard prevents the resulting
---      reload callback from causing re-entry.
---   4) Builds logical pitchbend columns per channel by iterating raw
---      pitchbend CC events and compensating for per-note detune values.
---      Hidden events (where the logical value hasn't changed) are flagged.
---   5) Distributes remaining CC events (cc, at, pc) into typed columns
---      per channel. Poly aftertouch events are attached to the note
---      column containing the target pitch where possible.
---   6) Distributes sysex/text events into per-channel sx columns.
---   7) Sorts all column events by ppq.
---   8) Reorders columns within each channel: note columns first, then
---      all others, preserving relative order within each group.
---   9) Fires callbacks.
---
 -- CHANNEL DATA
 --   tm:getChannel(chan)               -- returns the channel table for chan (1..16)
 --   tm:channels()                     -- iterator: for chan, channel in tm:channels()
@@ -106,9 +77,9 @@ function newTrackerManager(mm, cm)
 
   local function addColumn(channel, type, id)
     local colLabels = {
-      note = id and id > 1 and ("Note " .. id) or "Note",
+      note = id and id > 1 and ("Note " .. id) or " Note",
       cc   = "CC" .. (id or ""),
-      pb   = "PB",
+      pb   = " PB",
       at   = "AT",
       pa   = "PA",
       pc   = "PC",
@@ -405,7 +376,7 @@ function newTrackerManager(mm, cm)
       end
     end
 
-        -- 3) CCs, aftertouch, program change
+    -- 4) CCs, aftertouch, program change
     for loc, cc in mm:ccs() do
       local channel = channels[cc.chan]
 
@@ -423,7 +394,7 @@ function newTrackerManager(mm, cm)
             ppq = cc.ppq, pitch = cc.pitch, vel = cc.val,
           })
         end
-      else
+      elseif cc.msgType == "cc" or cc.msgType == "at" or cc.msgType == "pc" then
         local col = getOrCreateTypedColumn(channel, "cc", cc.cc)
         util:add(col.events, {
           ppq = cc.ppq, val = cc.val, loc = loc,
@@ -432,7 +403,7 @@ function newTrackerManager(mm, cm)
     end
 
 
-    -- 4) Sysex / text events
+    -- 5) Sysex / text events (sysex is channel-agnostic; all assigned to channel 1)
     for loc, sx in mm:sysexes() do
       local midiChan = (sx.chan or 0) + 1
       local chan = channels[midiChan]
@@ -445,14 +416,14 @@ function newTrackerManager(mm, cm)
       })
     end
 
-    -- 5) Sort every column's events by ppq
+    -- 6) Sort every column's events by ppq
     for _, chan in ipairs(channels) do
       for _, col in ipairs(chan.columns) do
         table.sort(col.events, function(a, b) return a.ppq < b.ppq end)
       end
     end
 
-    -- 6) Reorder columns: notes first, then everything else
+    -- 7) Reorder columns: notes first, then everything else
     for _, chan in ipairs(channels) do
       table.sort(chan.columns, function(a, b)
         local aNote = a.type == "note" and 0 or 1
@@ -506,6 +477,38 @@ function newTrackerManager(mm, cm)
   function tm:reso()
     return mm and mm:reso()
   end
+
+  -- EDITING
+
+  function tm:addEvent(type, data)
+    if type == 'note' then
+      mm:modify(function ()
+        mm:addNote(data)
+      end)
+    elseif type == 'pa' or 'cc' or 'at' or 'pc' then 
+      mm:modify(function ()
+        mm:addCC(data)
+      end)
+    end
+  end
+
+  function tm:assignEvent(type, evt, data)
+    if type == 'note' then
+      mm:modify(function ()
+        mm:assignNote(evt.loc, data)
+      end)
+    elseif type == 'pa' or 'cc' or 'at' or 'pc' then 
+      mm:modify(function ()
+        mm:assignCC(evt.loc, data)
+      end)
+    end
+  end
+  
+  function tm:editCell(type, evt, field, value)
+    print("editCell", type, "at", evt.loc or 0, "time", evt.ppq, field .. "=" .. value)
+  end
+
+  
 
   -- LIFECYCLE
 

@@ -54,11 +54,9 @@ util.IDX = { }
 local function fillIdx(arg, val)
   if arg == util.IDX then return val end
   if type(arg) == 'table' then
-    local rv = {}
     for k,v in pairs(arg) do
-      rv[k] = fillIdx(v,val)
+      arg[k] = fillIdx(v,val)
     end
-    return rv
   end
   return arg
 end

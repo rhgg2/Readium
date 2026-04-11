@@ -24,9 +24,9 @@
 --     Each group: { id, label, cols }
 --
 --   grid.cols    : flat array of all grid columns across all channels
---     Each column: { id, type, label, events, renderFn, width, groupId }
+--     Each column: { id, type, label, events, renderFn, width, groupId, midiChan }
 --       renderFn(evt) -> text, isEmpty
---       width: character width (7 for note columns, 5 for others)
+--       width: character width (6 for note columns, 4 for pitchbend, 2 for others)
 --
 --   grid.rows    : table keyed by row index (0-based)
 --     grid.rows[y][x] = array of events at that cell (x is 1-based col index)
@@ -84,9 +84,10 @@ function newViewManager(tm, cm)
   local colourDefaults = {
     bg           = {218/256, 214/256, 201/256, 1  },
     text         = { 48/256,  48/256,  33/256, 1  },
+    negative     = {218/256,  48/256,  33/256, 1  },
     textBar      = { 48/256,  48/256,  33/256, 1  },
     header       = { 48/256,  48/256,  33/256, 1  },
-    inactive     = {178/256, 174/256, 161/256, 1  },
+    inactive     = {138/256, 134/256, 121/256, 1  },
     cursor       = { 37/256,  41/256,  54/256, 1  },
     cursorText   = {207/256, 207/256, 222/256, 1  },
     rowNormal    = {218/256, 214/256, 201/256, 0  },
@@ -103,8 +104,9 @@ function newViewManager(tm, cm)
   local colourCache = {}
 
   local function colour(name)
+    name = name or 'text'
     if not colourCache[name] then
-      local c = cfg("colour." .. name, colourDefaults[name])
+      local c = cfg("colour." .. name, colourDefaults[name] or {0, 0, 0, 1})
       colourCache[name] = ImGui.ColorConvertDouble4ToU32(c[1], c[2], c[3], c[4])
     end
     return colourCache[name]
@@ -117,12 +119,19 @@ function newViewManager(tm, cm)
 
   ---------- RENDER STATE
 
+  local scrollCol   = 1
   local scrollRow   = 0
+  local cursorCol   = 1
+  local cursorStop  = 1
   local cursorRow   = 0
-  local cursorCol   = 0
-  local dx          = nil
-  local dy          = nil
-  local visibleRows = 0
+  
+  local GUTTER      = 4    -- row-number width in grid chars
+  local HEADER      = 2    -- header rows above grid data
+
+  local gridX       = nil
+  local gridY       = nil
+  local gridWidth   = 0
+  local gridHeight  = 0
 
   ---------- PRIVATE FUNCTIONS
 
@@ -132,10 +141,11 @@ function newViewManager(tm, cm)
     local function noteName(pitch)
       local NOTE_NAMES = {"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"}
       local oct = math.floor(pitch / 12) - 1
-      return string.format("%s%d", NOTE_NAMES[(pitch % 12) + 1], oct)
+      local octChar = oct >= 0 and tostring(oct) or "M"
+      return NOTE_NAMES[(pitch % 12) + 1] .. octChar
     end
 
-    if not evt then return "... ..", true end
+    if not evt then return "... ..", 'inactive' end
 
     local noteTxt = '...'
     local velTxt  = evt.vel and string.format("%02X", evt.vel) or '..'
@@ -148,21 +158,86 @@ function newViewManager(tm, cm)
 
   local function renderPB(evt)
     if evt and not evt.hidden then
-      return string.format("%+05d", math.floor(evt.val or 0))
-    else return ".....", true end
+      if evt.val < 0 then return string.format("%04d", math.abs(evt.val)), 'negative'
+      else return string.format("%04d", math.floor(evt.val or 0)) end
+    else return "....", 'inactive' end
   end
 
   local function renderCC(evt)
-    if evt and evt.val then
-      if evt.val < 0 then return string.format("-%04X", math.abs(evt.val))
-      else return string.format("%02X", evt.val) end
-    else return "..", true end
+    if evt and evt.val then return string.format("%02X", evt.val)
+    else return "..", 'inactive' end
   end
 
   local function renderDefault(evt)
     if evt then return "**"
-    else return "..", true
+    else return "..", 'inactive'
     end
+  end
+
+  ---------- SCROLL CURSOR
+
+  local function scrollRowBy(n)
+    local maxRow    = math.max(0, (grid.numRows or 1) - 1)
+    cursorRow       = util:clamp(cursorRow + n, 0, maxRow)
+    local maxScroll = math.max(0, maxRow - gridHeight + 1)
+    scrollRow = util:clamp(scrollRow,
+      math.max(0, cursorRow - gridHeight + 1),
+      math.min(cursorRow, maxScroll))
+  end
+
+  local function lastVisibleFrom(startCol)
+    local used = 0
+    local last = startCol - 1
+    for i = startCol, #grid.cols do
+      local w = grid.cols[i].width + (i > startCol and 1 or 0)
+      if used + w > gridWidth then break end
+      used = used + w
+      last = i
+    end
+    return last
+  end
+
+  local function scrollStopBy(n)
+    if #grid.cols == 0 then return end
+
+    -- Linearise (col, stop) → flat index
+    local pos = cursorStop - 1
+    for i = 1, cursorCol - 1 do
+      pos = pos + #grid.cols[i].stopPos
+    end
+
+    local total = 0
+    for _, col in ipairs(grid.cols) do total = total + #col.stopPos end
+
+    pos = util:clamp(pos + n, 0, total - 1)
+
+    -- De-linearise back to (col, stop)
+    for i, col in ipairs(grid.cols) do
+      if pos < #col.stopPos then
+        cursorCol  = i
+        cursorStop = pos + 1
+        break
+      end
+      pos = pos - #col.stopPos
+    end
+
+    -- Scroll-follow
+    scrollCol = util:clamp(scrollCol, 1, #grid.cols)
+    if cursorCol < scrollCol then
+      scrollCol = cursorCol
+    elseif cursorCol > lastVisibleFrom(scrollCol) then
+      while scrollCol < cursorCol do
+        scrollCol = scrollCol + 1
+        if cursorCol <= lastVisibleFrom(scrollCol) then break end
+      end
+    end
+  end
+
+  local function eventAtPos(x, y)
+    x = x or cursorCol
+    y = y or cursorRow
+    local rowData = grid.rows and grid.rows[y]
+    return rowData and rowData[x] and rowData[x][1]
   end
 
   ---------- REBUILD
@@ -191,29 +266,44 @@ function newViewManager(tm, cm)
         pc   = renderCC,
         sx   = renderDefault,
       }
+      
+      -- cursor stop positions in each column
+      local stopPos = {
+        note = {0, 2, 4, 5},      -- C-4 30
+        pb = {0, 1, 2, 3},  -- 0200
+        cc = {0,1},
+        pa = {0,1},
+        at = {0,1},
+        pc = {0,1},
+        sx = {0},
+      }
 
       for chan, channel in tm:channels() do
         local group = util:add(grid.groups, {
-          id    = util.IDX,
-          label = channel.label,
-          cols  = {}
+          id       = util.IDX,
+          label    = channel.label,
+          cols     = {}
         })
 
         for _, column in ipairs(channel.columns) do
           local gridCol = util:pick(column, "id type label events")
           util:assign(gridCol, {
             renderFn = renderFns[gridCol.type] or renderDefault,
-            width    = gridCol.type == "note" and 7 or 5,
-            groupId  = group.id
+            stopPos  = stopPos[gridCol.type] or {0},
+            width    = gridCol.type == "note" and 6
+                    or gridCol.type == "pb" and 4
+                    or 2,
+            groupId  = group.id,
+            midiChan = chan,
           })
           util:add(grid.cols, gridCol)
           util:add(group.cols, gridCol)
         end
       end
 
-      local numRows = math.ceil(length * rowPerQN / ppqPerQN)
-      if numRows < 1 then numRows = 1 end
+      local numRows = math.max(1, math.ceil(length * rowPerQN / ppqPerQN))
 
+      grid.numRows = numRows
       grid.rows    = {}
 
       for y = 0, numRows - 1 do
@@ -230,6 +320,10 @@ function newViewManager(tm, cm)
           end
         end
       end
+
+      -- Clamp cursor/scroll after layout changes
+      scrollRowBy(0)
+      scrollStopBy(0)
     end
   end
 
@@ -248,6 +342,212 @@ function newViewManager(tm, cm)
     push(ImGui.Col_ScrollbarGrab, 'scrollHandle')
     return count
   end
+
+  ---------- EDIT INPUT
+
+  local hexDigit = {}
+  for i = 0, 9 do hexDigit[string.byte(tostring(i))] = i end
+  for i = 0, 5 do
+    hexDigit[string.byte('a') + i] = 10 + i
+    hexDigit[string.byte('A') + i] = 10 + i
+  end
+
+  local function replaceNibble(old, nibble, d)
+    if nibble == 0 then return util:clamp((d << 4) | (old & 0x0F), 0, 127)
+    else return util:clamp((old & 0xF0) | d, 0, 127) end
+  end
+
+  local currentOctave = 2
+
+  -- Note input layouts: each has two rows of characters matching the
+  -- physical piano-key positions (Z-row = base octave, Q-row = +1).
+  -- Entries are single-char strings or Unicode codepoints for non-ASCII.
+  local noteLayouts = {
+    qwerty = {
+      { 'z','s','x','d','c','v','g','b','h','n','j','m',',','l','.',';','/' },
+      { 'q','2','w','3','e','r','5','t','6','y','7','u','i','9','o','0','p','[','=',']' },
+    },
+    colemak = {
+      { 'z','r','x','s','c','v','d','b','h','k','n','m',',','i','.','o','/' },
+      { 'q','2','w','3','f','p','5','g','6','j','7','l','u','9','y','0',';','[','=',']' },
+    },
+    dvorak = {
+      { ';','o','q','e','j','k','i','x','d','b','h','m','w','n','v','s','z' },
+      { "'", '2',',','3','.','p','5','y','6','f','7','g','c','9','r','0','l','/',']','=' },
+    },
+    azerty = {
+      { 'w','s','x','d','c','v','g','b','h','n','j',',',';','l',':','m','!' },
+      { 'a',233,'z','"','e','r','(','t','-','y',232,'u','i',231,'o',224,'p','^','=','$' },
+    },
+  }
+
+  local function buildNoteChars(layout)
+    local t = {}
+    for octOff, row in ipairs(layout) do
+      for semi, ch in ipairs(row) do
+        local code = type(ch) == 'number' and ch or string.byte(ch)
+        t[code] = { semi - 1, octOff - 1 }
+      end
+    end
+    return t
+  end
+
+  local noteChars = buildNoteChars(noteLayouts.colemak)
+
+  local function resolveEdit(col, stop, charCode)
+    local t = col.type
+
+    -- Note column
+    if t == 'note' then
+      -- Stop 1 (note name): character-based layout lookup
+      if stop == 1 then
+        local nk = noteChars[charCode]
+        if not nk then return nil end
+        local pitch = (currentOctave + 1 + nk[2]) * 12 + nk[1]
+        return {
+          field = 'pitch',
+          apply = function() return util:clamp(pitch, 0, 127) end
+        }
+      end
+
+      -- Stop 2 (octave): digit sets octave, minus gives -1
+      if stop == 2 then
+        local oct
+        if charCode == string.byte('-') then oct = -1
+        else
+          local d = charCode - string.byte('0')
+          if d < 0 or d > 9 then return nil end
+          oct = d
+        end
+        return {
+          field = 'pitch',
+          apply = function(old)
+            return util:clamp((oct + 1) * 12 + old % 12, 0, 127)
+          end
+        }
+      end
+
+      -- Stops 3,4 (velocity high/low nibble)
+      local d = hexDigit[charCode]
+      if not d then return nil end
+      return {
+        field = 'vel',
+        apply = function(old) return replaceNibble(old, stop - 3, d) end
+      }
+    end
+
+    -- CC, PA, AT, PC: 2-nibble hex
+    if t == 'cc' or t == 'pa' or t == 'at' or t == 'pc' then
+      local d = hexDigit[charCode]
+      if not d then return nil end
+      return {
+        field = 'val',
+        apply = function(old) return replaceNibble(old, stop - 1, d) end
+      }
+    end
+
+    -- PB: 4-digit decimal
+    if t == 'pb' then
+      local d = charCode - string.byte('0')
+      if d < 0 or d > 9 then return nil end
+      local pow = ({1000, 100, 10, 1})[stop]
+      return {
+        field = 'val',
+        apply = function(old)
+          local place = math.floor(old / pow) % 10
+          return util:clamp(old + (d - place) * pow, 0, 8191)
+        end
+      }
+    end
+
+    return nil
+  end
+
+  local function applyEdit(type, evt, stop, char)
+    -- Note column
+    if type == 'note' then
+      -- Stop 1 (note name): character-based layout lookup
+      if stop == 1 then
+        local nk = noteChars[char]
+        if not nk then return end
+        local pitch = (currentOctave + 1 + nk[2]) * 12 + nk[1]
+        return { pitch = util:clamp(pitch, 0, 127) }
+      end
+
+      -- Stop 2 (octave): digit sets octave, minus gives -1
+      if stop == 2 then
+        if not evt then return end
+        local oct
+        if char == string.byte('-') then oct = -1
+        else
+          local d = char - string.byte('0')
+          if d < 0 or d > 9 then return end
+          oct = d
+        end
+        return { pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127) }
+      end
+
+      -- Stops 3,4 (velocity high/low nibble)
+      local d = hexDigit[char]
+      if not d then return end
+      if not evt then return end
+      return { vel = replaceNibble(evt.vel, stop - 3, d) }
+    end
+
+    -- CC, PA, AT, PC: 2-nibble hex
+    if type == 'cc' or type == 'pa' or type == 'at' or type == 'pc' then
+      local d = hexDigit[char]
+      if not d then return end
+      return { val = replaceNibble(evt and evt.val or 0, stop - 1, d) }
+    end
+
+    -- PB: 4-digit decimal
+    if type == 'pb' then
+      local d = char - string.byte('0')
+      if d < 0 or d > 9 then return end
+      local pow = ({1000, 100, 10, 1})[stop]
+      local old = evt and evt.val or 0
+      local place = math.floor(old / pow) % 10
+      return { val = util:clamp(old + (d - place) * pow, 0, 8191) }
+    end
+
+    return nil
+  end
+
+  ---------- COMMANDS & KEYMAP
+
+  local commands = {
+    cursorDown  = function() scrollRowBy(1) end,
+    cursorUp    = function() scrollRowBy(-1) end,
+    pageDown    = function() scrollRowBy(gridHeight) end,
+    pageUp      = function() scrollRowBy(-gridHeight) end,
+    goTop       = function() scrollRowBy(1 - cursorRow) end,
+    goBottom    = function() scrollRowBy((grid.numRows or 1) - cursorRow) end,
+    cursorRight = function() scrollStopBy(1) end,
+    cursorLeft  = function() scrollStopBy(-1) end,
+    tabRight    = function()
+      local col = grid.cols[cursorCol]
+      local nxt = grid.cols[cursorCol + 1]
+      if nxt then scrollStopBy(1 - cursorStop + #col.stopPos) end
+    end,
+    tabLeft     = function()
+      local prev = grid.cols[cursorCol - 1]
+      scrollStopBy(prev and 1 - cursorStop - #prev.stopPos or 1 - cursorStop)
+    end,
+  }
+
+  local keymap = {
+    cursorDown  = { ImGui.Key_DownArrow  },
+    cursorUp    = { ImGui.Key_UpArrow    },
+    pageDown    = { ImGui.Key_PageDown   },
+    pageUp      = { ImGui.Key_PageUp     },
+    goTop       = { ImGui.Key_Home       },
+    goBottom    = { ImGui.Key_End        },
+    cursorRight = { ImGui.Key_RightArrow },
+    cursorLeft  = { ImGui.Key_LeftArrow  },
+    tabRight    = { ImGui.Key_Tab },
+    tabLeft     = { { ImGui.Key_Tab, ImGui.Mod_Shift } },
+  }
 
   local function drawToolbar()
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
@@ -274,160 +574,214 @@ function newViewManager(tm, cm)
 
   local function drawStatusBar()
     ImGui.Separator(ctx)
-    local ppq  = cursorRow * ppqPerRow
-    local beat = math.floor(cursorRow / rowPerQN) + 1
-    local sub  = (cursorRow % rowPerQN) + 1
+    local ppq      = cursorRow * ppqPerRow
+    local beat     = math.floor(cursorRow / rowPerQN) + 1
+    local sub      = (cursorRow % rowPerQN) + 1
+    local col      = grid.cols[cursorCol]
+    local colLabel = col and col.label or '?'
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
     ImGui.Text(ctx, string.format(
-      "Row: %d | PPQ: %d | Beat: %d.%d | Step: 1/%d",
-      cursorRow, ppq, beat, sub, rowPerQN
+      "Row: %d | PPQ: %d | Beat: %d.%d | Step: 1/%d | Col: %d (%s) Stop: %d",
+      cursorRow, ppq, beat, sub, rowPerQN, cursorCol, colLabel, cursorStop
     ))
     ImGui.PopStyleColor(ctx)
   end
 
+  local function printer(ctx, gridX, gridY)
+    local drawList = ImGui.GetWindowDrawList(ctx)
+    local px, py   = ImGui.GetCursorScreenPos(ctx)
+    local x0, y0   = px + GUTTER * gridX, py + HEADER * gridY
+    local halfW    = math.floor(gridX / 2)
+    local halfH    = math.floor(gridY / 2)
+
+    local pt = {}
+
+    local function drawTextAt(xpos, ypos, txt, c)
+      for char in txt:gmatch(".") do
+        ImGui.DrawList_AddText(drawList, xpos, ypos, colour(c), char)
+        xpos = xpos + gridX
+      end
+    end
+    
+    function pt:text(x, y, txt, c)
+      drawTextAt(x0 + x * gridX, y0 + y * gridY, txt, c)
+    end
+
+    function pt:textCentred(x1, x2, y, txt, c)
+      local textWidth = ImGui.CalcTextSize(ctx, txt)
+      local maxWidth  = (x2 - x1 + 1) * gridX
+      local offset    = math.max(0, math.floor((maxWidth - textWidth) / 2))
+      drawTextAt(x0 + x1 * gridX + offset, y0 + y * gridY, txt, c)
+    end
+
+    function pt:vLine(x, y1, y2, c)
+      ImGui.DrawList_AddLine(drawList, x0 + x * gridX + halfW, y0 + y1 * gridY, x0 + x * gridX + halfW, y0 + y2 * gridY + gridY, colour(c), 1)
+    end
+
+    function pt:hLine(x1, x2, y, c)
+      ImGui.DrawList_AddLine(drawList, x0 + x1 * gridX, y0 + y * gridY, x0 + x2 * gridX + gridX, y0 + y * gridY, colour(c), 1)
+    end
+
+    function pt:box(x1, x2, y1, y2, c)
+      ImGui.DrawList_AddRectFilled(drawList, x0 + x1 * gridX, y0 + y1 * gridY, x0 + x2 * gridX + gridX, y0 + y2 * gridY + gridY, colour(c))
+    end
+
+    return pt
+  end
+
   local function drawTracker()
-    if not dx then
-      dx, dy = ImGui.CalcTextSize(ctx, "W")
+    if not gridX then
+      local charW, charH = ImGui.CalcTextSize(ctx, "W")
+      gridX              = 2 * math.ceil(charW / 2) -1
+      gridY              = 2 * math.ceil(charH / 2) -1
     end
 
-    local rowHeight   = dy + 2
-    local rowNumWidth = ImGui.CalcTextSize(ctx, "00000") + 12
-    local numRows     = #grid.rows
+    local windowWidth, windowHeight = ImGui.GetContentRegionAvail(ctx)
+    gridWidth  = math.max(1, math.floor(windowWidth  / gridX) - GUTTER)
+    gridHeight = math.max(1, math.floor(windowHeight / gridY) - HEADER - 1)
+    local numRows = grid.numRows or 0
 
-    -- Visible rows from available height (subtract header rows and status bar)
-    local _, windowHeight = ImGui.GetContentRegionAvail(ctx)
-    visibleRows = math.max(1, math.floor(windowHeight / rowHeight) - 3)
+    -- Clamp cursor/scroll after possible resize
+    scrollRowBy(0)
+    scrollStopBy(0)
 
-    -- Clamp cursor and scroll; cursor-follow
-    cursorRow = util:clamp(cursorRow, 0, math.max(0, numRows - 1))
-    scrollRow = util:clamp(scrollRow, 0, math.max(0, numRows - visibleRows))
-    if cursorRow < scrollRow then
-      scrollRow = cursorRow
-    elseif cursorRow >= scrollRow + visibleRows then
-      scrollRow = cursorRow - visibleRows + 1
+    -- Compute start position for each visible column and its group
+    for _, group in ipairs(grid.groups) do
+      group.x     = nil
+      group.width = 0
+      for _, col in ipairs(group.cols) do
+        col.x = nil
+      end
     end
 
-    -- Pre-compute pixel widths for each column (width field is in characters)
-    local colWidths = {}
-    for x, col in ipairs(grid.cols) do
-      colWidths[x] = col.width * dx + 8
+    local cx = 0
+    for i = scrollCol, #grid.cols do
+      local col = grid.cols[i]
+      if cx + col.width > gridWidth then break end
+      col.x = cx
+      local group = grid.groups[col.groupId]
+      if group then
+        if not group.x then group.x = col.x end
+        group.width = (col.x + col.width) - group.x
+      end
+      cx = cx + col.width + 1
     end
 
-    -- Total width for background fills and dummy spacer
-    local totalWidth = rowNumWidth
-    for _, w in ipairs(colWidths) do totalWidth = totalWidth + w end
-
-    local drawList       = ImGui.GetWindowDrawList(ctx)
-    local startX, startY = ImGui.GetCursorScreenPos(ctx)
-    local totalHeight    = (visibleRows + 3) * rowHeight
+    local totalWidth = math.max(0, cx - 1)
+    local draw = printer(ctx, gridX, gridY)
 
     -- Header row 1: group labels
-    -- colXs[x] = pixel x-start of column x (1-based); built during this pass
-    ImGui.DrawList_AddText(drawList, startX + 4, startY, colour('inactive'), "Row")
-
-    local hx      = startX + rowNumWidth
-    local colXs   = { hx }    -- colXs[1] = start of first column
-    local flatIdx = 1
-
+    draw:text(-GUTTER, -HEADER, 'Row', 'accent')
     for _, group in ipairs(grid.groups) do
-      if #group.cols > 0 then
-        -- Vertical separator between groups (and between row-num and first group)
-        ImGui.DrawList_AddLine(drawList, hx - 2, startY,
-          hx - 2, startY + totalHeight, colour('separator'), 1)
-        -- Group label
-        ImGui.DrawList_AddText(drawList, hx + 4, startY, colour('accent'), group.label)
-        -- Advance through this group's columns, recording each start x
-        for _ = 1, #group.cols do
-          hx = hx + colWidths[flatIdx]
-          flatIdx = flatIdx + 1
-          colXs[flatIdx] = hx
-        end
+      if group.x then
+        draw:textCentred(group.x, group.x + group.width - 1, -HEADER, group.label, 'accent')
       end
     end
 
     -- Header row 2: column labels
-    local colLabelY = startY + rowHeight
-    ImGui.DrawList_AddText(drawList, startX + 4, colLabelY, colour('inactive'), "---")
-    for x, col in ipairs(grid.cols) do
-      ImGui.DrawList_AddText(drawList, colXs[x] + 4, colLabelY, colour('header'), col.label)
+    for _, col in ipairs(grid.cols) do
+      if col.x then draw:text(col.x, -1, col.label) end
     end
 
-    -- Separator line below headers
-    local rowsY = colLabelY + rowHeight
-    ImGui.DrawList_AddLine(drawList, startX, rowsY - 2,
-      startX + totalWidth, rowsY - 2, colour('header'), 1)
+    -- Separator below headers
+    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header')
 
     -- Rows
     local rowsPerBar = rowPerQN * 4
 
-    for vi = 0, visibleRows - 1 do
-      local row = scrollRow + vi
+    for y = 0, gridHeight - 1 do
+      local row = scrollRow + y
       if row >= numRows then break end
 
-      local rowY        = rowsY + vi * rowHeight
       local isBarStart  = (row % rowsPerBar == 0)
       local isBeatStart = (row % rowPerQN   == 0)
       local isCursor    = (row == cursorRow)
 
       -- Row background
-      if isCursor then
-        ImGui.DrawList_AddRectFilled(drawList, startX, rowY,
-          startX + totalWidth, rowY + rowHeight, colour('cursor'))
-      elseif isBarStart then
-        ImGui.DrawList_AddRectFilled(drawList, startX, rowY,
-          startX + totalWidth, rowY + rowHeight, colour('rowBarStart'))
-      elseif isBeatStart then
-        ImGui.DrawList_AddRectFilled(drawList, startX, rowY,
-          startX + totalWidth, rowY + rowHeight, colour('rowBeat'))
+      for _, group in ipairs(grid.groups) do
+        if group.x then
+          if isBarStart then
+            draw:box(group.x, group.x + group.width - 1, y, y, 'rowBarStart')
+          elseif isBeatStart then
+            draw:box(group.x, group.x + group.width - 1, y, y, 'rowBeat')
+          end
+        end
       end
 
       -- Row number
-      local rowNumCol = isCursor    and colour('cursorText')
-                     or isBeatStart and colour('textBar')
-                     or                 colour('inactive')
-      ImGui.DrawList_AddText(drawList, startX + 4, rowY, rowNumCol,
-        string.format("%03d", row))
+      local rowNumCol = (isBeatStart and 'textBar') or 'inactive'
+      draw:text(-GUTTER, y, string.format("%03d", row), rowNumCol)
 
       -- Cells
-      local rowData = grid.rows[row]
       for x, col in ipairs(grid.cols) do
-        local evt        = rowData and rowData[x] and rowData[x][1]
-        local text, isEmpty = col.renderFn(evt)
-        local textCol    = isCursor  and colour('cursorText')
-                        or isEmpty   and colour('inactive')
-                        or               colour('text')
-        ImGui.DrawList_AddText(drawList, colXs[x] + 4, rowY, textCol, text)
+        if col.x then
+          local evt = eventAtPos(x, row)
+          local text, textCol = col.renderFn(evt)
+          draw:text(col.x, y, text, textCol or 'text')
+        end
       end
     end
 
-    -- Reserve content space so ImGui knows the drawable area
-    ImGui.Dummy(ctx, totalWidth, rowsY - startY + visibleRows * rowHeight + 4)
+    -- Cursor: 1-char highlight at the current stop position
+    local col = grid.cols[cursorCol]
+    if col and col.x then
+      local stopOffset = (col.stopPos and col.stopPos[cursorStop]) or 0
+      local charX = col.x + stopOffset
+      draw:box(charX, charX, y, y, 'cursor')
+      local evt = eventAtPos()
+      local text = col.renderFn(evt)
+      local ch = text:sub(stopOffset + 1, stopOffset + 1)
+      if ch ~= '' then draw:text(charX, y, ch, 'cursorText') end
+    end
 
-    -- Keyboard navigation
+    -- Reserve content space so ImGui knows the drawable area
+    ImGui.Dummy(ctx, (totalWidth + GUTTER) * gridX, (gridHeight + HEADER) * gridY)
+
+    -- Keyboard
     if ImGui.IsWindowFocused(ctx) then
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_DownArrow) then
-        cursorRow = math.min(cursorRow + 1, numRows - 1)
+      for command, keys in pairs(keymap) do
+        for _, key in ipairs(keys) do
+          local mods = ImGui.Mod_None
+          if type(key) == 'table' then
+            for i = 2, #key do
+              mods = mods | key[i]
+            end
+            key = key[1]
+          end
+          if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then
+            commands[command]()
+          end
+        end
       end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_UpArrow) then
-        cursorRow = math.max(cursorRow - 1, 0)
-      end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_PageDown) then
-        cursorRow = math.min(cursorRow + visibleRows, numRows - 1)
-      end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_PageUp) then
-        cursorRow = math.max(cursorRow - visibleRows, 0)
-      end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_Home) then
-        cursorRow = 0
-      end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_End) then
-        cursorRow = numRows - 1
-      end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_RightArrow) then
-        cursorCol = math.min(cursorCol + 1, math.max(0, #grid.cols - 1))
-      end
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_LeftArrow) then
-        cursorCol = math.max(cursorCol - 1, 0)
+
+      -- Edit keys: unmodified alphanumeric input
+      if ImGui.GetKeyMods(ctx) == ImGui.Mod_None then
+        local col = grid.cols[cursorCol]
+        if col then
+          local type = col.type
+          
+          -- Character queue: hex/decimal edits, octave changes
+          local idx = 0
+          while true do
+            local rv, char = ImGui.GetInputQueueCharacter(ctx, idx)
+            if not rv then break end
+            idx = idx + 1
+
+            local evt = eventAtCursor()
+            local update = applyEdit(type, evt, cursorStop, char)
+
+            if update and evt then
+              tm:assignEvent(type, evt, update)
+            elseif update and type ~= 'note' then
+              util:assign(update, { ppq = cursorRow * ppqPerRow, chan = col.midiChan })
+              if type == 'cc' then
+                util:assign(update, { cc = col.id })
+              end
+              tm:addEvent(type, update)
+            end
+            scrollRowBy(1)
+          end              
+        end
       end
     end
   end
@@ -453,7 +807,8 @@ function newViewManager(tm, cm)
     local visible, open = ImGui.Begin(ctx, 'Readium Tracker', true,
       ImGui.WindowFlags_NoScrollbar
       | ImGui.WindowFlags_NoScrollWithMouse
-      | ImGui.WindowFlags_NoDocking)
+      | ImGui.WindowFlags_NoDocking
+      | ImGui.WindowFlags_NoNav)
 
     if visible then
       if #grid.cols > 0 then

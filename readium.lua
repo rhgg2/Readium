@@ -4,15 +4,15 @@ function loadModule(module)
   require(script_path .. module)
 end
 
-local function print(...)
-  return util:print(...)
-end
-
 loadModule('util')
 loadModule('configManager')
 loadModule('midiManager')
 loadModule('trackerManager')
 loadModule('viewManager')
+
+local function print(...)
+  return util:print(...)
+end
 
 ---
 
