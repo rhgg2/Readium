@@ -181,6 +181,13 @@ function newMidiManager(take)
     }
 
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util:serialise(data, noteEventFields), true)
+
+    -- Ensure this UUID is in the keys list so loadMetadata() finds it on reload
+    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
+    if not ok or not keysText or not keysText:find(uuidTxt, 1, true) then
+      local keys = (ok and keysText and keysText ~= '') and (keysText .. ',' .. uuidTxt) or uuidTxt
+      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', keys, true)
+    end
   end
 
   local function saveMetadata()

@@ -314,6 +314,7 @@ function newViewManager(tm, cm)
     for _, evt in ipairs(events) do
       if evt.ppq >= ppq then next = evt; break end
     end
+    return next
   end
   
   local function firstAfter(events, ppq)
@@ -360,7 +361,6 @@ function newViewManager(tm, cm)
     update.vel    = last and last.vel or cfg('defaultVelocity', 100)
     update.endppq = next and next.ppq or length
     update.colID  = col.id
-    util:print_r(update)
     tm:addEvent('note', update)
   end
 
@@ -481,21 +481,21 @@ function newViewManager(tm, cm)
   end
 
   local function overlapLimit(col, note)
-    local _, next = firstAfter(col.events, note.ppq)
+    local next = firstAfter(col.events, note.ppq)
     if next then return next.ppq + cfg('overlapOffset', 1/16) * resolution end
     return length
   end
 
   local function noteOff()
     local col = grid.cols[cursorCol]
-    if not col or col.type ~= 'note' then return end
+    if not col or col.type ~= 'note' then return true end -- fall through
     local cursorPPQ = rowPPQs[cursorRow]
-    if not cursorPPQ then return end
+    if not cursorPPQ then return true end
     
     local last = lastBefore(col.events, cursorPPQ)
     if not last then return end
     if last.endppq == cursorPPQ then
-      local next = firstAfter(col.events, cursorPPQ)
+      local next = firstNotBefore(col.events, cursorPPQ)
       tm:assignEvent('note', last, { endppq = next and next.ppq or length })
     else
       local maxPPQ = overlapLimit(col, last)
@@ -506,8 +506,9 @@ function newViewManager(tm, cm)
   local function adjustDuration(rowDelta, fine)
     local col, note = cursorNote()
     if not note then return end
-    local endRow = ppqToRow(note.endppq)
-    local rowLen = (rowPPQs[endRow + 1] or length) - (rowPPQs[endRow] or 0)
+
+    local endRow = math.min(ppqToRow(note.endppq), grid.numRows - 1)
+    local rowLen = (rowPPQs[endRow + 1] or length) - rowPPQs[endRow]
     local step = fine
       and math.max(1, math.floor(rowLen / cfg('durationFineSteps', 4) + 0.5))
       or rowLen
@@ -519,9 +520,6 @@ function newViewManager(tm, cm)
   -- Append note deletion ops (with predecessor endppq fixup) to ops list.
   local function appendDeleteNotes(ops, col, locs)
     local lastSurvivor, pendingFixup = nil, false
-    print("RIGHT NOW, OPS IS:")
-    util:print_r(ops)
-    print("----")
     for _, evt in ipairs(col.events) do
       if locs[evt.loc] then
         if not pendingFixup and lastSurvivor and lastSurvivor.endppq == evt.ppq then
@@ -620,9 +618,6 @@ function newViewManager(tm, cm)
       end
     end
 
-    util:print_r(noteOps)
-    print("  then  ")
-    util:print_r(ccOps)
     if #noteOps > 0 then tm:assignEvents('note', noteOps) end
     if #ccOps > 0 then tm:assignEvents('cc', ccOps) end
     selClear()
@@ -702,8 +697,6 @@ function newViewManager(tm, cm)
       end
 
       if #events == 0 then return nil end
-      util:print_r({ mode = 'single', type = clipType, numRows = numRows,
-                     sourceIdx = c1, events = events })
       return { mode = 'single', type = clipType, numRows = numRows,
                sourceIdx = c1, events = events }
     end
@@ -735,7 +728,6 @@ function newViewManager(tm, cm)
     end
 
     if #cols == 0 then return nil end
-    util:print_r({ mode = 'multi', numRows = numRows, cols = cols })
     return { mode = 'multi', numRows = numRows, cols = cols }
   end
 
@@ -821,8 +813,13 @@ function newViewManager(tm, cm)
           locs[evt.loc] = evt
         end
       end
-      local deleteOps = {}
-      appendDeleteNotes(deleteOps, dstCol, locs)
+      local updateOps = {}
+
+      if last and events and events[1] and last.endppq > events[1].ppq then
+        util:add(updateOps, { last, { endppq = events[1].ppq } })
+      end
+      appendDeleteNotes(updateOps, dstCol, locs)
+      util:print_r(updateOps)
 
       local adds = {}
       local vi = 1
@@ -837,9 +834,7 @@ function newViewManager(tm, cm)
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
         }
       end
-      print("NOW DELET_OPS IS")
-      util:print_r(deleteOps)
-      if #deleteOps > 0 then tm:assignEvents('note', deleteOps) end
+      if #updateOps > 0 then tm:assignEvents('note', updateOps) end
       if #adds > 0 then tm:addEvents('note', adds) end
       return
     end
@@ -1151,8 +1146,11 @@ function newViewManager(tm, cm)
 
   ---------- REBUILD
 
+  local rebuilding = false
+
   function vm:rebuild(changed)
-    if not tm then return end
+    if not tm or rebuilding then return end
+    rebuilding = true
     changed = changed or { take = false, data = true }
 
     if changed.take then
@@ -1178,32 +1176,34 @@ function newViewManager(tm, cm)
       grid.cols   = {}
       grid.groups = {}
 
-      -- cursor stop positions in each column
-      local stopPos = {
-        note = {0, 2, 4, 5},   -- C-4 30
-        pb = {0,1,2,3},        -- 0200
-        cc = {0,1},            -- 94
-        pa = {0,1},
-        at = {0,1},
-        pc = {0,1},
-      }
-
-      -- assigns stop positions to selection groups (for marking)
-      local selGroups = {
-        note = {1, 1, 2, 2},      -- C-4 30
-        pb = {1, 1, 1, 1},        -- 0200
-        cc = {1,1},               -- 94
-        pa = {1,1},
-        at = {1,1},
-        pc = {1,1},
-      }
 
       local function addGridCol(group, chan, type, id, events)
+        -- cursor stop positions in each column
+        local stopPos = {
+          note = {0, 2, 4, 5},   -- C-4 30
+          pb = {0,1,2,3},        -- 0200
+          cc = {0,1},            -- 94
+          pa = {0,1},
+          at = {0,1},
+          pc = {0,1},
+        }
+
+        -- assigns stop positions to selection groups (for marking)
+        local selGroups = {
+          note = {1, 1, 2, 2},      -- C-4 30
+          pb = {1, 1, 1, 1},        -- 0200
+          cc = {1,1},               -- 94
+          pa = {1,1},
+          at = {1,1},
+          pc = {1,1},
+        }
+
         local colLabels = {
           note = id and id > 1 and ('Note ' .. id) or 'Note',
-          cc   = 'CC' .. (id or ''),
+          cc   = 'CC', --tostring(id) or '',
           pb   = 'PB',  at = 'AT',  pa = 'PA',  pc = 'PC',
         }
+        
         local gridCol = {
           id        = id,
           type      = type,
@@ -1292,6 +1292,7 @@ function newViewManager(tm, cm)
       -- Clamp cursor/scroll after layout changes
       clampCursor()
     end
+    rebuilding = false
   end
 
   -- LIFECYCLE

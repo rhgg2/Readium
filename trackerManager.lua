@@ -436,7 +436,7 @@ function newTrackerManager(mm, cm)
           })
         end
       elseif cc.msgType == 'cc' or cc.msgType == 'at' or cc.msgType == 'pc' then
-        local col = getOrCreateTypedColumn(channel, 'cc', cc.cc)
+        local col = getOrCreateTypedColumn(channel, cc.msgType, cc.cc)
         util:add(col.events, {
           ppq = cc.ppq, val = cc.val, loc = loc,
         })
@@ -567,7 +567,7 @@ function newTrackerManager(mm, cm)
   function tm:assignEvents(type, evts)
     local assigns, deletes = {}, {}
     for _, pair in ipairs(evts) do
-      if pair[2].loc == util.REMOVE then deletes[#deletes+1] = pair[1]
+      if pair[2] and pair[2].loc == util.REMOVE then deletes[#deletes+1] = pair[1]
       else assigns[#assigns+1] = pair end
     end
     table.sort(deletes, function(a, b) return a.loc > b.loc end)
@@ -577,8 +577,6 @@ function newTrackerManager(mm, cm)
         else mm:assignCC(pair[1].loc, pair[2]) end
       end
       for _, evt in ipairs(deletes) do
-        print("DELETING")
-        util:print_r(evt)
         if type == 'note' then mm:deleteNote(evt.loc)
         else mm:deleteCC(evt.loc) end
       end

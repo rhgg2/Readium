@@ -69,9 +69,9 @@ function newRenderManager(vm, cm)
       return NOTE_NAMES[(pitch % 12) + 1] .. octChar
     end
 
-    if not evt then return '\u{00B7}\u{00B7}\u{00B7} \u{00B7}\u{00B7}', 'inactive' end
+    if not evt then return '··· ··', 'inactive' end
 
-    local noteTxt = '\u{00B7}\u{00B7}\u{00B7}'
+    local noteTxt = '···'
     local velTxt  = evt.vel and string.format('%02X', evt.vel) or '\u{00B7}\u{00B7}'
 
     if evt.pitch then noteTxt = noteName(evt.pitch)
@@ -83,17 +83,17 @@ function newRenderManager(vm, cm)
     if evt and not evt.hidden then
       if evt.val < 0 then return string.format('%04d', math.abs(evt.val)), 'negative'
       else return string.format('%04d', math.floor(evt.val or 0)) end
-    else return '....', 'inactive' end
+    else return '····', 'inactive' end
   end
 
   local function renderCC(evt)
     if evt and evt.val then return string.format('%02X', evt.val)
-    else return '..', 'inactive' end
+    else return '··', 'inactive' end
   end
 
   local function renderDefault(evt)
     if evt then return '**'
-    else return '..', 'inactive'
+    else return '··', 'inactive'
     end
   end
 
@@ -132,7 +132,7 @@ function newRenderManager(vm, cm)
     accent       = {159/256, 147/256, 115/256, 1  },
     separator    = {159/256, 147/256, 115/256, 0.3},
     tail         = {100/256, 130/256, 160/256, 0.15},
-    tailBord     = {100/256, 130/256, 160/256, 0.2},
+    tailBord     = {100/256, 130/256, 160/256, 0.7},
   }
 
   local colourCache = {}
@@ -290,7 +290,8 @@ function newRenderManager(vm, cm)
 
     -- Header row 2: column labels
     for _, col in ipairs(grid.cols) do
-      if col.x then draw:text(col.x, -1, col.label) end
+--      if col.x then draw:text(col.x, -1, col.label) end
+      if col.x then draw:textCentred(col.x, col.x + col.width-1, -1, col.label) end
     end
 
     -- Separator below headers
@@ -330,22 +331,20 @@ function newRenderManager(vm, cm)
     for _, col in ipairs(grid.cols) do
       if col.x and col.type == 'note' and col.events then
         local colPx = gridOriginX + col.x * gridX
-        local slot = 0
-        local prevEndFrac = -1
         for _, evt in ipairs(col.events) do
           local startFrac = vm:fractionalRow(evt.ppq)
           local endFrac   = vm:fractionalRow(evt.endppq)
           if endFrac > viewTop and startFrac < viewBot then
-            if startFrac < prevEndFrac then slot = 1 - slot else slot = 0 end
             local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
             local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
-            local x1 = colPx  -- (slot + 1) * (barW + 1)
-            --            ImGui.DrawList_AddRectFilled(drawList, x1, y1, x1 + barW, y1+2, tailStart)
+            local x1 = colPx - 4 -- (slot + 1) * (barW + 1)
+--                        ImGui.DrawList_AddRectFilled(drawList, x1-6, y1, x1 + 5, y1+2, tailBord)
 --            ImGui.DrawList_AddTriangleFilled(drawList, x1 - 0.5*gridX, y1, x1+2.5*gridX, y1, x1 + gridX, y1+6, tailCol)
-            ImGui.DrawList_AddRectFilled(drawList, x1, y1, x1 + 1, y2+1, tailCol)
-            ImGui.DrawList_AddRect(drawList, x1, y1, x1 + 1, y2+1, tailBord,2)
+            ImGui.DrawList_AddRectFilled(drawList, x1-2, y1-1, x1 + 4, y1+1, tailBord)
+            ImGui.DrawList_AddRectFilled(drawList, x1-2, y1, x1, y2, tailBord)
+            ImGui.DrawList_AddRectFilled(drawList, x1-2, y2-1, x1 + 4, y2+1, tailBord)
+--            ImGui.DrawList_AddRect(drawList, x1-2, y1, x1 + 1, y2+1, tailBord,2)
           end
-          prevEndFrac = endFrac
         end
       end
     end
@@ -390,7 +389,7 @@ function newRenderManager(vm, cm)
       local stopOffset = (col.stopPos and col.stopPos[cursorStop]) or 0
       local charX = col.x + stopOffset
       local charY = cursorRow - scrollRow
-      draw:box(charX, charX, charY, charY, 'cursor')
+      draw:box(charX, charX, charY+0.1, charY-0.1, 'cursor')
       local evt = col.cells and col.cells[cursorRow]
       local text = renderCell(col, evt)
       local ch = utf8.offset(text, stopOffset + 1) and text:sub(utf8.offset(text, stopOffset + 1), utf8.offset(text, stopOffset + 2) - 1) or ''
@@ -593,8 +592,9 @@ function newRenderManager(vm, cm)
               ImGui.OpenPopup(ctx, 'Add Column')
               return
             else
-              vm.commands[command]()
-              return
+              local fallThrough = vm.commands[command]()
+              if not fallThrough then return end
+              commandHeld = false
             end
           end
         end
@@ -663,7 +663,7 @@ function newRenderManager(vm, cm)
   function rm:loop()
     if not ctx then return false end
 
-    ImGui.PushFont(ctx, font, 25)
+    ImGui.PushFont(ctx, font, 18)
     
     local styleCount = pushStyles()
 
