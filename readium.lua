@@ -9,6 +9,7 @@ loadModule('configManager')
 loadModule('midiManager')
 loadModule('trackerManager')
 loadModule('viewManager')
+loadModule('renderManager')
 
 local function print(...)
   return util:print(...)
@@ -17,8 +18,8 @@ end
 ---
 
 local function err_handler(err)
-  reaper.ShowConsoleMsg("\nERROR:\n" .. tostring(err) .. "\n\n")
-  reaper.ShowConsoleMsg(debug.traceback() .. "\n")
+  reaper.ShowConsoleMsg('\nERROR:\n' .. tostring(err) .. '\n\n')
+  reaper.ShowConsoleMsg(debug.traceback() .. '\n')
   reaper.defer(function() end)
 end
 
@@ -32,7 +33,7 @@ end
 function Main()
   local item = reaper.GetSelectedMediaItem(0, 0)
   if not item then
-    reaper.ShowConsoleMsg("Please select a MIDI item.\n")
+    reaper.ShowConsoleMsg('Please select a MIDI item.\n')
     return
   end
 
@@ -42,11 +43,12 @@ function Main()
   cm:setContext(take)
   local tm = newTrackerManager(mm, cm)
 
-  local tracker = newViewManager(tm, cm)
-  tracker:init()
+  local vm = newViewManager(tm, cm)
+  local renderer = newRenderManager(vm, cm)
+  renderer:init()
 
   local function loop()
-    if tracker:loop() then
+    if renderer:loop() then
       reaper.defer(loop)
     end
   end

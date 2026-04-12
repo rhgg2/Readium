@@ -13,8 +13,6 @@
 --   local vm = newViewManager(nil)     -- create empty, call vm:attach(tm) later
 --
 -- LIFECYCLE
---   vm:init()           -- create ImGui context and font
---   vm:loop()           -- per-frame draw; returns false when the window is closed
 --   vm:attach(tm, cm)   -- attach to a trackerManager; triggers immediate rebuild
 --   vm:detach()         -- remove callback from the attached trackerManager
 --   vm:rebuild(changed) -- manually trigger a grid rebuild
@@ -24,17 +22,15 @@
 --     Each group: { id, label, firstCol, lastCol }
 --
 --   grid.cols    : flat array of all grid columns across all channels
---     Each column: { id, type, label, events, renderFn, width, group, midiChan,
+--     Each column: { id, type, label, events, width, group, midiChan,
 --                    cells = { [y] = event } }
---       renderFn(evt) -> text, isEmpty
 --       width: character width (6 for note columns, 4 for pitchbend, 2 for others)
 --       cells: row-indexed events (y is 0-based row index, evt.overflow if >1 at same row)
 --
 -- DISPLAY PARAMETERS
---   ppqPerQN  : PPQ per quarter note (from tm:reso() on take change)
+--   resolution: PPQ per quarter note (from tm:resolution() on take change)
 --   rowPerBeat: rows per beat (from config, default 4; beat = 1/denom note)
 --   rowPerBar : rows per bar  (rows per beat * numerator of time sig)
---   ppqPerRow : derived as (ppqPerQN * 4 / denom) / rowPerBeat
 --   length    : item length in PPQ
 --------------------
 
@@ -46,12 +42,6 @@ local function print(...)
   return util:print(...)
 end
 
-if not reaper.ImGui_GetBuiltinPath then
-  return reaper.MB('ReaImGui is not installed or too old.', 'My script', 0)
-end
-package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua'
-local ImGui = require 'imgui' '0.10'
-
 --------------------
 -- Factory
 --------------------
@@ -60,8 +50,7 @@ function newViewManager(tm, cm)
 
   ---------- PRIVATE STATE
 
-  local ppqPerRow  = 60
-  local ppqPerQN   = 240
+  local resolution   = 240
   local rowPerBeat = 4
   local rowPerBar  = 16
   local rowPPQs    = {}
@@ -77,20 +66,13 @@ function newViewManager(tm, cm)
   local cursorRow   = 0
   local sel         = nil   -- { row1, row2, col1, col2, selgrp1, selgrp2 } or nil
 
-  local GUTTER      = 4    -- row-number width in grid chars
-  local HEADER      = 2    -- header rows above grid data
+  -- Audition: one pending note-off at a time
+  local auditionNote     = nil  -- { chan, pitch } (chan is 0-indexed for MIDI)
+  local auditionTime     = 0    -- reaper.time_precise() when note was sent
+  local AUDITION_TIMEOUT = 0.8  -- seconds
 
-  local gridX       = nil
-  local gridY       = nil
-  local gridOriginX = 0
-  local gridOriginY = 0
   local gridWidth   = 0
   local gridHeight  = 0
-
-  local ctx         = nil  -- ImGui handles
-  local font        = nil
-  local dragging    = false
-  local dragWinX, dragWinY = 0, 0
 
   local grid = {
     cols    = {},
@@ -114,15 +96,31 @@ function newViewManager(tm, cm)
   ---------- PPQ / ROW MAPPING
 
   local function ppqToRow(ppq)
-    if ppq >= (rowPPQs[grid.numRows - 1] or 0) + ppqPerRow then
+    if ppq >= length then
       return grid.numRows
     end
     local lo, hi = 0, grid.numRows - 1
     while lo < hi do
-      local mid = math.floor((lo + hi + 1) / 2)
+      local mid = (lo + hi + 1) // 2
       if rowPPQs[mid] <= ppq then lo = mid else hi = mid - 1 end
     end
     return lo
+  end
+
+  ---------- AUDITION
+
+  local function killAudition()
+    if not auditionNote then return end
+    reaper.StuffMIDIMessage(0, 0x80 | auditionNote.chan, auditionNote.pitch, 0)
+    auditionNote = nil
+  end
+
+  local function audition(pitch, vel, chan)
+    killAudition()
+    local midiChan = (chan or 1) - 1  -- internal 1-indexed → MIDI 0-indexed
+    reaper.StuffMIDIMessage(0, 0x90 | midiChan, pitch, vel or 100)
+    auditionNote = { chan = midiChan, pitch = pitch }
+    auditionTime = reaper.time_precise()
   end
 
   ---------- SCROLL / CURSOR NAVIGATION
@@ -147,13 +145,14 @@ function newViewManager(tm, cm)
       cursorCol  = util:clamp(cursorCol, 1, #grid.cols)
       cursorStop = util:clamp(cursorStop, 1, #grid.cols[cursorCol].stopPos)
     end
-    
-    -- Row follow
-    local maxRow    = math.max(0, (grid.numRows or 1) - 1)
-    local maxScroll = math.max(0, maxRow - gridHeight + 1)
-    scrollRow = util:clamp(scrollRow,
-      math.max(0, cursorRow - gridHeight + 1),
-      math.min(cursorRow, maxScroll))
+
+    -- Row follow (skip before gridHeight is set to avoid inverted bounds)
+    if gridHeight > 0 then
+      local maxScroll = math.max(0, maxRow - gridHeight + 1)
+      scrollRow = util:clamp(scrollRow,
+        math.max(0, cursorRow - gridHeight + 1),
+        math.min(cursorRow, maxScroll))
+    end
 
     -- Column follow
     if #grid.cols == 0 then return end
@@ -197,6 +196,7 @@ function newViewManager(tm, cm)
   local function selClear() sel = nil; selAnchor = nil end
 
   local function scrollRowBy(n, selecting)
+    killAudition()
     if selecting then
       if not sel then selStart() end
     else selClear() end
@@ -206,6 +206,7 @@ function newViewManager(tm, cm)
   end
 
   local function scrollStopBy(n, selecting)
+    killAudition()
     if #grid.cols == 0 then return end
     if selecting then
       if not sel then selStart() end
@@ -230,6 +231,7 @@ function newViewManager(tm, cm)
   end
 
   local function scrollColBy(n)
+    killAudition()
     if #grid.cols == 0 then return end
     selClear()
     cursorCol  = util:clamp(cursorCol + n, 1, #grid.cols)
@@ -238,6 +240,7 @@ function newViewManager(tm, cm)
   end
 
   local function scrollGroupBy(n)
+    killAudition()
     if #grid.cols == 0 then return end
     selClear()
     local groupId = grid.cols[cursorCol].group.id
@@ -248,7 +251,7 @@ function newViewManager(tm, cm)
   end
 
   ---------- ADD/EDIT EVENTS
-  
+
 
   local hexDigit = {}
   for i = 0, 9 do hexDigit[string.byte(tostring(i))] = i end
@@ -297,38 +300,87 @@ function newViewManager(tm, cm)
 
   local noteChars = buildNoteChars(noteLayouts.colemak)
 
-  local function neighbours(events, ppq)
-    local last, next
+  local function lastBefore(events, ppq)
+    local last
     for _, evt in ipairs(events) do
       if evt.ppq < ppq then last = evt
-      elseif evt.ppq > ppq then next = evt; break end
+      elseif evt.ppq >= ppq then break end
     end
-    return last, next
+    return last
+  end
+
+  local function firstNotBefore(events, ppq)
+    local next
+    for _, evt in ipairs(events) do
+      if evt.ppq >= ppq then next = evt; break end
+    end
+  end
+  
+  local function firstAfter(events, ppq)
+    local next
+    for j = #events, 1, -1 do
+      local evt = events[j]
+      if evt.ppq > ppq then next = evt
+      elseif evt.ppq <= ppq then break end
+    end
+    return next
+  end
+
+  local function lastNotAfter(events, ppq)
+    local last
+    for j = #events, 1, -1 do
+      local evt = events[j]
+      if evt.ppq <= ppq then last = evt; break end
+    end
+    return last
+  end
+
+  local function truncatePitchInGroup(col, pitch, ppq, excludeEvt)
+    local group = col.group
+    for ci = group.firstCol, group.lastCol do
+      local gc = grid.cols[ci]
+      if gc and gc.type == 'note' and gc ~= col then
+        for _, evt in ipairs(gc.events) do
+          if evt ~= excludeEvt and evt.pitch == pitch
+            and evt.ppq <= ppq and evt.endppq > ppq then
+            tm:assignEvent('note', evt, { endppq = ppq })
+            evt.endppq = ppq
+          end
+        end
+      end
+    end
   end
 
   local function placeNewNote(col, update)
-    local last, next = neighbours(col.events, update.ppq)
-    if last then
+    local last = lastBefore(col.events, update.ppq)
+    local next = firstAfter(col.events, update.ppq)
+    if last and last.endppq >= update.ppq then
       tm:assignEvent('note', last, { endppq = update.ppq })
     end
-    update.vel = last and last.vel or cfg('defaultVelocity', 100)
+    update.vel    = last and last.vel or cfg('defaultVelocity', 100)
     update.endppq = next and next.ppq or length
+    update.colID  = col.id
+    util:print_r(update)
     tm:addEvent('note', update)
   end
 
+  --- EDIT EVENT
+  
   local function editEvent(col, evt, stop, char)
     if not col then return end
     local type = col.type
     local update
-    
+
     -- Note column
     if type == 'note' then
       -- Stop 1 (note name): character-based layout lookup
       if stop == 1 then
         local nk = noteChars[char]
         if not nk then return end
-        local pitch = (currentOctave + 1 + nk[2]) * 12 + nk[1]
-        update = { pitch = util:clamp(pitch, 0, 127) }
+        local pitch = util:clamp((currentOctave + 1 + nk[2]) * 12 + nk[1], 0, 127)
+        local ppq = evt and evt.ppq or rowPPQs[cursorRow]
+        truncatePitchInGroup(col, pitch, ppq, evt)
+        update = { pitch = pitch }
 
       -- Stop 2 (octave): digit sets octave, minus gives -1
       elseif stop == 2 then
@@ -340,7 +392,9 @@ function newViewManager(tm, cm)
           if d < 0 or d > 9 then return end
           oct = d
         end
-        update = { pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127) }
+        local pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
+        truncatePitchInGroup(col, pitch, evt.ppq, evt)
+        update = { pitch = pitch }
 
       -- Stops 3,4 (velocity high/low nibble)
       else
@@ -362,7 +416,7 @@ function newViewManager(tm, cm)
       if d < 0 or d > 9 then return end
       local pow = ({1000, 100, 10, 1})[stop]
       local old = evt and evt.val or 0
-      local place = math.floor(old / pow) % 10
+      local place = (old // pow) % 10
       update = { val = util:clamp(old + (d - place) * pow, 0, 8191) }
     end
 
@@ -371,24 +425,31 @@ function newViewManager(tm, cm)
     else
       util:assign(update, { ppq = rowPPQs[cursorRow], chan = col.midiChan })
       if type == 'note' then
-        return placeNewNote(col, update)
+        util:assign(update)
+        placeNewNote(col, update)
+      elseif type == 'cc' then
+        tm:addEvent(type, util:assign(update, { cc = col.id }))
+      elseif type == 'at' or type == 'pc' or type == 'pb' or type == 'pa' then
+        tm:addEvent(type, util:assign(update, { msgType = type }))
       end
-      if type == 'cc' then
-        util:assign(update, { cc = col.id })
-      end
-      if type == 'at' or type == 'pc' or type == 'pb' or type == 'pa' then
-        util:assign(update, { msgType = type })
-      end
-      tm:addEvent(type, update)
+    end
+
+    scrollRowBy(advanceBy)
+
+    -- Audition note on pitch entry
+    if type == 'note' and update.pitch then
+      local vel = update.vel or (evt and evt.vel) or 100
+      audition(update.pitch, vel, col.midiChan)
     end
   end
-  
+
   ----------  EVENT DELETION
 
   local function deleteNote(col, note)
-    local last, next = neighbours(col.events, note.ppq)
-    if last then
-      tm:assignEvent('note', last, { endppq = next and next.ppq or length })
+    local last = lastBefore(col.events, note.ppq)
+    if last and last.endppq >= note.ppq then
+      local after = firstAfter(col.events, note.ppq)
+      tm:assignEvent('note', last, { endppq = after and after.ppq or length })
     end
     tm:deleteEvent('note', note)
   end
@@ -405,12 +466,67 @@ function newViewManager(tm, cm)
     end
   end
 
+  ---------- NOTE DURATION
+
+  local function cursorNote()
+    local col = grid.cols[cursorCol]
+    if not col or col.type ~= 'note' then return end
+    local note = col.cells and col.cells[cursorRow]
+    if note then return col, note end
+    
+    local cursorPPQ = rowPPQs[cursorRow]
+    if not cursorPPQ then return end
+    local last = lastBefore(col.events, cursorPPQ)
+    return col, last
+  end
+
+  local function overlapLimit(col, note)
+    local _, next = firstAfter(col.events, note.ppq)
+    if next then return next.ppq + cfg('overlapOffset', 1/16) * resolution end
+    return length
+  end
+
+  local function noteOff()
+    local col = grid.cols[cursorCol]
+    if not col or col.type ~= 'note' then return end
+    local cursorPPQ = rowPPQs[cursorRow]
+    if not cursorPPQ then return end
+    
+    local last = lastBefore(col.events, cursorPPQ)
+    if not last then return end
+    if last.endppq == cursorPPQ then
+      local next = firstAfter(col.events, cursorPPQ)
+      tm:assignEvent('note', last, { endppq = next and next.ppq or length })
+    else
+      local maxPPQ = overlapLimit(col, last)
+      tm:assignEvent('note', last, { endppq = util:clamp(cursorPPQ, last.ppq + 1, maxPPQ) })
+    end
+  end
+
+  local function adjustDuration(rowDelta, fine)
+    local col, note = cursorNote()
+    if not note then return end
+    local endRow = ppqToRow(note.endppq)
+    local rowLen = (rowPPQs[endRow + 1] or length) - (rowPPQs[endRow] or 0)
+    local step = fine
+      and math.max(1, math.floor(rowLen / cfg('durationFineSteps', 4) + 0.5))
+      or rowLen
+    local maxPPQ = rowDelta > 0 and overlapLimit(col, note) or length
+    local newPPQ = util:clamp(note.endppq + step * rowDelta, note.ppq + 1, maxPPQ)
+    tm:assignEvent('note', note, { endppq = newPPQ })
+  end
+
   -- Append note deletion ops (with predecessor endppq fixup) to ops list.
   local function appendDeleteNotes(ops, col, locs)
     local lastSurvivor, pendingFixup = nil, false
+    print("RIGHT NOW, OPS IS:")
+    util:print_r(ops)
+    print("----")
     for _, evt in ipairs(col.events) do
       if locs[evt.loc] then
-        pendingFixup = true
+        if not pendingFixup and lastSurvivor and lastSurvivor.endppq == evt.ppq then
+          pendingFixup = true
+        end
       else
         if pendingFixup and lastSurvivor then
           ops[#ops + 1] = { lastSurvivor, { endppq = evt.ppq } }
@@ -494,7 +610,7 @@ function newViewManager(tm, cm)
     for _, group in ipairs(groups) do
       local col, locs = group.col, group.locs
       if col.type == 'note' then
-        if isVelOnly then
+        if isVelOnly  then
           appendResetVelocities(noteOps, col, locs)
         else
           appendDeleteNotes(noteOps, col, locs)
@@ -504,6 +620,9 @@ function newViewManager(tm, cm)
       end
     end
 
+    util:print_r(noteOps)
+    print("  then  ")
+    util:print_r(ccOps)
     if #noteOps > 0 then tm:assignEvents('note', noteOps) end
     if #ccOps > 0 then tm:assignEvents('cc', ccOps) end
     selClear()
@@ -511,17 +630,13 @@ function newViewManager(tm, cm)
 
   ---------- CLIPBOARD
 
-  local CLIP_SECTION = "rdm"
-  local CLIP_KEY     = "clipboard"
-
   local function clipboardSave(clip)
-    reaper.SetExtState(CLIP_SECTION, CLIP_KEY,
-      util:serialise(clip, { loc = true, sourceIdx = true }), false)
+    reaper.SetExtState('rdm', 'clipboard', util:serialise(clip, { loc = true, sourceIdx = true }), false)
   end
 
   local function clipboardLoad()
-    local raw = reaper.GetExtState(CLIP_SECTION, CLIP_KEY)
-    if raw == "" then return nil end
+    local raw = reaper.GetExtState('rdm', 'clipboard')
+    if raw == '' then return nil end
     return util:unserialise(raw)
   end
 
@@ -551,7 +666,7 @@ function newViewManager(tm, cm)
     end
 
     -- Single-column mode
-    if c1 == c2 and g1 == g2 then
+    if c1 == c2 then
       local col = grid.cols[c1]
       if not col then return nil end
 
@@ -587,6 +702,8 @@ function newViewManager(tm, cm)
       end
 
       if #events == 0 then return nil end
+      util:print_r({ mode = 'single', type = clipType, numRows = numRows,
+                     sourceIdx = c1, events = events })
       return { mode = 'single', type = clipType, numRows = numRows,
                sourceIdx = c1, events = events }
     end
@@ -618,6 +735,7 @@ function newViewManager(tm, cm)
     end
 
     if #cols == 0 then return nil end
+    util:print_r({ mode = 'multi', numRows = numRows, cols = cols })
     return { mode = 'multi', numRows = numRows, cols = cols }
   end
 
@@ -642,11 +760,8 @@ function newViewManager(tm, cm)
   end
 
   local function pasteVelocities(events, dstCol, startPPQ, endPPQ)
-    local currentVel = cfg('defaultVelocity', 100)
-    for _, evt in ipairs(dstCol.events) do
-      if evt.ppq >= startPPQ then break end
-      currentVel = evt.vel
-    end
+    local last = lastBefore(dstCol.events, startPPQ)
+    local currentVel = last and last.vel or cfg('defaultVelocity', 100)
 
     local ops = {}
     local ci = 1
@@ -686,7 +801,7 @@ function newViewManager(tm, cm)
     end
     table.sort(events, function(a, b) return a.ppq < b.ppq end)
 
-    -- (1) note → note (pitch selgrp): delete existing, paste with target vels
+    -- (1) note -> note (pitch selgrp): delete existing, paste with target vels
     if clip.type == 'note' and dstCol.type == 'note' and selGrp == 1 then
       local velList = {}
       for _, evt in ipairs(dstCol.events) do
@@ -694,16 +809,11 @@ function newViewManager(tm, cm)
           velList[#velList + 1] = { ppq = evt.ppq, val = evt.vel }
         end
       end
-      local currentVel = cfg('defaultVelocity', 100)
-      for _, evt in ipairs(dstCol.events) do
-        if evt.ppq >= startPPQ then break end
-        currentVel = evt.vel
-      end
+      local last = lastBefore(dstCol.events, startPPQ)
+      local currentVel = last and last.vel or cfg('defaultVelocity', 100)
 
-      local afterRegionPPQ = length
-      for _, evt in ipairs(dstCol.events) do
-        if evt.ppq >= endPPQ then afterRegionPPQ = evt.ppq; break end
-      end
+      local subseq = firstNotBefore(dstCol.events, endPPQ)
+      local afterRegionPPQ = subseq and subseq.ppq or length
 
       local locs = {}
       for _, evt in ipairs(dstCol.events) do
@@ -727,19 +837,20 @@ function newViewManager(tm, cm)
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
         }
       end
-
+      print("NOW DELET_OPS IS")
+      util:print_r(deleteOps)
       if #deleteOps > 0 then tm:assignEvents('note', deleteOps) end
       if #adds > 0 then tm:addEvents('note', adds) end
       return
     end
 
-    -- (4) 7bit → note velocity (vel selgrp): carry-forward
+    -- (4) 7bit -> note velocity (vel selgrp): carry-forward
     if clip.type == '7bit' and dstCol.type == 'note' and selGrp == 2 then
       pasteVelocities(events, dstCol, startPPQ, endPPQ)
       return
     end
 
-    -- (2) pb → pb, (3) 7bit → 7bit: wipe and replace
+    -- (2) pb -> pb, (3) 7bit -> 7bit: wipe and replace
     if (clip.type == 'pb' and dstCol.type == 'pb')
     or (clip.type == '7bit' and dstCol.type ~= 'note' and dstCol.type ~= 'pb') then
       local delOps = {}
@@ -770,7 +881,7 @@ function newViewManager(tm, cm)
     local endPPQ = rowPPQs[cursorRow + clip.numRows] or length
 
     -- Resolve all clipboard events to target PPQs
-    local noteAddsByCol = {}  -- keyed by "chan:colID"
+    local noteAddsByCol = {}  -- keyed by 'chan:colID'
     local ccAdds = {}
 
     for _, srcCol in ipairs(clip.cols) do
@@ -786,7 +897,7 @@ function newViewManager(tm, cm)
             local ep = rowToPPQ(cursorRow, ce.endRow)
             endNPQ = ep and math.min(ep, endPPQ) or endPPQ
           end
-          local key = dstChan .. ":" .. (srcCol.id or 1)
+          local key = dstChan .. ':' .. (srcCol.id or 1)
           if not noteAddsByCol[key] then
             noteAddsByCol[key] = { chan = dstChan, colID = srcCol.id or 1, adds = {} }
           end
@@ -815,9 +926,8 @@ function newViewManager(tm, cm)
       local afterPPQ = length
       for _, col in ipairs(grid.cols) do
         if col.type == 'note' and col.midiChan == group.chan and col.id == group.colID then
-          for _, evt in ipairs(col.events) do
-            if evt.ppq >= endPPQ then afterPPQ = evt.ppq; break end
-          end
+          local next = firstNotBefore(col.events, endPPQ)
+          if next then afterPPQ = next.ppq end
           break
         end
       end
@@ -844,40 +954,6 @@ function newViewManager(tm, cm)
     end
   end
 
-  ---------- COLOUR
-
-  local colourDefaults = {
-    bg           = {218/256, 214/256, 201/256, 1  },
-    text         = { 48/256,  48/256,  33/256, 1  },
-    overflow     = {150/256,  90/256,  35/256, 1  },
-    negative     = {218/256,  48/256,  33/256, 1  },
-    textBar      = { 48/256,  48/256,  33/256, 1  },
-    header       = { 48/256,  48/256,  33/256, 1  },
-    inactive     = {138/256, 134/256, 121/256, 1  },
-    cursor       = { 37/256,  41/256,  54/256, 1  },
-    cursorText   = {207/256, 207/256, 222/256, 1  },
-    rowNormal    = {218/256, 214/256, 201/256, 0  },
-    rowBeat      = {181/256, 179/256, 158/256, 0.4},
-    rowBarStart  = {159/256, 147/256, 115/256, 0.4},
-    editCursor   = {1,       1,       0,       1  },
-    selection    = {247/256, 247/256, 244/256, 0.5},
-    scrollHandle = { 48/256,  48/256,  33/256, 1  },
-    scrollBg     = {218/256, 214/256, 201/256, 1  },
-    accent       = {159/256, 147/256, 115/256, 1  },
-    separator    = {159/256, 147/256, 115/256, 0.3},
-  }
-
-  local colourCache = {}
-
-  local function colour(name)
-    name = name or 'text'
-    if not colourCache[name] then
-      local c = cfg("colour." .. name, colourDefaults[name] or {0, 0, 0, 1})
-      colourCache[name] = ImGui.ColorConvertDouble4ToU32(c[1], c[2], c[3], c[4])
-    end
-    return colourCache[name]
-  end
-
   ---------- TIME SIGNATURE HELPERS
 
   local function timeSigAt(ppq)
@@ -890,15 +966,17 @@ function newViewManager(tm, cm)
   end
 
   local function rowBeatInfo(row)
-    local ppq = rowPPQs[row]
-    local ts = timeSigAt(ppq)
+    local ppq         = rowPPQs[row]
+    local ts          = timeSigAt(ppq)
     if not ts then return false, false end
-    local ppqPerBeat = ppqPerQN * 4 / ts.denom
-    local ppqPerBar  = ppqPerBeat * ts.num
-    local offset     = ppq - ts.ppq
+    local offset      = ppq - ts.ppq
+
+    local ppqPerBeat  = resolution * 4 / ts.denom
     local nearestBeat = math.floor(offset / ppqPerBeat + 0.5)
-    local nearestBar  = math.floor(offset / ppqPerBar  + 0.5)
     local isBeatStart = ppqToRow(ts.ppq + nearestBeat * ppqPerBeat) == row
+
+    local ppqPerBar   = ppqPerBeat * ts.num
+    local nearestBar  = math.floor(offset / ppqPerBar  + 0.5)
     local isBarStart  = ppqToRow(ts.ppq + nearestBar  * ppqPerBar)  == row
     return isBarStart, isBeatStart
   end
@@ -906,7 +984,7 @@ function newViewManager(tm, cm)
   local function barBeatSub(row)
     local bar = 1
     for i, ts in ipairs(timeSigs) do
-      local ppqPerBeat = ppqPerQN * 4 / ts.denom
+      local ppqPerBeat = resolution * 4 / ts.denom
       local ppqPerBar  = ppqPerBeat * ts.num
       local nextPPQ    = timeSigs[i + 1] and timeSigs[i + 1].ppq or math.huge
       local nextRow    = timeSigs[i + 1] and ppqToRow(nextPPQ) or math.huge
@@ -915,473 +993,18 @@ function newViewManager(tm, cm)
         local ppq      = rowPPQs[row]
         local offset   = ppq - ts.ppq
         local inBar    = offset % ppqPerBar
-        local beatNum  = math.floor(inBar / ppqPerBeat)
-        local beatPPQ  = ts.ppq + math.floor(offset / ppqPerBar) * ppqPerBar + beatNum * ppqPerBeat
+        local beatNum  = inBar // ppqPerBeat
+        local beatPPQ  = ppq - offset % ppqPerBeat
         local beatRow  = ppqToRow(beatPPQ)
-        return bar + math.floor(offset / ppqPerBar),
+        return bar + offset // ppqPerBar,
                beatNum + 1,
                row - beatRow + 1,
                ts
       else
-        bar = bar + math.floor((nextPPQ - ts.ppq) / ppqPerBar)
+        bar = bar + (nextPPQ - ts.ppq) // ppqPerBar
       end
     end
     return bar, 1, 1, timeSigs[1]
-  end
-
-  ---------- CELL RENDERERS
-
-  local function renderNote(evt)
-    local function noteName(pitch)
-      local NOTE_NAMES = {"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"}
-      local oct = math.floor(pitch / 12) - 1
-      local octChar = oct >= 0 and tostring(oct) or "M"
-      return NOTE_NAMES[(pitch % 12) + 1] .. octChar
-    end
-
-    if not evt then return "... ..", 'inactive' end
-
-    local noteTxt = '...'
-    local velTxt  = evt.vel and string.format("%02X", evt.vel) or '..'
-
-    if evt.pitch then noteTxt = noteName(evt.pitch)
-    elseif evt.type == 'pa' then noteTxt = 'PA ' end
-    return noteTxt .. ' ' .. velTxt, evt.overflow and 'overflow'
-  end
-
-  local function renderPB(evt)
-    if evt and not evt.hidden then
-      if evt.val < 0 then return string.format("%04d", math.abs(evt.val)), 'negative'
-      else return string.format("%04d", math.floor(evt.val or 0)) end
-    else return "....", 'inactive' end
-  end
-
-  local function renderCC(evt)
-    if evt and evt.val then return string.format("%02X", evt.val)
-    else return "..", 'inactive' end
-  end
-
-  local function renderDefault(evt)
-    if evt then return "**"
-    else return "..", 'inactive'
-    end
-  end
-
-  ---------- DRAWING
-
-  local function pushStyles()
-    local count = 0
-    local function push(enum, col)
-      if enum then
-        ImGui.PushStyleColor(ctx, enum, colour(col))
-        count = count + 1
-      end
-    end
-    push(ImGui.Col_WindowBg,      'bg')
-    push(ImGui.Col_ScrollbarBg,   'scrollBg')
-    push(ImGui.Col_ScrollbarGrab, 'scrollHandle')
-    return count
-  end
-
-  local function printer(ctx, gridX, gridY, x0, y0)
-    local drawList = ImGui.GetWindowDrawList(ctx)
-    local halfW    = math.floor(gridX / 2)
-    local halfH    = math.floor(gridY / 2)
-
-    local pt = {}
-
-    local function drawTextAt(xpos, ypos, txt, c)
-      for char in txt:gmatch(".") do
-        ImGui.DrawList_AddText(drawList, xpos, ypos, colour(c), char)
-        xpos = xpos + gridX
-      end
-    end
-
-    function pt:text(x, y, txt, c)
-      drawTextAt(x0 + x * gridX, y0 + y * gridY, txt, c)
-    end
-
-    function pt:textCentred(x1, x2, y, txt, c)
-      local textWidth = ImGui.CalcTextSize(ctx, txt)
-      local maxWidth  = (x2 - x1 + 1) * gridX
-      local offset    = math.max(0, math.floor((maxWidth - textWidth) / 2))
-      drawTextAt(x0 + x1 * gridX + offset, y0 + y * gridY, txt, c)
-    end
-
-    function pt:vLine(x, y1, y2, c)
-      ImGui.DrawList_AddLine(drawList, x0 + x * gridX + halfW, y0 + y1 * gridY, x0 + x * gridX + halfW, y0 + y2 * gridY + gridY, colour(c), 1)
-    end
-
-    function pt:hLine(x1, x2, y, c)
-      ImGui.DrawList_AddLine(drawList, x0 + x1 * gridX, y0 + y * gridY, x0 + x2 * gridX + gridX, y0 + y * gridY, colour(c), 1)
-    end
-
-    function pt:box(x1, x2, y1, y2, c)
-      ImGui.DrawList_AddRectFilled(drawList, x0 + x1 * gridX, y0 + y1 * gridY, x0 + x2 * gridX + gridX, y0 + y2 * gridY + gridY, colour(c))
-    end
-
-    return pt
-  end
-
-  local function drawToolbar()
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
-    ImGui.Text(ctx, "Rows/beat:")
-    ImGui.PopStyleColor(ctx)
-    ImGui.SameLine(ctx)
-
-    local subdivOptions = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-    for _, s in ipairs(subdivOptions) do
-      local isActive = (s == rowPerBeat)
-      if isActive then
-        ImGui.PushStyleColor(ctx, ImGui.Col_Button, colour('cursor'))
-        ImGui.PushStyleColor(ctx, ImGui.Col_Text,   colour('cursorText'))
-      end
-      if ImGui.SmallButton(ctx, tostring(s)) then
-        cursorRow = math.floor(cursorRow * s / rowPerBeat)
-        setcfg("track", "rowPerBeat", s)
-      end
-      if isActive then ImGui.PopStyleColor(ctx, 2) end
-      ImGui.SameLine(ctx)
-    end
-
-    ImGui.NewLine(ctx)
-    ImGui.Separator(ctx)
-  end
-
-  local function drawTracker()
-    if not gridX then
-      local charW, charH = ImGui.CalcTextSize(ctx, "W")
-      gridX              = 2 * math.ceil(charW / 2) -1
-      gridY              = 2 * math.ceil(charH / 2) -1
-    end
-
-    local px, py = ImGui.GetCursorScreenPos(ctx)
-    gridOriginX  = px + GUTTER * gridX
-    gridOriginY  = py + HEADER * gridY
-
-    local windowWidth, windowHeight = ImGui.GetContentRegionAvail(ctx)
-    gridWidth  = math.max(1, math.floor(windowWidth  / gridX) - GUTTER)
-    gridHeight = math.max(1, math.floor(windowHeight / gridY) - HEADER - 1)
-    local numRows = grid.numRows or 0
-
-    -- Clamp cursor/scroll after possible resize
-    clampCursor()
-
-    -- Compute start position for each visible column and its group
-    for _, group in ipairs(grid.groups) do
-      group.x     = nil
-      group.width = 0
-      for i = group.firstCol, group.lastCol do
-        grid.cols[i].x = nil
-      end
-    end
-
-    local cx = 0
-    for i = scrollCol, #grid.cols do
-      local col = grid.cols[i]
-      if cx + col.width > gridWidth then break end
-      col.x = cx
-      local group = col.group
-      if not group.x then group.x = col.x end
-      group.width = (col.x + col.width) - group.x
-      cx = cx + col.width + 1
-    end
-
-    local totalWidth = math.max(0, cx - 1)
-    local draw = printer(ctx, gridX, gridY, gridOriginX, gridOriginY)
-
-    -- Header row 1: group labels
-    draw:text(-GUTTER, -HEADER, 'Row', 'accent')
-    for _, group in ipairs(grid.groups) do
-      if group.x then
-        draw:textCentred(group.x, group.x + group.width - 1, -HEADER, group.label, 'accent')
-      end
-    end
-
-    -- Header row 2: column labels
-    for _, col in ipairs(grid.cols) do
-      if col.x then draw:text(col.x, -1, col.label) end
-    end
-
-    -- Separator below headers
-    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header')
-
-    -- Rows
-    for y = 0, gridHeight - 1 do
-      local row = scrollRow + y
-      if row >= numRows then break end
-
-      local isBarStart, isBeatStart = rowBeatInfo(row)
-      local isCursor    = (row == cursorRow)
-
-      -- Row background
-      for _, group in ipairs(grid.groups) do
-        if group.x then
-          if isBarStart then
-            draw:box(group.x, group.x + group.width - 1, y, y, 'rowBarStart')
-          elseif isBeatStart then
-            draw:box(group.x, group.x + group.width - 1, y, y, 'rowBeat')
-          end
-        end
-      end
-
-      -- Row number
-      local rowNumCol = (isBeatStart and 'textBar') or 'inactive'
-      draw:text(-GUTTER, y, string.format("%03d", row), rowNumCol)
-
-      -- Cells
-      for x, col in ipairs(grid.cols) do
-        if col.x then
-          local evt = col.cells and col.cells[row]
-          local text, textCol = col.renderFn(evt)
-          draw:text(col.x, y, text, textCol or 'text')
-        end
-      end
-    end
-
-    -- Selection highlight
-    if sel and sel.col2 >= scrollCol and sel.col1 <= lastVisibleFrom(scrollCol) then
-      local yFrom = math.max(sel.row1 - scrollRow, 0)
-      local yTo   = math.min(sel.row2 - scrollRow, gridHeight - 1)
-      local c1, c2 = grid.cols[sel.col1], grid.cols[sel.col2]
-      local x1, x2
-      if c1.x then
-        x1 = c1.x
-        for s, g in ipairs(c1.selGroups) do
-          if g >= sel.selgrp1 then x1 = c1.x + c1.stopPos[s]; break end
-        end
-      else x1 = 0 end
-      if c2.x then
-        x2 = c2.x + c2.stopPos[#c2.stopPos]
-        for s = #c2.selGroups, 1, -1 do
-          if c2.selGroups[s] <= sel.selgrp2 then x2 = c2.x + c2.stopPos[s]; break end
-        end
-      else x2 = totalWidth end
-      draw:box(x1, x2, yFrom, yTo, 'selection')
-    end
-
-    -- Cursor
-    local col = grid.cols[cursorCol]
-    if col and col.x then
-      local stopOffset = (col.stopPos and col.stopPos[cursorStop]) or 0
-      local charX = col.x + stopOffset
-      local charY = cursorRow - scrollRow
-      draw:box(charX, charX, charY, charY, 'cursor')
-      local evt = col.cells and col.cells[cursorRow]
-      local text = col.renderFn(evt)
-      local ch = text:sub(stopOffset + 1, stopOffset + 1)
-      if ch ~= '' then draw:text(charX, charY, ch, 'cursorText') end
-    end
-
-    -- Reserve content space so ImGui knows the drawable area
-    ImGui.Dummy(ctx, (totalWidth + GUTTER) * gridX, (gridHeight + HEADER) * gridY)
-  end
-
-  local function drawStatusBar()
-    local ppq      = rowPPQs[cursorRow]
-    local bar, beat, sub, ts = barBeatSub(cursorRow)
-    local col      = grid.cols[cursorCol]
-    local colLabel = col and col.label or '?'
-    local tsLabel  = ts and string.format("%d/%d", ts.num, ts.denom) or "?"
-
-    ImGui.Separator(ctx)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
-    ImGui.Text(ctx, string.format(
-      "%s | PPQ: %d | %d:%d.%d/%d | Octave: %d | Advance: %d",
-      colLabel, math.floor(ppq), bar, beat, sub, rowPerBeat, currentOctave, advanceBy
-    ))
-    ImGui.PopStyleColor(ctx)
-  end
-
-  ---------- COMMANDS & KEYBOARD
-
-  local commands = {
-    cursorDown  = function() scrollRowBy(1) end,
-    cursorUp    = function() scrollRowBy(-1) end,
-    pageDown    = function() scrollRowBy(rowPerBar) end,
-    pageUp      = function() scrollRowBy(-rowPerBar) end,
-    goTop       = function() scrollRowBy(1 - cursorRow) end,
-    goBottom    = function() scrollRowBy((grid.numRows or 1) - cursorRow) end,
-    cursorRight = function() scrollStopBy(1) end,
-    cursorLeft  = function() scrollStopBy(-1) end,
-    selectDown  = function() scrollRowBy(1, true) end,
-    selectUp    = function() scrollRowBy(-1, true) end,
-    selectRight = function() scrollStopBy(1, true) end,
-    selectLeft  = function() scrollStopBy(-1, true) end,
-    tabRight    = function() scrollGroupBy(1) end,
-    tabLeft     = function() scrollGroupBy(-1) end,
-    delete      = function() selClear(); deleteEvent(); scrollRowBy(advanceBy) end,
-    deleteSel   = function() deleteSelection() end,
-    copy        = function() copySelection() end,
-    cut         = function() cutSelection() end,
-    paste       = function() pasteClipboard() end,
-    upOctave    = function() setcfg('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
-    downOctave  = function() setcfg('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
-  }
-
-  for i = 0, 9 do
-    commands["advBy" .. i] = function() setcfg('take', 'advanceBy', i) end
-  end
-
-  local keymap = {
-    cursorDown  = { ImGui.Key_DownArrow  },
-    cursorUp    = { ImGui.Key_UpArrow    },
-    pageDown    = { ImGui.Key_PageDown   },
-    pageUp      = { ImGui.Key_PageUp     },
-    goTop       = { ImGui.Key_Home       },
-    goBottom    = { ImGui.Key_End        },
-    cursorRight = { ImGui.Key_RightArrow },
-    cursorLeft  = { ImGui.Key_LeftArrow  },
-    selectDown  = { { ImGui.Key_DownArrow,  ImGui.Mod_Shift } },
-    selectUp    = { { ImGui.Key_UpArrow,    ImGui.Mod_Shift } },
-    selectRight = { { ImGui.Key_RightArrow, ImGui.Mod_Shift } },
-    selectLeft  = { { ImGui.Key_LeftArrow,  ImGui.Mod_Shift } },
-    tabRight    = { ImGui.Key_Tab },
-    tabLeft     = { { ImGui.Key_Tab, ImGui.Mod_Shift } },
-    delete      = { ImGui.Key_Period },
-    deleteSel   = { ImGui.Key_Delete },
-    copy        = { { ImGui.Key_C, ImGui.Mod_Shortcut } },
-    cut         = { { ImGui.Key_X, ImGui.Mod_Shortcut } },
-    paste       = { { ImGui.Key_V, ImGui.Mod_Shortcut } },
-    quit        = { ImGui.Key_Enter },
-    upOctave    = { { ImGui.Key_8,  ImGui.Mod_Shift } },
-    downOctave  = { ImGui.Key_Slash },
-  }
-
-  for i = 0, 9 do
-    keymap["advBy" .. i] = { { ImGui.Key_0 + i, ImGui.Mod_Ctrl } }
-  end
-
-  local function nearestStop(mouseX, mouseY)
-    local fracX = (mouseX - gridOriginX) / gridX
-    local bestCol, bestStop, bestDist = nil, nil, math.huge
-    for i, col in ipairs(grid.cols) do
-      if col.x then
-        for s, pos in ipairs(col.stopPos) do
-          local dist = math.abs(fracX - col.x - pos - 0.5)
-          if dist < bestDist then
-            bestCol, bestStop, bestDist = i, s, dist
-          end
-        end
-      end
-    end
-    return bestCol, bestStop, fracX
-  end
-
-  local function handleMouse()
-    local clicked = ImGui.IsMouseClicked(ctx, 0)
-    local held    = ImGui.IsMouseDown(ctx, 0)
-
-    if clicked and ImGui.IsWindowHovered(ctx) then
-      local mouseX, mouseY = ImGui.GetMousePos(ctx)
-      local charY = math.floor((mouseY - gridOriginY) / gridY)
-      local col, stop, fracX = nearestStop(mouseX, mouseY)
-      if not col then return end
-      if charY < 0 or charY >= gridHeight then return end
-      if fracX < 0 then return end
-      local last = grid.cols[col]
-      if fracX >= last.x + last.width + 1 then return end
-
-      local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
-
-      if shift then
-        if not sel then selStart() end
-        cursorRow, cursorCol, cursorStop = scrollRow + charY, col, stop
-        clampCursor()
-        selUpdate()
-      else
-        selClear()
-        cursorRow, cursorCol, cursorStop = scrollRow + charY, col, stop
-        clampCursor()
-        dragging = true
-        dragWinX, dragWinY = ImGui.GetWindowPos(ctx)
-      end
-
-    elseif dragging and held then
-      local mouseX, mouseY = ImGui.GetMousePos(ctx)
-      local charY = math.floor((mouseY - gridOriginY) / gridY)
-      local row = scrollRow + charY
-      local fracX = (mouseX - gridOriginX) / gridX
-      local lastVis = lastVisibleFrom(scrollCol)
-      local rightEdge = grid.cols[lastVis].x + grid.cols[lastVis].width
-
-      local col, stop
-      if fracX < 0 then
-        col, stop = cursorCol, cursorStop - 1
-        if stop < 1 then
-          if col > 1 then col = col - 1; stop = #grid.cols[col].stopPos
-          else stop = 1 end
-        end
-      elseif fracX >= rightEdge then
-        col, stop = cursorCol, cursorStop + 1
-        if stop > #grid.cols[cursorCol].stopPos then
-          if col < #grid.cols then col = col + 1; stop = 1
-          else stop = #grid.cols[col].stopPos end
-        end
-      else
-        col, stop = nearestStop(mouseX, mouseY)
-        if not col then return end
-      end
-
-      -- Only start selection once cursor moves to a different position
-      if row ~= cursorRow or col ~= cursorCol or stop ~= cursorStop then
-        if not sel then selStart() end
-        cursorRow, cursorCol, cursorStop = row, col, stop
-        clampCursor()
-        selUpdate()
-      end
-
-    elseif dragging and not held then
-      dragging = false
-    end
-  end
-
-  local function handleKeys()
-    if ImGui.IsWindowFocused(ctx) then
-      local commandHeld = false
-      for command, keys in pairs(keymap) do
-        for _, key in ipairs(keys) do
-          local mods = ImGui.Mod_None
-          if type(key) == 'table' then
-            for i = 2, #key do
-              mods = mods | key[i]
-            end
-            key = key[1]
-          end
-          if ImGui.IsKeyDown(ctx, key) then commandHeld = true end
-          if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then
-            if command == 'quit' then
-              return true
-            else
-              commands[command]()
-              return
-            end
-          end
-        end
-      end
-
-      -- Edit keys: unmodified alphanumeric input
-      -- Skip if a command key is held — auto-repeat timing mismatches
-      -- between IsKeyPressed and the character queue can leak input
-      if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_None then
-        local col = grid.cols[cursorCol]
-        if col then
-          local type = col.type
-
-          -- Character queue: hex/decimal edits, octave changes
-          local idx = 0
-          while true do
-            local rv, char = ImGui.GetInputQueueCharacter(ctx, idx)
-            if not rv then break end
-            idx = idx + 1
-
-            local evt = col.cells and col.cells[cursorRow]
-            editEvent(col, evt, cursorStop, char)
-            scrollRowBy(advanceBy)
-          end
-        end
-      end
-    end
   end
 
   --------------------
@@ -1390,10 +1013,140 @@ function newViewManager(tm, cm)
 
   local vm = {}
 
-  function vm:init()
-    ctx  = ImGui.CreateContext('Readium Tracker')
-    font = ImGui.CreateFont('Source Code Pro', ImGui.FontFlags_Bold)
-    ImGui.Attach(ctx, font)
+  -- Exposed state for renderManager
+  vm.grid = grid
+
+  function vm:cursor()
+    return cursorRow, cursorCol, cursorStop, scrollRow, scrollCol
+  end
+
+  function vm:selection() return sel end
+
+  function vm:displayParams()
+    return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
+  end
+
+  function vm:fractionalRow(ppq)
+    if ppq >= length then return grid.numRows or 0 end
+    local row = ppqToRow(ppq)
+    local rowPPQ = rowPPQs[row] or 0
+    local nextPPQ = rowPPQs[row + 1] or length
+    local rowLen = nextPPQ - rowPPQ
+    if rowLen <= 0 then return row end
+    return row + (ppq - rowPPQ) / rowLen
+  end
+
+  function vm:rowPPQ(row) return rowPPQs[row] end
+
+  function vm:rowBeatInfo(row) return rowBeatInfo(row) end
+
+  function vm:barBeatSub(row) return barBeatSub(row) end
+
+  function vm:lastVisibleFrom(startCol) return lastVisibleFrom(startCol) end
+
+  function vm:setGridSize(w, h)
+    gridWidth, gridHeight = w, h
+  end
+
+  function vm:setCursor(row, col, stop)
+    cursorRow, cursorCol, cursorStop = row, col, stop
+    clampCursor()
+  end
+
+  function vm:selStart() selStart() end
+  function vm:selUpdate() selUpdate() end
+  function vm:selClear() selClear() end
+
+  function vm:editEvent(col, evt, stop, char)
+    editEvent(col, evt, stop, char)
+  end
+
+  function vm:tick()
+    if auditionNote and reaper.time_precise() - auditionTime > AUDITION_TIMEOUT then
+      killAudition()
+    end
+  end
+
+  -- Command table — renderManager maps keys to these
+  vm.commands = {
+    cursorDown     = function() scrollRowBy(1) end,
+    cursorUp       = function() scrollRowBy(-1) end,
+    pageDown       = function() scrollRowBy(rowPerBar) end,
+    pageUp         = function() scrollRowBy(-rowPerBar) end,
+    goTop          = function() scrollRowBy(-cursorRow) end,
+    goBottom       = function() scrollRowBy((grid.numRows or 1) - cursorRow) end,
+    cursorRight    = function() scrollStopBy(1) end,
+    cursorLeft     = function() scrollStopBy(-1) end,
+    selectDown     = function() scrollRowBy(1, true) end,
+    selectUp       = function() scrollRowBy(-1, true) end,
+    selectRight    = function() scrollStopBy(1, true) end,
+    selectLeft     = function() scrollStopBy(-1, true) end,
+    tabRight       = function() scrollGroupBy(1) end,
+    tabLeft        = function() scrollGroupBy(-1) end,
+    delete         = function() selClear(); deleteEvent(); scrollRowBy(advanceBy) end,
+    deleteSel      = function() deleteSelection() end,
+    copy           = function() copySelection() end,
+    cut            = function() cutSelection() end,
+    paste          = function() pasteClipboard() end,
+    upOctave       = function() setcfg('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
+    downOctave     = function() setcfg('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
+    noteOff        = noteOff,
+    growNote       = function() adjustDuration(1, false) end,
+    shrinkNote     = function() adjustDuration(-1, false) end,
+    growNoteFine   = function() adjustDuration(1, true) end,
+    shrinkNoteFine = function() adjustDuration(-1, true) end,
+    play           = function() tm:play() end,
+    playPause      = function() tm:playPause() end,
+    playFromTop    = function() tm:playFrom(0) end,
+    playFromCursor = function() tm:playFrom(rowPPQs[cursorRow] or 0) end,
+    stop           = function() tm:stop() end,
+    addNoteCol     = function() vm:addExtraCol('note') end,
+  }
+
+  --- Add an extra view-only column to the current channel.
+  --- type: 'note', 'cc', 'pb', 'at', 'pc'. id: CC number or nil.
+  function vm:addExtraCol(type, id)
+    local col = grid.cols[cursorCol]
+    if not col then return end
+    local chan = col.midiChan
+
+    if type == 'note' then
+      local maxId = 0
+      for _, c in ipairs(grid.cols) do
+        if c.midiChan == chan and c.type == 'note' and c.id > maxId then maxId = c.id end
+      end
+      id = maxId + 1
+    else
+      -- Duplicate check
+      for _, c in ipairs(grid.cols) do
+        if c.midiChan == chan and c.type == type and c.id == id then return end
+      end
+    end
+
+    local extras = cfg('extraColumns', {})
+    local chanExtras = extras[chan] or {}
+    chanExtras[#chanExtras + 1] = { type = type, id = id }
+    extras[chan] = chanExtras
+    setcfg('take', 'extraColumns', extras)
+    vm:rebuild()
+  end
+
+  --- Parse a type string like "cc74", "pb", "at", "pc" and add as extra column.
+  function vm:addTypedCol(typeStr)
+    local type, idStr = typeStr:lower():match('^(%a+)(%d*)$')
+    if not type then return end
+    local id = idStr ~= '' and tonumber(idStr) or nil
+
+    if type == 'cc' then
+      if not id or id < 0 or id > 127 then return end
+    elseif type ~= 'pb' and type ~= 'at' and type ~= 'pc' then
+      return
+    end
+    vm:addExtraCol(type, id)
+  end
+
+  for i = 0, 9 do
+    vm.commands['advBy' .. i] = function() setcfg('take', 'advanceBy', i) end
   end
 
   ---------- REBUILD
@@ -1403,36 +1156,27 @@ function newViewManager(tm, cm)
     changed = changed or { take = false, data = true }
 
     if changed.take then
-      ppqPerQN  = tm:reso()
-      length    = tm:length()
-      timeSigs  = tm:timeSigs()
-      cursorRow = 0
-      cursorCol = 1
+      resolution = tm:resolution()
+      length     = tm:length()
+      timeSigs   = tm:timeSigs()
+      cursorRow  = 0
+      cursorCol  = 1
       selClear()
     end
 
     if changed.take or changed.data then
       advanceBy = cfg('advanceBy', 1)
       currentOctave = cfg('currentOctave', 2)
-      rowPerBeat = cfg("rowPerBeat", 4)
+      rowPerBeat = cfg('rowPerBeat', 4)
       -- Grid resolution is pinned to the first time sig's denominator;
       -- mid-item time sig changes affect bar/beat highlighting but not row size.
       local denom = timeSigs[1] and timeSigs[1].denom or 4
       local num   = timeSigs[1] and timeSigs[1].num or 4
       rowPerBar = rowPerBeat * num
-      ppqPerRow = (ppqPerQN * 4 / denom) / rowPerBeat
+      local ppqPerRow = (resolution * 4 / denom) / rowPerBeat
 
       grid.cols   = {}
       grid.groups = {}
-
-      local renderFns = {
-        note = renderNote,
-        pb   = renderPB,
-        cc   = renderCC,
-        pa   = renderCC,
-        at   = renderCC,
-        pc   = renderCC,
-      }
 
       -- cursor stop positions in each column
       local stopPos = {
@@ -1454,29 +1198,70 @@ function newViewManager(tm, cm)
         pc = {1,1},
       }
 
+      local function addGridCol(group, chan, type, id, events)
+        local colLabels = {
+          note = id and id > 1 and ('Note ' .. id) or 'Note',
+          cc   = 'CC' .. (id or ''),
+          pb   = 'PB',  at = 'AT',  pa = 'PA',  pc = 'PC',
+        }
+        local gridCol = {
+          id        = id,
+          type      = type,
+          label     = colLabels[type] or '',
+          events    = events or {},
+          stopPos   = stopPos[type] or {0},
+          selGroups = selGroups[type] or {0},
+          width     = type == 'note' and 6
+                   or type == 'pb' and 4
+                   or 2,
+          group     = group,
+          midiChan  = chan,
+          cells     = {},
+        }
+        util:add(grid.cols, gridCol)
+        group.firstCol = group.firstCol or #grid.cols
+        group.lastCol  = #grid.cols
+      end
+
+      local extras = cfg('extraColumns', {})
+      local extrasChanged = false
+
       for chan, channel in tm:channels() do
         local group = util:add(grid.groups, {
           id       = util.IDX,
-          label    = channel.label,
+          label    = 'Ch ' .. chan,
         })
 
         for _, column in ipairs(channel.columns) do
-          local gridCol = util:pick(column, "id type label events")
-          util:assign(gridCol, {
-            renderFn = renderFns[gridCol.type] or renderDefault,
-            stopPos  = stopPos[gridCol.type] or {0},
-            selGroups= selGroups[gridCol.type] or {0},
-            width    = gridCol.type == "note" and 6
-                    or gridCol.type == "pb" and 4
-                    or 2,
-            group    = group,
-            midiChan = chan,
-            cells    = {},
-          })
-          util:add(grid.cols, gridCol)
-          group.firstCol = group.firstCol or #grid.cols
-          group.lastCol  = #grid.cols
+          addGridCol(group, chan, column.type, column.id, column.events)
         end
+
+        -- Inject view-only extra columns, pruning any now owned by trackerManager
+        local chanExtras = extras[chan]
+        if chanExtras then
+          local kept = {}
+          for _, extra in ipairs(chanExtras) do
+            local found = false
+            for _, col in ipairs(channel.columns) do
+              if col.type == extra.type and col.id == extra.id then
+                found = true
+                break
+              end
+            end
+            if found then
+              extrasChanged = true
+            else
+              kept[#kept + 1] = extra
+              addGridCol(group, chan, extra.type, extra.id)
+            end
+          end
+          extras[chan] = #kept > 0 and kept or nil
+          group.extraColumns = extras[chan]
+        end
+      end
+
+      if extrasChanged then
+        setcfg('take', 'extraColumns', next(extras) and extras or nil)
       end
 
       rowPPQs = {}
@@ -1509,42 +1294,6 @@ function newViewManager(tm, cm)
     end
   end
 
-  function vm:loop()
-    if not ctx then return false end
-
-    ImGui.PushFont(ctx, font, 15)
-    local styleCount = pushStyles()
-
-    if dragging then
-      ImGui.SetNextWindowPos(ctx, dragWinX, dragWinY)
-    end
-    local visible, open = ImGui.Begin(ctx, 'Readium Tracker', true,
-      ImGui.WindowFlags_NoScrollbar
-      | ImGui.WindowFlags_NoScrollWithMouse
-      | ImGui.WindowFlags_NoDocking
-      | ImGui.WindowFlags_NoNav)
-    local quit = false
-
-    if visible then
-      if #grid.cols > 0 then
-        drawToolbar()
-        drawTracker()
-        drawStatusBar()
-        handleMouse()
-        quit = handleKeys()
-      else
-        ImGui.Text(ctx, "Select a MIDI item to begin.")
-      end
-
-      ImGui.End(ctx)
-    end
-
-    ImGui.PopStyleColor(ctx, styleCount)
-    ImGui.PopFont(ctx)
-
-    return open and not quit
-  end
-
   -- LIFECYCLE
 
   local callback = function(changed, _tm)
@@ -1555,7 +1304,6 @@ function newViewManager(tm, cm)
 
   local configCallback = function(changed, _cm)
     if changed.config then
-      colourCache = {}
       vm:rebuild({ take = false, data = true })
     end
   end

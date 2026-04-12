@@ -27,19 +27,17 @@
 --
 --   Each channel table contains:
 --     chan    : number (1..16)
---     label   : string ("Channel 1", etc.)
 --     columns : array of column tables
 --
 --   Each column table contains:
 --     order  : number (position within the channel after sorting)
---     type   : string ("note", "cc", "pb", "at", "pa", "pc")
+--     type   : string ('note', 'cc', 'pb', 'at', 'pa', 'pc')
 --     id     : number or nil (note columns: 1, 2, ...; cc columns: CC number)
---     label  : string ("Note", "Note 2", "CC74", "PB", etc.)
 --     events : array of event tables, sorted by ppq
 --
 -- GLOBAL DATA
 --   tm:length()       -- take length in PPQ (delegated to midiManager)
---   tm:reso()         -- PPQ per quarter note (delegated to midiManager)
+--   tm:resolution()   -- PPQ per quarter note (delegated to midiManager)
 --   tm:editCursor()   -- edit cursor position in PPQ relative to the take start
 --------------------
 
@@ -76,20 +74,10 @@ function newTrackerManager(mm, cm)
   --------------------
 
   local function addColumn(channel, type, id)
-    local colLabels = {
-      note = id and id > 1 and ("Note " .. id) or " Note",
-      cc   = "CC" .. (id or ""),
-      pb   = " PB",
-      at   = "AT",
-      pa   = "PA",
-      pc   = "PC",
-    }
-
     return util:add(channel.columns, {
       order  = #channel.columns + 1,
       type   = type,
       id     = id,
-      label  = colLabels[type] or "",
       events = {},
     })
   end
@@ -99,7 +87,7 @@ function newTrackerManager(mm, cm)
     for _, col in ipairs(channel.columns) do
       if col.type == 'note' and col.id > maxId then maxId = col.id end
     end
-    return addColumn(channel, "note", maxId + 1)
+    return addColumn(channel, 'note', maxId + 1)
   end
 
   local function getOrCreateTypedColumn(channel, colType, colId, extra)
@@ -126,7 +114,7 @@ function newTrackerManager(mm, cm)
   --------------------
 
   local function noteColumnAccepts(col, notePpq, noteEndPpq)
-    local overlapThreshold = cfg("overlapOffset", 0) * mm:reso()
+    local overlapThreshold = cfg('overlapOffset', 1/16) * mm:resolution()
     local dominated = 0
     for _, evt in ipairs(col.events) do
       if notePpq == evt.ppq then return false end
@@ -159,12 +147,12 @@ function newTrackerManager(mm, cm)
       end
       if not needsRealloc then
         -- didn't find a matching note column, so create one
-        return addColumn(channel, "note", note.colID)
+        return addColumn(channel, 'note', note.colID)
       end
     end
     -- didn't match existing note colID, or matched and didn't fit
     for _, col in ipairs(channel.columns) do
-      if col.type == "note" and noteColumnAccepts(col, note.ppq, note.endppq) then
+      if col.type == 'note' and noteColumnAccepts(col, note.ppq, note.endppq) then
         return col
       end
     end
@@ -177,7 +165,7 @@ function newTrackerManager(mm, cm)
 
   local function findNoteColumnForPitch(channel, pitch, ppq_pos)
     for _, col in ipairs(channel.columns) do
-      if col.type == "note" then
+      if col.type == 'note' then
         for _, evt in ipairs(col.events) do
           if evt.pitch == pitch and evt.ppq <= ppq_pos and evt.endppq > ppq_pos then
             return col
@@ -186,7 +174,7 @@ function newTrackerManager(mm, cm)
       end
     end
     for _, col in ipairs(channel.columns) do
-      if col.type == "note" then
+      if col.type == 'note' then
         for _, evt in ipairs(col.events) do
           if evt.pitch == pitch then return col end
         end
@@ -196,12 +184,12 @@ function newTrackerManager(mm, cm)
   end
 
   --------------------
-  -- Tuning: add missing pitchbend events for "pitchbend" mode
-  -- Precondition: all events have a "detune" parameter
+  -- Tuning: add missing pitchbend events for 'pitchbend' mode
+  -- Precondition: all events have a 'detune' parameter
   --------------------
 
   local function addMissingPitchbends()
-    local pbRange = cfg("pbRange", 2)
+    local pbRange = cfg('pbRange', 2)
 
     local toInsert = {}
     
@@ -211,7 +199,7 @@ function newTrackerManager(mm, cm)
         -- pitchbend data is keyed to the first note column;
         -- microtuning and secondary note columns shouldn't be mixed
         
-        if col.type == "note" and col.id == 1 then
+        if col.type == 'note' and col.id == 1 then
           local currentRaw = 4096
           local currentCents = 0
           local currentLogical = 0
@@ -220,7 +208,7 @@ function newTrackerManager(mm, cm)
       
           -- Iterate over raw pb messages for this channel
           for _, cc in mm:ccs() do
-            if cc.chan == chan and cc.msgType == "pb" then
+            if cc.chan == chan and cc.msgType == 'pb' then
               -- iterate over all notes up to this pitchbend message
               nextNote = col.events[loc]
               while nextNote and nextNote.ppq < cc.ppq do
@@ -230,7 +218,7 @@ function newTrackerManager(mm, cm)
                   toInsert[#toInsert + 1] = {
                     ppq = nextNote.ppq,
                     chan = chan,
-                    msgType = "pb",
+                    msgType = 'pb',
                     val = currentRaw,  -- whatever pb is already in effect
                   }
                 end
@@ -251,7 +239,7 @@ function newTrackerManager(mm, cm)
               toInsert[#toInsert + 1] = {
                 ppq = nextNote.ppq,
                 chan = chan,
-                msgType = "pb",
+                msgType = 'pb',
                 val = currentRaw,  -- whatever pb is already in effect
               }
             end
@@ -295,7 +283,6 @@ function newTrackerManager(mm, cm)
     for i = 1, 16 do
       channels[i] = {
         chan = i,
-        label = 'Ch ' .. i,
         columns = { },
       }
       addNoteColumn(channels[i])
@@ -306,6 +293,33 @@ function newTrackerManager(mm, cm)
       if not note.detune then
         mm:assignNote(loc, { detune = 0 })
       end
+    end
+
+    -- 1b) Truncate overlapping notes on the same channel and pitch.
+    --      The earlier note is clipped to end where the later one begins.
+    local truncations = {}
+    do
+      local groups = {}
+      for loc, note in mm:notes() do
+        local key = note.chan .. '|' .. note.pitch
+        if not groups[key] then groups[key] = {} end
+        util:add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
+      end
+      for _, group in pairs(groups) do
+        table.sort(group, function(a, b) return a.ppq < b.ppq end)
+        for i = 1, #group - 1 do
+          if group[i].endppq > group[i + 1].ppq then
+            util:add(truncations, { loc = group[i].loc, endppq = group[i + 1].ppq })
+          end
+        end
+      end
+    end
+    if #truncations > 0 then
+      mm:modify(function()
+        for _, t in ipairs(truncations) do
+          mm:assignNote(t.loc, { endppq = t.endppq })
+        end
+      end)
     end
 
     -- 2) Assign notes to note columns
@@ -320,22 +334,24 @@ function newTrackerManager(mm, cm)
     end
     
     -- 2b) Compact note columns: remove empties, close gaps in IDs
+    -- Always keep at least one note column per channel.
     for _, channel in ipairs(channels) do
       local kept = {}
+      local keptNote = false
       for _, col in ipairs(channel.columns) do
-        if col.type ~= "note" or #col.events > 0 then
+        if col.type ~= 'note' or #col.events > 0 or not keptNote then
           kept[#kept + 1] = col
+          if col.type == 'note' then keptNote = true end
         end
       end
       channel.columns = kept
 
       local newId = 0
       for _, col in ipairs(channel.columns) do
-        if col.type == "note" then
+        if col.type == 'note' then
           newId = newId + 1
           if col.id ~= newId then
             col.id = newId
-            col.label = newId > 1 and ("Note " .. newId) or " Note"
             for _, evt in ipairs(col.events) do
               mm:assignNote(evt.loc, { colID = newId })
             end
@@ -347,7 +363,7 @@ function newTrackerManager(mm, cm)
     -- 3) Pitchbend: build logical pitchbend lane per channel
     --    Note lane 1 is used
 
-    local pbRange = cfg("pbRange", 2)
+    local pbRange = cfg('pbRange', 2)
     addMissingPitchbends()
 
     for chan = 1, 16 do
@@ -367,9 +383,9 @@ function newTrackerManager(mm, cm)
 
       if notes then
         for loc, cc in mm:ccs() do
-          if cc.chan == chan and cc.msgType == "pb" then
+          if cc.chan == chan and cc.msgType == 'pb' then
             if not col then
-              col = getOrCreateTypedColumn(channel, "pb")
+              col = getOrCreateTypedColumn(channel, 'pb')
             end
 
             -- Find detune just before this ppq
@@ -405,22 +421,22 @@ function newTrackerManager(mm, cm)
     for loc, cc in mm:ccs() do
       local channel = channels[cc.chan]
 
-      if cc.msgType == "pa" then
+      if cc.msgType == 'pa' then
         -- Poly AT → attach to the note column owning that pitch
         local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
         if noteCol then
           util:add(noteCol.events,{
-            ppq = cc.ppq, type = "pa", pitch = cc.pitch, vel = cc.val, loc = loc
+            ppq = cc.ppq, type = 'pa', pitch = cc.pitch, vel = cc.val, loc = loc
           })
         else
           -- Orphaned poly AT → dedicated column
-          local col = getOrCreateTypedColumn(channel, "pa")
+          local col = getOrCreateTypedColumn(channel, 'pa')
           util:add(col.events, {
             ppq = cc.ppq, pitch = cc.pitch, vel = cc.val,
           })
         end
-      elseif cc.msgType == "cc" or cc.msgType == "at" or cc.msgType == "pc" then
-        local col = getOrCreateTypedColumn(channel, "cc", cc.cc)
+      elseif cc.msgType == 'cc' or cc.msgType == 'at' or cc.msgType == 'pc' then
+        local col = getOrCreateTypedColumn(channel, 'cc', cc.cc)
         util:add(col.events, {
           ppq = cc.ppq, val = cc.val, loc = loc,
         })
@@ -438,8 +454,8 @@ function newTrackerManager(mm, cm)
     -- 6) Reorder columns: notes first, then everything else
     for _, chan in ipairs(channels) do
       table.sort(chan.columns, function(a, b)
-        local aNote = a.type == "note" and 0 or 1
-        local bNote = b.type == "note" and 0 or 1
+        local aNote = a.type == 'note' and 0 or 1
+        local bNote = b.type == 'note' and 0 or 1
         if aNote ~= bNote then return aNote < bNote end
         return a.order < b.order
       end)
@@ -486,12 +502,30 @@ function newTrackerManager(mm, cm)
     return mm and mm:length()
   end
 
-  function tm:reso()
-    return mm and mm:reso()
+  function tm:resolution()
+    return mm and mm:resolution()
   end
 
   function tm:timeSigs()
     return mm and mm:timeSigs() or {}
+  end
+
+  function tm:playFrom(ppq)
+    if not (mm and mm:take()) then return end
+    reaper.SetEditCurPos(reaper.MIDI_GetProjTimeFromPPQPos(mm:take(), ppq), false, false)
+    reaper.Main_OnCommand(1007, 0)  -- Transport: Play
+  end
+
+  function tm:play()
+    reaper.Main_OnCommand(1007, 0)
+  end
+
+  function tm:stop()
+    reaper.Main_OnCommand(1016, 0)
+  end
+
+  function tm:playPause()
+    reaper.Main_OnCommand(40073, 0)
   end
 
   -- EDITING
@@ -518,7 +552,7 @@ function newTrackerManager(mm, cm)
   end
   
   function tm:editCell(type, evt, field, value)
-    print("editCell", type, "at", evt.loc or 0, "time", evt.ppq, field .. "=" .. value)
+    print('editCell', type, 'at', evt.loc or 0, 'time', evt.ppq, field .. '=' .. value)
   end
 
   function tm:addEvents(type, evts)
@@ -531,23 +565,31 @@ function newTrackerManager(mm, cm)
   end
 
   function tm:assignEvents(type, evts)
+    local assigns, deletes = {}, {}
+    for _, pair in ipairs(evts) do
+      if pair[2].loc == util.REMOVE then deletes[#deletes+1] = pair[1]
+      else assigns[#assigns+1] = pair end
+    end
+    table.sort(deletes, function(a, b) return a.loc > b.loc end)
     mm:modify(function()
-      for _, pair in ipairs(evts) do
-        local evt, update = pair[1], pair[2]
-        if update.loc == util.REMOVE then
-          if type == 'note' then mm:deleteNote(evt.loc)
-          else mm:deleteCC(evt.loc) end
-        else
-          if type == 'note' then mm:assignNote(evt.loc, update)
-          else mm:assignCC(evt.loc, update) end
-        end
+      for _, pair in ipairs(assigns) do
+        if type == 'note' then mm:assignNote(pair[1].loc, pair[2])
+        else mm:assignCC(pair[1].loc, pair[2]) end
+      end
+      for _, evt in ipairs(deletes) do
+        print("DELETING")
+        util:print_r(evt)
+        if type == 'note' then mm:deleteNote(evt.loc)
+        else mm:deleteCC(evt.loc) end
       end
     end)
   end
 
   function tm:deleteEvents(type, evts)
+    local sorted = { table.unpack(evts) }
+    table.sort(sorted, function(a, b) return a.loc > b.loc end)
     mm:modify(function()
-      for _, evt in ipairs(evts) do
+      for _, evt in ipairs(sorted) do
         if type == 'note' then mm:deleteNote(evt.loc)
         else mm:deleteCC(evt.loc) end
       end

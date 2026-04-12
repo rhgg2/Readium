@@ -2,10 +2,10 @@ util = {}
 
 function util:print(...)
   if ( not ... ) then
-    reaper.ShowConsoleMsg("nil value\n")
+    reaper.ShowConsoleMsg('nil value\n')
     return
   end
-  reaper.ShowConsoleMsg(table.concat({...}, "\t") .. "\n")
+  reaper.ShowConsoleMsg(table.concat({...}, '\t') .. '\n')
 end
 
 local function print(...)
@@ -13,24 +13,24 @@ local function print(...)
 end
 
 function util:print_r(root)
-  local cache = {  [root] = "." }
+  local cache = {  [root] = '.' }
   local function _dump(t,space,name)
     local temp = {}
     for k,v in pairs(t) do
       local key = tostring(k)
       if cache[v] then
-        table.insert(temp,"+" .. key .. " {" .. cache[v].."}")
-      elseif type(v) == "table" then
-        local new_key = name .. "." .. key
+        table.insert(temp,'+' .. key .. ' {' .. cache[v]..'}')
+      elseif type(v) == 'table' then
+        local new_key = name .. '.' .. key
         cache[v] = new_key
-        table.insert(temp,"+" .. key .. _dump(v,space .. (next(t,k) and "|" or " " ).. string.rep(" ",#key),new_key))
+        table.insert(temp,'+' .. key .. _dump(v,space .. (next(t,k) and '|' or ' ' ).. string.rep(' ',#key),new_key))
       else
-        table.insert(temp,"+" .. key .. " [" .. tostring(v).."]")
+        table.insert(temp,'+' .. key .. ' [' .. tostring(v)..']')
       end
     end
-    return table.concat(temp,"\n"..space)
+    return table.concat(temp,'\n'..space)
   end
-  print(_dump(root, "",""))
+  print(_dump(root, '',''))
 end
 
 util.REMOVE = { }
@@ -71,15 +71,15 @@ end
 
 function util:pick(src, keys)
   local dst = {}
-  for k in keys:gmatch("%S+") do
+  for k in keys:gmatch('%S+') do
     dst[k] = src[k]
   end
   return dst
 end
 
 local function escape_string(s)
-  return (s:gsub("[\\{},=]", function(c)
-    return "\\" .. c
+  return (s:gsub('[\\{},=]', function(c)
+    return '\\' .. c
   end))
 end
 
@@ -87,16 +87,16 @@ function util:serialise(value, exclude, seen)
   exclude = exclude or { } 
   local t = type(value)
 
-  if t == "number" then
+  if t == 'number' then
     return tostring(value)
 
-  elseif t == "string" then
+  elseif t == 'string' then
     return escape_string(value)
 
-  elseif t == "table" then
+  elseif t == 'table' then
     seen = seen or {}
     if seen[value] then
-      error("cycle detected during serialisation")
+      error('cycle detected during serialisation')
     end
     seen[value] = true
 
@@ -105,15 +105,15 @@ function util:serialise(value, exclude, seen)
       if not exclude[k] then
         local key_str = util:serialise(k, nil, seen)
         local val_str = util:serialise(v, nil, seen)
-        parts[#parts+1] = key_str .. "=" .. val_str
+        parts[#parts+1] = key_str .. '=' .. val_str
       end
     end
 
     seen[value] = nil
-    return "{" .. table.concat(parts, ",") .. "}"
+    return '{' .. table.concat(parts, ',') .. '}'
 
   else
-    error("unsupported type: " .. t)
+    error('unsupported type: ' .. t)
   end
 end
 
@@ -137,16 +137,16 @@ function util:unserialise(input)
     while pos <= len do
       local c = nextChar()
 
-      if c == "\\" then
+      if c == '\\' then
         local n = nextChar()
 
-        if n == "{" or n == "}" or n == "," or n == "=" or n == "\\" then
+        if n == '{' or n == '}' or n == ',' or n == '=' or n == '\\' then
           buf[#buf+1] = n
         else
-          error("invalid escape: \\" .. tostring(n))
+          error('invalid escape: \\' .. tostring(n))
         end
 
-      elseif c == "{" or c == "}" or c == "," or c == "=" then
+      elseif c == '{' or c == '}' or c == ',' or c == '=' then
         pos = pos - 1
         break
 
@@ -169,13 +169,13 @@ function util:unserialise(input)
   local parseValue -- forward decl
 
   local function parseTable()
-    if nextChar() ~= "{" then
+    if nextChar() ~= '{' then
       error("expected '{'")
     end
 
     local t = {}
 
-    if peek() == "}" then
+    if peek() == '}' then
       nextChar()
       return t
     end
@@ -183,7 +183,7 @@ function util:unserialise(input)
     while true do
       local key = parseValue()
 
-      if nextChar() ~= "=" then
+      if nextChar() ~= '=' then
         error("expected '=' after key")
       end
 
@@ -192,9 +192,9 @@ function util:unserialise(input)
 
       local c = nextChar()
 
-      if c == "}" then
+      if c == '}' then
         break
-      elseif c == "," then
+      elseif c == ',' then
         -- continue
       else
         error("expected ',' or '}'")
@@ -205,7 +205,7 @@ function util:unserialise(input)
   end
 
   function parseValue()
-    if peek() == "{" then
+    if peek() == '{' then
       return parseTable()
     else
       return parseStringToken()
@@ -215,7 +215,7 @@ function util:unserialise(input)
   local result = parseValue()
 
   if pos <= len then
-    error("trailing characters")
+    error('trailing characters')
   end
 
   return result
@@ -233,7 +233,7 @@ end
 
 function util:fromBase36(txt)
   if not tonumber(txt,36) then
-    print("Error! " .. txt .. " is not a valid base36 string")
+    print('Error! ' .. txt .. ' is not a valid base36 string')
     return nil
   else
     return tonumber(txt,36)
@@ -241,9 +241,9 @@ function util:fromBase36(txt)
 end
 
 function util:toBase36(num)
-  local alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-  if num == 0 then return "0" end
-  local result = ""
+  local alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  if num == 0 then return '0' end
+  local result = ''
   while num > 0 do
     local remainder = num % 36
     result = string.sub(alphabet, remainder + 1, remainder + 1) .. result

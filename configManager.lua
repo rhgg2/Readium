@@ -47,7 +47,7 @@
 --     changed is of the form { config = true }
 --
 -- LEVELS (valid strings for the level parameter)
---   "global", "project", "track", "take"
+--   'global', 'project', 'track', 'take'
 --------------------
 
 loadModule('util')
@@ -62,9 +62,9 @@ function newConfigManager()
 
   ---------- PRIVATE DATA
 
-  local CONFIG_PREFIX = "rdm_"
+  local CONFIG_PREFIX = 'rdm_'
   local SCRIPT_PATH = debug.getinfo(1,'S').source:match[[^@?(.*[\/])[^\/]-$]]
-  local CONFIG_GLOBAL_PATH = SCRIPT_PATH .. "rdm_cfg.txt"
+  local CONFIG_GLOBAL_PATH = SCRIPT_PATH .. 'rdm_cfg.txt'
 
   local take      = nil
   local track     = nil
@@ -78,7 +78,7 @@ function newConfigManager()
     take    = nil,
   }
 
-  local levels = { "global", "project", "track", "take" }
+  local levels = { 'global', 'project', 'track', 'take' }
 
   local levelSet = {}
   for _, l in ipairs(levels) do levelSet[l] = true end
@@ -86,26 +86,26 @@ function newConfigManager()
   ---------- STORAGE BACKENDS
 
   local function parse(text)
-    if not text or text == "" then return {} end
+    if not text or text == '' then return {} end
     local ok, result = pcall(util.unserialise, util, text)
-    if ok and type(result) == "table" then return result end
+    if ok and type(result) == 'table' then return result end
     return {}
   end
   
   -- Level 1: global (Lua file on disk)
 
   local function loadGlobal()
-    local f = io.open(CONFIG_GLOBAL_PATH, "r")
+    local f = io.open(CONFIG_GLOBAL_PATH, 'r')
     if not f then return {} end
-    local content = f:read("*a")
+    local content = f:read('*a')
     f:close()
     return parse(content)
   end
 
   local function saveGlobal(tbl)
-    local f = io.open(CONFIG_GLOBAL_PATH, "w")
+    local f = io.open(CONFIG_GLOBAL_PATH, 'w')
     if not f then
-      print("Error! Could not write global config to " .. CONFIG_GLOBAL_PATH)
+      print('Error! Could not write global config to ' .. CONFIG_GLOBAL_PATH)
       return
     end
     f:write(util:serialise(tbl))
@@ -115,12 +115,12 @@ function newConfigManager()
   -- Level 2: project (project extension data)
 
   local function loadProject()
-    local ok, val = reaper.GetProjExtState(0, "rdm", "config")
+    local ok, val = reaper.GetProjExtState(0, 'rdm', 'config')
     return ok and parse(val)
   end
 
   local function saveProject(tbl)
-    reaper.SetProjExtState(0, "rdm", "config", util:serialise(tbl))
+    reaper.SetProjExtState(0, 'rdm', 'config', util:serialise(tbl))
   end
 
   -- Level 3: track (track extension data)
@@ -128,33 +128,33 @@ function newConfigManager()
   local function loadTrack()
     if not track then return {} end
     local ok, val = reaper.GetSetMediaTrackInfo_String(
-      track, "P_EXT:" .. CONFIG_PREFIX .. "config", "", false)
+      track, 'P_EXT:' .. CONFIG_PREFIX .. 'config', '', false)
     return ok and parse(val)
   end
 
   local function saveTrack(tbl)
     if not track then
-      print("Error! No track context for config storage")
+      print('Error! No track context for config storage')
       return
     end
     reaper.GetSetMediaTrackInfo_String(
-      track, "P_EXT:" .. CONFIG_PREFIX .. "config", util:serialise(tbl), true)
+      track, 'P_EXT:' .. CONFIG_PREFIX .. 'config', util:serialise(tbl), true)
   end
 
   -- Level 4: take (take extension data)
 
   local function loadTake()
     if not take then return {} end
-    local ok, val = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_config", "", false)
+    local ok, val = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', '', false)
     return ok and parse(val)
   end
 
   local function saveTake(tbl)
     if not take then
-      print("Error! No take context for config storage")
+      print('Error! No take context for config storage')
       return
     end
-    reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_config", util:serialise(tbl), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', util:serialise(tbl), true)
   end
 
   -- Backend dispatch
@@ -204,7 +204,7 @@ function newConfigManager()
 
   local function checkLevel(level)
     if not levelSet[level] then
-      print("Error! Unknown config level: " .. tostring(level))
+      print('Error! Unknown config level: ' .. tostring(level))
       return false
     end
     return true
@@ -282,7 +282,7 @@ function newConfigManager()
   end
 
   function cm:assign(level, updates)
-    if type(updates) ~= "table" then return end
+    if type(updates) ~= 'table' then return end
     if not checkLevel(level) then return end
     ensureCache()
 

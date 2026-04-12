@@ -94,7 +94,7 @@
 --
 -- TAKE DATA
 --   mm:take()                         -- the current REAPER take (read-only)
---   mm:reso()                         -- PPQ per quarter note
+--   mm:resolution()                   -- PPQ per quarter note
 --   mm:length()                       -- take length in PPQ (excludes looping)
 --
 -- ACCESSORS
@@ -148,14 +148,14 @@ function newMidiManager(take)
   local function loadMetadata()
     if not take then return end
 
-    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_keys", "", false)
-    if not (ok and keysText and keysText ~= "") then return {} end
+    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
+    if not (ok and keysText and keysText ~= '') then return {} end
     local tbl = {}
-    for uuidTxt in keysText:gmatch("[^,]+") do
+    for uuidTxt in keysText:gmatch('[^,]+') do
       local uuid = util:fromBase36(uuidTxt)
       tbl[uuid] = { }
 
-      local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_" .. uuidTxt, "", false)
+      local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, '', false)
       if entryOk and fields then
         tbl[uuid] = util:unserialise(fields)
       end
@@ -170,7 +170,7 @@ function newMidiManager(take)
     local data = uuidTbl[uuid]
 
     if not data then
-      print("Error! uuid not found")
+      print('Error! uuid not found')
       return nil
     end
     
@@ -180,7 +180,7 @@ function newMidiManager(take)
       pitch = true, vel = true, uuid = true, uuidIdx = true,
     }
 
-    reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_" .. uuidTxt, util:serialise(data, noteEventFields), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util:serialise(data, noteEventFields), true)
   end
 
   local function saveMetadata()
@@ -195,12 +195,12 @@ function newMidiManager(take)
     end
 
     -- Delete stale keys that exist in the old key list but not in metadata table
-    local ok, oldKeysText = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_keys", "", false)
-    if ok and oldKeysText and oldKeysText ~= "" then
-      for oldUuidTxt in oldKeysText:gmatch("[^,]+") do
+    local ok, oldKeysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
+    if ok and oldKeysText and oldKeysText ~= '' then
+      for oldUuidTxt in oldKeysText:gmatch('[^,]+') do
         if not newKeys[oldUuidTxt] then
           -- Writing an empty string effectively removes the extension data
-          reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_" .. oldUuidTxt, "", true)
+          reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. oldUuidTxt, '', true)
         end
       end
     end
@@ -210,7 +210,7 @@ function newMidiManager(take)
     for uuidTxt in pairs(newKeys) do
       keyList[#keyList + 1] = uuidTxt
     end
-    reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:rdm_keys", table.concat(keyList, ","), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keyList, ','), true)
   end
 
   local function removeDuplicateEvents()
@@ -303,7 +303,7 @@ function newMidiManager(take)
     -- remove duplicate notes
     local removedCount = removeDuplicateEvents() or 0
     if removedCount > 0 then
-      print("Removed " .. removedCount .. " duplicate events!")
+      print('Removed ' .. removedCount .. ' duplicate events!')
     end
 
     -- get note data
@@ -341,7 +341,7 @@ function newMidiManager(take)
       local ok, selected, muted, ppq, chanmsg, chan, msg2, msg3 = reaper.MIDI_GetCC(take, i)
       chan = chan + 1
       if ok then
-        local msgType = chanMsgTypes[chanmsg] or ("chanmsg_" .. chanmsg)
+        local msgType = chanMsgTypes[chanmsg] or ('chanmsg_' .. chanmsg)
         local entry = {
           idx     = i,
           ppq     = ppq,
@@ -379,7 +379,7 @@ function newMidiManager(take)
     for i = 0, textCount-1 do
       local ok, selected, muted, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
-        local chan, pitch, uuidTxt = msg:match("^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$")
+        local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
         chan = chan + 1
         if uuidTxt then
           -- one of our UUID identifiers
@@ -391,7 +391,7 @@ function newMidiManager(take)
             note.uuidIdx = i
             UUIDCount[uuid] = (UUIDCount[uuid] or 0) + 1
           else
-            print("Error! UUID at " .. ppq .. " has no coincident note")
+            print('Error! UUID at ' .. ppq .. ' has no coincident note')
           end
         end
       end
@@ -414,34 +414,34 @@ function newMidiManager(take)
         UUIDCount[oldUUID] = UUIDCount[oldUUID] - 1
         UUIDCount[newUUID] = 1
         metadata[newUUID] = util:assign({}, metadata[oldUUID] or {})
-        reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format("NOTE %d %d custom rdm_%s", note.chan - 1, note.pitch, util:toBase36(newUUID)), false)
+        reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, util:toBase36(newUUID)), false)
       elseif not uuid then
         local newUUID = assignNewUUID(note)
         UUIDCount[newUUID] = 1
         metadata[newUUID] = {}
-        reaper.MIDI_InsertTextSysexEvt(take, false, false, note.ppq, 15, string.format("NOTE %d %d custom rdm_%s", note.chan - 1, note.pitch, util:toBase36(newUUID)))
+        reaper.MIDI_InsertTextSysexEvt(take, false, false, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, util:toBase36(newUUID)))
       end
     end
     reaper.MIDI_Sort(take)
 
     -- Now rescan ALL sysex/text events, including updating uuidIdx for notes
     local textMsgTypes = {
-      [-1] = "sysex",
-      [1]  = "text",
-      [2]  = "copyright",
-      [3]  = "trackname",
-      [4]  = "instrument",
-      [5]  = "lyric",
-      [6]  = "marker",
-      [7]  = "cuepoint",
-      [15] = "notation",
+      [-1] = 'sysex',
+      [1]  = 'text',
+      [2]  = 'copyright',
+      [3]  = 'trackname',
+      [4]  = 'instrument',
+      [5]  = 'lyric',
+      [6]  = 'marker',
+      [7]  = 'cuepoint',
+      [15] = 'notation',
     }
 
     _ , _, _, textCount = reaper.MIDI_CountEvts(take)
     for i = 0, textCount-1 do
       local ok, selected, muted, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
-        local chan, pitch, uuidTxt = msg:match("^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$")
+        local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
         chan = chan + 1
         if uuidTxt then
           -- one of our UUID identifiers
@@ -464,7 +464,7 @@ function newMidiManager(take)
         sysexTbl[nextSysex()] = {
             idx     = i,
             ppq     = ppq,
-            msgType = textMsgTypes[eventtype] or ("meta_" .. eventtype),
+            msgType = textMsgTypes[eventtype] or ('meta_' .. eventtype),
             val     = msg,
         }
       end
@@ -494,7 +494,7 @@ function newMidiManager(take)
   --- LOCKING
 
   local function checkLock()
-    assert(lock, "Error! You must call modification functions via modify()!")
+    assert(lock, 'Error! You must call modification functions via modify()!')
     return true
   end
 
@@ -538,8 +538,6 @@ function newMidiManager(take)
     local note = loc and noteTbl[loc]
     if not note then return end
 
-    -- remove the notation event first
-    reaper.MIDI_DeleteTextSysexEvt(take, note.uuidIdx)
     reaper.MIDI_DeleteNote(take, note.idx)
 
     -- clean up internal tables
@@ -577,7 +575,7 @@ function newMidiManager(take)
 
     -- if ppq, chan, or pitch changed, update the notation event to match
     if (t.ppq or t.chan or t.pitch) and note.uuidIdx then
-      reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, note.ppq, 15, string.format("NOTE %d %d custom rdm_%s", chan, note.pitch, util:toBase36(note.uuid)), true)
+      reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', chan, note.pitch, util:toBase36(note.uuid)), true)
     end
 
     saveMetadatum(note.uuid)
@@ -597,7 +595,7 @@ function newMidiManager(take)
     local note = util:assign({ }, t)
     local uuid = assignNewUUID(note)
     -- create notation event for UUID
-    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format("NOTE %d %d custom rdm_%s", t.chan - 1, t.pitch, util:toBase36(note.uuid)), true)
+    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, util:toBase36(note.uuid)), true)
 
     -- copy data to tables
     local _, noteCount, _, sysexCount = reaper.MIDI_CountEvts(take)
@@ -812,7 +810,7 @@ function newMidiManager(take)
   end
 
   -- resolution in PPQ per QN
-  function mm:reso()
+  function mm:resolution()
     if not take then return end
     return reaper.MIDI_GetPPQPosFromProjQN(take, 1) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
   end
@@ -832,8 +830,8 @@ function newMidiManager(take)
     if not take then return {} end
 
     local item = reaper.GetMediaItemTake_Item(take)
-    local startTime = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-    local itemLength = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local startTime = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+    local itemLength = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
     local endTime = startTime + itemLength
     local basePPQ = reaper.MIDI_GetPPQPosFromProjTime(take, startTime)
 
