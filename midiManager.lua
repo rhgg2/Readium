@@ -132,19 +132,30 @@ function newMidiManager(take)
   local maxCC     = 0
   local maxSysex  = 0
   local lock      = false
-  local callbacks = {}
+  local fire  -- installed below, once mm exists
 
-  local function copyEntry(entry, exceptions)
-    if not entry then return end
-    local val = util:assign({}, entry)
-    if exceptions then
-      for k,_ in pairs(exceptions) do
-        val[k] = nil
-      end
-    end
-    return val
+  local INTERNALS = { idx = true, uuidIdx = true }
+
+  local BASE36 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+  local function fromBase36(txt)
+    local n = tonumber(txt, 36)
+    if not n then print('Error! ' .. txt .. ' is not a valid base36 string') end
+    return n
   end
-  
+
+  local function toBase36(num)
+    if num == 0 then return '0' end
+    local result = ''
+    while num > 0 do
+      local r = num % 36
+      result = string.sub(BASE36, r + 1, r + 1) .. result
+      num = math.floor(num / 36)
+    end
+    return result
+  end
+
+
   local function loadMetadata()
     if not take then return end
 
@@ -152,7 +163,7 @@ function newMidiManager(take)
     if not (ok and keysText and keysText ~= '') then return {} end
     local tbl = {}
     for uuidTxt in keysText:gmatch('[^,]+') do
-      local uuid = util:fromBase36(uuidTxt)
+      local uuid = fromBase36(uuidTxt)
       tbl[uuid] = { }
 
       local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, '', false)
@@ -163,22 +174,22 @@ function newMidiManager(take)
     return tbl
   end
 
+  -- note-event fields stripped when serialising per-note metadata
+  local noteEventFields = {
+    idx = true, ppq = true, endppq = true, chan = true,
+    pitch = true, vel = true, uuid = true, uuidIdx = true,
+  }
+
   local function saveMetadatum(uuid)
     if not take then return end
-    
-    local uuidTxt = util:toBase36(uuid)
+
+    local uuidTxt = toBase36(uuid)
     local data = uuidTbl[uuid]
 
     if not data then
       print('Error! uuid not found')
       return nil
     end
-    
-    -- note-event fields to strip
-    local noteEventFields = {
-      idx = true, ppq = true, endppq = true, chan = true,
-      pitch = true, vel = true, uuid = true, uuidIdx = true,
-    }
 
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util:serialise(data, noteEventFields), true)
 
@@ -193,11 +204,12 @@ function newMidiManager(take)
   local function saveMetadata()
     if not take then return end
     
-    -- Collect the set of uuids we're about to write
-    local newKeys = {}
+    -- Collect uuids as both a set (for stale-key check) and a list (for serialisation)
+    local newKeys, keyList = {}, {}
     for uuid, _ in pairs(uuidTbl) do
-      local uuidTxt = util:toBase36(uuid)
+      local uuidTxt = toBase36(uuid)
       newKeys[uuidTxt] = true
+      util:add(keyList, uuidTxt)
       saveMetadatum(uuid)
     end
 
@@ -212,11 +224,6 @@ function newMidiManager(take)
       end
     end
 
-    -- Write the new key list
-    local keyList = {}
-    for uuidTxt in pairs(newKeys) do
-      keyList[#keyList + 1] = uuidTxt
-    end
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keyList, ','), true)
   end
 
@@ -237,10 +244,10 @@ function newMidiManager(take)
         if notesSeen[tag] then
           local last = notesSeen[tag]
           if endppq > last.endppq then
-            notesToDelete[#notesToDelete + 1] = last.idx
+            util:add(notesToDelete, last.idx)
             notesSeen[tag] = { idx = i, endppq = endppq }
           else
-            notesToDelete[#notesToDelete + 1] = i
+            util:add(notesToDelete, i)
           end
         else
           notesSeen[tag] = { idx = i, endppq = endppq }
@@ -284,6 +291,7 @@ function newMidiManager(take)
   ---------- PUBLIC FUNCTIONS
 
   local mm = {}
+  fire = util:installHooks(mm)
 
   -- Load take and initialise tables
   function mm:load(newTake)
@@ -390,7 +398,7 @@ function newMidiManager(take)
         chan = chan + 1
         if uuidTxt then
           -- one of our UUID identifiers
-          local uuid = util:fromBase36(uuidTxt)
+          local uuid = fromBase36(uuidTxt)
           local tag = ppq .. '|' .. chan .. '|' .. pitch
           local note = notesLUT[tag]
           if note then
@@ -420,13 +428,13 @@ function newMidiManager(take)
         local newUUID = assignNewUUID(note)
         UUIDCount[oldUUID] = UUIDCount[oldUUID] - 1
         UUIDCount[newUUID] = 1
-        metadata[newUUID] = util:assign({}, metadata[oldUUID] or {})
-        reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, util:toBase36(newUUID)), false)
+        metadata[newUUID] = util:clone(metadata[oldUUID]) or {}
+        reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, toBase36(newUUID)), false)
       elseif not uuid then
         local newUUID = assignNewUUID(note)
         UUIDCount[newUUID] = 1
         metadata[newUUID] = {}
-        reaper.MIDI_InsertTextSysexEvt(take, false, false, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, util:toBase36(newUUID)))
+        reaper.MIDI_InsertTextSysexEvt(take, false, false, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, toBase36(newUUID)))
       end
     end
     reaper.MIDI_Sort(take)
@@ -477,19 +485,17 @@ function newMidiManager(take)
       end
     end
 
-    -- add metadata to notes
+    -- add metadata to notes, defaulting fields absent from older takes
     for i,note in ipairs(noteTbl) do
       util:assign(note, metadata[note.uuid])
+      if note.detune == nil then note.detune = 0 end
       uuidTbl[note.uuid] = note
     end
 
     -- save all metadata, built from uuidTbl
     saveMetadata()
 
-    -- callbacks
-    for fn,_ in pairs(callbacks) do
-      fn(changed, mm)
-    end
+    fire(changed, mm)
   end
 
   function mm:reload()
@@ -520,12 +526,12 @@ function newMidiManager(take)
 
   function mm:getNote(loc)
     local note = noteTbl[loc]
-    return copyEntry(note, { idx = true, uuidIdx = true })
+    return util:clone(note, INTERNALS)
   end
 
   function mm:getNoteByUUID(uuid)
     local note = uuidTbl[uuid]
-    return copyEntry(note, { idx = true, uuidIdx = true })
+    return util:clone(note, INTERNALS)
   end
 
   function mm:notes()
@@ -534,7 +540,7 @@ function newMidiManager(take)
       i = i + 1
       local note = noteTbl[i]
       if note then
-        return i, copyEntry(note, { idx = true, uuidIdx = true })
+        return i, util:clone(note, INTERNALS)
       end
     end
   end
@@ -582,7 +588,7 @@ function newMidiManager(take)
 
     -- if ppq, chan, or pitch changed, update the notation event to match
     if (t.ppq or t.chan or t.pitch) and note.uuidIdx then
-      reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', chan, note.pitch, util:toBase36(note.uuid)), true)
+      reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', chan, note.pitch, toBase36(note.uuid)), true)
     end
 
     saveMetadatum(note.uuid)
@@ -599,10 +605,10 @@ function newMidiManager(take)
     -- create a new note
     reaper.MIDI_InsertNote(take, false, false, t.ppq, t.endppq, t.chan - 1, t.pitch, t.vel, true)
     -- copy table, assign new UUID
-    local note = util:assign({ }, t)
+    local note = util:clone(t)
     local uuid = assignNewUUID(note)
     -- create notation event for UUID
-    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, util:toBase36(note.uuid)), true)
+    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, toBase36(note.uuid)), true)
 
     -- copy data to tables
     local _, noteCount, _, sysexCount = reaper.MIDI_CountEvts(take)
@@ -633,7 +639,7 @@ function newMidiManager(take)
 
   function mm:getCC(loc)
     local msg = ccTbl[loc]
-    return copyEntry(msg, { idx = true })
+    return util:clone(msg, INTERNALS)
   end
 
   function mm:ccs()
@@ -642,7 +648,7 @@ function newMidiManager(take)
       i = i + 1
       local msg = ccTbl[i]
       if msg then
-        return i, copyEntry(msg, { idx = true })
+        return i, util:clone(msg, INTERNALS)
       end
     end
   end
@@ -698,7 +704,7 @@ function newMidiManager(take)
       chanmsg = chanMsgLUT[t.msgType]
       msg2, msg3 = reconstruct(t)
     elseif t.val or t.cc or t.pitch then
-      local merged = util:assign(util:assign({}, msg), t)
+      local merged = util:assign(util:clone(msg), t)
       msg2, msg3 = reconstruct(merged)
     end
     local chan
@@ -731,7 +737,7 @@ function newMidiManager(take)
 
     reaper.MIDI_InsertCC(take, false, false, t.ppq, chanmsg, t.chan - 1, msg2, msg3)
 
-    local msg = util:assign({ }, t)
+    local msg = util:clone(t)
 
     local _, _, ccCount = reaper.MIDI_CountEvts(take)
     msg.idx = ccCount - 1
@@ -746,7 +752,7 @@ function newMidiManager(take)
 
   function mm:getSysex(loc)
     local sysex = sysexTbl[loc]
-    return copyEntry(sysex, { idx = true })
+    return util:clone(sysex, INTERNALS)
   end
 
   function mm:sysexes()
@@ -755,7 +761,7 @@ function newMidiManager(take)
       i = i + 1
       local sysex = sysexTbl[i]
       if sysex then
-        return i, copyEntry(sysex, { idx = true })
+        return i, util:clone(sysex, INTERNALS)
       end
     end
   end
@@ -800,7 +806,7 @@ function newMidiManager(take)
 
     reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, eventtype, t.val)
 
-    local sysex = util:assign({ }, t)
+    local sysex = util:clone(t)
 
     local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
     sysex.idx = sysexCount - 1
@@ -867,23 +873,11 @@ function newMidiManager(take)
       local _, pos, _, _, _, num, denom, _ = reaper.GetTempoTimeSigMarker(0, i)
       if num > 0 and pos > startTime and pos < endTime then
         local ppq = reaper.MIDI_GetPPQPosFromProjTime(take, pos) - basePPQ
-        result[#result + 1] = { ppq = ppq, num = num, denom = denom }
+        util:add(result, { ppq = ppq, num = num, denom = denom })
       end
     end
 
     return result
-  end
-
-  --- MESSAGING
-
-  -- Add callback function
-  function mm:addCallback(fn)
-    callbacks[fn] = true
-  end
-
-  -- Remove callback function
-  function mm:removeCallback(fn)
-    callbacks[fn] = nil
   end
 
   ---------- FACTORY BODY

@@ -69,7 +69,7 @@ function newConfigManager()
   local take      = nil
   local track     = nil
   local defaults  = {}
-  local callbacks = {}
+  local fire  -- installed below, once cm exists
 
   local cache = {
     global  = nil,
@@ -187,19 +187,13 @@ function newConfigManager()
 
   local function mergedTable()
     ensureCache()
-    local merged = util:assign({}, defaults)
+    local merged = util:clone(defaults) or {}
     for _, level in ipairs(levels) do
       if cache[level] then
         util:assign(merged, cache[level])
       end
     end
     return merged
-  end
-
-  local function fireCallbacks()
-    for fn, _ in pairs(callbacks) do
-      fn({ config = true }, cm)
-    end
   end
 
   local function checkLevel(level)
@@ -213,6 +207,7 @@ function newConfigManager()
   ---------- PUBLIC INTERFACE
 
   local cm = {}
+  fire = util:installHooks(cm)
 
   -- Context: set the active take (and derived track)
 
@@ -228,7 +223,7 @@ function newConfigManager()
     end
 
     refreshCache()
-    fireCallbacks()
+    fire({ config = true }, cm)
   end
 
   -- Reading
@@ -244,7 +239,7 @@ function newConfigManager()
     ensureCache()
     local tbl = cache[level] or {}
     if key ~= nil then return tbl[key] end
-    return util:assign({}, tbl)
+    return util:clone(tbl)
   end
 
   function cm:getLevel(key)
@@ -267,7 +262,7 @@ function newConfigManager()
     cache[level] = cache[level] or {}
     cache[level][key] = value
     savers[level](cache[level])
-    fireCallbacks()
+    fire({ config = true }, cm)
   end
 
   function cm:remove(level, key)
@@ -277,7 +272,7 @@ function newConfigManager()
     if cache[level] then
       cache[level][key] = nil
       savers[level](cache[level])
-      fireCallbacks()
+      fire({ config = true }, cm)
     end
   end
 
@@ -286,25 +281,16 @@ function newConfigManager()
     if not checkLevel(level) then return end
     ensureCache()
 
-    util:assign(cache[level], updates, true)
+    cache[level] = cache[level] or {}
+    util:assign(cache[level], updates)
     savers[level](cache[level])
-    fireCallbacks()
+    fire({ config = true }, cm)
   end        
 
   -- Defaults
 
   function cm:setDefaults(tbl)
-    defaults = util:assign({}, tbl)
-  end
-
-  -- Messaging
-
-  function cm:addCallback(fn)
-    callbacks[fn] = true
-  end
-
-  function cm:removeCallback(fn)
-    callbacks[fn] = nil
+    defaults = util:clone(tbl)
   end
 
   ---------- FACTORY BODY

@@ -12,6 +12,7 @@ local function print(...)
   return util:print(...)
 end
 
+-- dev only
 function util:print_r(root)
   local cache = {  [root] = '.' }
   local function _dump(t,space,name)
@@ -35,8 +36,7 @@ end
 
 util.REMOVE = { }
 
-function util:assign(t1,t2,createIfNil)
-  t1 = t1 or (createIfNil and { })
+function util:assign(t1,t2)
   if t2 then
     for k, v in pairs(t2) do
       if v == util.REMOVE then
@@ -49,30 +49,17 @@ function util:assign(t1,t2,createIfNil)
   return t1
 end
 
-util.IDX = { }
-
-local function fillIdx(arg, val)
-  if arg == util.IDX then return val end
-  if type(arg) == 'table' then
-    for k,v in pairs(arg) do
-      arg[k] = fillIdx(v,val)
-    end
-  end
-  return arg
-end
-
-
 function util:add(tbl, val)
   local idx = #tbl+1
-  local obj = fillIdx(val, idx)
-  tbl[idx] = obj
-  return obj
+  tbl[idx] = val
+  return val
 end
 
-function util:pick(src, keys)
+function util:clone(src, exclude)
+  if not src then return end
   local dst = {}
-  for k in keys:gmatch('%S+') do
-    dst[k] = src[k]
+  for k, v in pairs(src) do
+    if not (exclude and exclude[k]) then dst[k] = v end
   end
   return dst
 end
@@ -83,11 +70,38 @@ local function escape_string(s)
   end))
 end
 
+function util:installHooks(owner)
+  local listeners = {}
+  function owner:addCallback(fn)    listeners[fn] = true end
+  function owner:removeCallback(fn) listeners[fn] = nil  end
+  return function(...)
+    for fn in pairs(listeners) do fn(...) end
+  end
+end
+
+function util:clamp(val,min,max)
+  if val < min then
+    return min
+  elseif val > max then
+    return max
+  else
+    return val
+  end
+end
+
+function util:oneOf(choices, txt)
+  for k in choices:gmatch('%S+') do
+    if txt == k then return true end
+  end
+  return false
+end
+
+
 function util:serialise(value, exclude, seen)
   exclude = exclude or { } 
   local t = type(value)
 
-  if t == 'number' then
+  if t == 'number' or t == 'boolean' then
     return tostring(value)
 
   elseif t == 'string' then
@@ -163,6 +177,10 @@ function util:unserialise(input)
       return n
     end
 
+    -- boolean
+    if s == 'true' then return true end
+    if s == 'false' then return false end
+
     return s
   end
 
@@ -219,36 +237,4 @@ function util:unserialise(input)
   end
 
   return result
-end
-
-function util:clamp(val,min,max)
-  if val < min then
-    return min
-  elseif val > max then
-    return max
-  else
-    return val
-  end
-end
-
-function util:fromBase36(txt)
-  if not tonumber(txt,36) then
-    print('Error! ' .. txt .. ' is not a valid base36 string')
-    return nil
-  else
-    return tonumber(txt,36)
-  end
-end
-
-function util:toBase36(num)
-  local alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-  if num == 0 then return '0' end
-  local result = ''
-  while num > 0 do
-    local remainder = num % 36
-    result = string.sub(alphabet, remainder + 1, remainder + 1) .. result
-    num = math.floor(num / 36)
-  end
-  return result
-end
-
+end 

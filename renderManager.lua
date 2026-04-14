@@ -34,7 +34,7 @@ function newRenderManager(vm, cm)
   ---------- PRIVATE STATE
 
   local GUTTER      = 4    -- row-number width in grid chars
-  local HEADER      = 2    -- header rows above grid data
+  local HEADER      = 3    -- header rows above grid data
 
   local gridX       = nil
   local gridY       = nil
@@ -47,7 +47,7 @@ function newRenderManager(vm, cm)
   local font        = nil
   local dragging    = false
   local dragWinX, dragWinY = 0, 0
-  local colPromptBuf = nil   -- nil = closed, string = input buffer
+  local modalState = nil   -- nil = closed, else { title, prompt, callback, buf }
 
   ---------- CONFIG HELPERS
 
@@ -61,7 +61,7 @@ function newRenderManager(vm, cm)
 
   ---------- CELL RENDERERS
 
-  local function renderNote(evt)
+  local function renderNote(evt, col, row)
     local function noteName(pitch)
       local NOTE_NAMES = {'C-','C#','D-','D#','E-','F-','F#','G-','G#','A-','A#','B-'}
       local oct = math.floor(pitch / 12) - 1
@@ -69,32 +69,35 @@ function newRenderManager(vm, cm)
       return NOTE_NAMES[(pitch % 12) + 1] .. octChar
     end
 
-    if not evt then return '··· ··', 'inactive' end
+    local showDelay = col and col.showDelay
+    if not evt then
+      return showDelay and '··· ·· ··' or '··· ··'
+    end
 
-    local noteTxt = '···'
-    local velTxt  = evt.vel and string.format('%02X', evt.vel) or '\u{00B7}\u{00B7}'
+    local noteTxt = evt.type == 'pa' and '···' or noteName(evt.pitch)
+    local velTxt  = evt.vel and string.format('%02X', evt.vel) or '··'
+    local text    = noteTxt .. ' ' .. velTxt
 
-    if evt.pitch then noteTxt = noteName(evt.pitch)
-    elseif evt.type == 'pa' then noteTxt = 'PA ' end
-    return noteTxt .. ' ' .. velTxt, evt.overflow and 'overflow'
+    if showDelay then
+      local basePPQ = vm:rowPPQ(row)
+      local nextPPQ = vm:rowPPQ(row + 1)
+      local rowLen  = nextPPQ and (nextPPQ - basePPQ) or 0
+      local val     = rowLen > 0 and math.floor((evt.ppq - basePPQ) / rowLen * 0x80 + 0.5) or 0
+      text = text .. ' ' .. (val > 0 and string.format('%02X', val) or '··')
+    end
+    return text, evt.overflow and 'overflow'
   end
 
   local function renderPB(evt)
     if evt and not evt.hidden then
       if evt.val < 0 then return string.format('%04d', math.abs(evt.val)), 'negative'
       else return string.format('%04d', math.floor(evt.val or 0)) end
-    else return '····', 'inactive' end
+    else return '····' end
   end
 
   local function renderCC(evt)
     if evt and evt.val then return string.format('%02X', evt.val)
-    else return '··', 'inactive' end
-  end
-
-  local function renderDefault(evt)
-    if evt then return '**'
-    else return '··', 'inactive'
-    end
+    else return '··' end
   end
 
   local renderFns = {
@@ -106,8 +109,8 @@ function newRenderManager(vm, cm)
     pc   = renderCC,
   }
 
-  local function renderCell(col, evt)
-    return (renderFns[col.type] or renderDefault)(evt)
+  local function renderCell(evt, col, row)
+    return renderFns[col.type] and renderFns[col.type](evt, col, row)
   end
 
   ---------- COLOUR
@@ -132,7 +135,8 @@ function newRenderManager(vm, cm)
     accent       = {159/256, 147/256, 115/256, 1  },
     separator    = {159/256, 147/256, 115/256, 0.3},
     tail         = {100/256, 130/256, 160/256, 0.15},
-    tailBord     = {100/256, 130/256, 160/256, 0.7},
+--    tailBord     = {100/256, 130/256, 160/256, 0.4},
+    tailBord     = {140/256, 170/256, 200/256, 1},
   }
 
   local colourCache = {}
@@ -189,16 +193,25 @@ function newRenderManager(vm, cm)
     function pt:textCentred(x1, x2, y, txt, c)
       local textWidth = ImGui.CalcTextSize(ctx, txt)
       local maxWidth  = (x2 - x1 + 1) * gX
-      local offset    = math.max(0, math.floor((maxWidth - textWidth) / 2))
+      local offset    = math.floor((maxWidth - textWidth) / 2)
       drawTextAt(x0 + x1 * gX + offset, y0 + y * gY, txt, c)
+    end
+
+    function pt:textCentredSmall(x1, x2, y, txt, size, c)
+      local scale     = size / 15
+      local textWidth = ImGui.CalcTextSize(ctx, txt) * scale
+      local maxWidth  = (x2 - x1 + 1) * gX
+      local xPos = x0 + x1 * gX + math.floor((maxWidth - textWidth) / 2)
+      ImGui.DrawList_AddTextEx(drawList, font, size, xPos, y0 + y * gY, colour(c), txt)
     end
 
     function pt:vLine(x, y1, y2, c)
       ImGui.DrawList_AddLine(drawList, x0 + x * gX + halfW, y0 + y1 * gY, x0 + x * gX + halfW, y0 + y2 * gY + gY, colour(c), 1)
     end
 
-    function pt:hLine(x1, x2, y, c)
-      ImGui.DrawList_AddLine(drawList, x0 + x1 * gX, y0 + y * gY, x0 + x2 * gX + gX, y0 + y * gY, colour(c), 1)
+    function pt:hLine(x1, x2, y, c, yOff)
+      local yPos = y0 + (y + (yOff or 0)) * gY
+      ImGui.DrawList_AddLine(drawList, x0 + x1 * gX, yPos, x0 + x2 * gX + gX, yPos, colour(c), 1)
     end
 
     function pt:box(x1, x2, y1, y2, c)
@@ -216,23 +229,13 @@ function newRenderManager(vm, cm)
     ImGui.PopStyleColor(ctx)
     ImGui.SameLine(ctx)
 
-    local subdivOptions = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-    for _, s in ipairs(subdivOptions) do
-      local isActive = (s == rowPerBeat)
-      if isActive then
-        ImGui.PushStyleColor(ctx, ImGui.Col_Button, colour('cursor'))
-        ImGui.PushStyleColor(ctx, ImGui.Col_Text,   colour('cursorText'))
-      end
-      if ImGui.SmallButton(ctx, tostring(s)) then
-        local cursorRow, cursorCol, cursorStop = vm:cursor()
-        vm:setCursor(math.floor(cursorRow * s / rowPerBeat), cursorCol, cursorStop)
-        cm:set('track', 'rowPerBeat', s)
-      end
-      if isActive then ImGui.PopStyleColor(ctx, 2) end
-      ImGui.SameLine(ctx)
-    end
+    local textW = ImGui.CalcTextSize(ctx, '32')
+    local btnW  = ImGui.GetFrameHeight(ctx)
+    ImGui.SetNextItemWidth(ctx, textW + btnW * 2 + 16)
+    local changed, n = ImGui.InputInt(ctx, '##rpb', rowPerBeat, 1, 4)
+    if changed then vm:setRowPerBeat(util:clamp(n, 1, 32)) end
 
-    ImGui.NewLine(ctx)
+--    ImGui.NewLine(ctx)
     ImGui.Separator(ctx)
   end
 
@@ -257,45 +260,57 @@ function newRenderManager(vm, cm)
     vm:setGridSize(gridWidth, gridHeight)
     local numRows = grid.numRows or 0
 
-    -- Compute start position for each visible column and its group
-    for _, group in ipairs(grid.groups) do
-      group.x     = nil
-      group.width = 0
-      for i = group.firstCol, group.lastCol do
-        grid.cols[i].x = nil
-      end
-    end
+    -- Clear last frame's layout; then lay out visible columns left-to-right,
+    -- accumulating each channel's x/width as we go.
+    for _, col in ipairs(grid.cols) do col.x = nil end
+    local chanX, chanW = {}, {}
 
     local cx = 0
     for i = scrollCol, #grid.cols do
       local col = grid.cols[i]
       if cx + col.width > gridWidth then break end
       col.x = cx
-      local group = col.group
-      if not group.x then group.x = col.x end
-      group.width = (col.x + col.width) - group.x
+      local chan = col.midiChan
+      chanX[chan] = chanX[chan] or cx
+      chanW[chan] = (cx + col.width) - chanX[chan]
       cx = cx + col.width + 1
     end
 
     local totalWidth = math.max(0, cx - 1)
     local draw = printer(ctx, gridX, gridY, gridOriginX, gridOriginY)
 
-    -- Header row 1: group labels
+    -- Header row 1: channel labels
     draw:text(-GUTTER, -HEADER, 'Row', 'accent')
-    for _, group in ipairs(grid.groups) do
-      if group.x then
-        draw:textCentred(group.x, group.x + group.width - 1, -HEADER, group.label, 'accent')
+    for chan = 1, 16 do
+      if chanX[chan] then
+        draw:textCentred(chanX[chan], chanX[chan] + chanW[chan] - 1,
+                         -HEADER, 'Ch ' .. chan, 'accent')
       end
     end
 
-    -- Header row 2: column labels
+    -- Header rows 2 & 3: column labels and sub-labels. Track per-channel
+    -- note-lane counters so note columns can display their lane number.
+    local laneByChan = {}
     for _, col in ipairs(grid.cols) do
---      if col.x then draw:text(col.x, -1, col.label) end
-      if col.x then draw:textCentred(col.x, col.x + col.width-1, -1, col.label) end
+      local sub
+      if col.type == 'note' then
+        local n = (laneByChan[col.midiChan] or 0) + 1
+        laneByChan[col.midiChan] = n
+        sub = tostring(n)
+      elseif col.type == 'cc' then
+        sub = tostring(col.cc)
+      end
+      if col.x then
+        local xr = col.x + col.width - 1
+        draw:textCentred(col.x, xr, -2.1, col.label)
+        if sub then
+          draw:textCentredSmall(col.x, xr, -1.2, sub, 14, 'accent')
+        end
+      end
     end
 
-    -- Separator below headers
-    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header')
+    -- Separator below headers (1/3 up from the sub-label row)
+    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header', -1/3)
 
     -- Rows
     for y = 0, gridHeight - 1 do
@@ -306,12 +321,11 @@ function newRenderManager(vm, cm)
       local isCursor    = (row == cursorRow)
 
       -- Row background
-      for _, group in ipairs(grid.groups) do
-        if group.x then
-          if isBarStart then
-            draw:box(group.x, group.x + group.width - 1, y, y, 'rowBarStart')
-          elseif isBeatStart then
-            draw:box(group.x, group.x + group.width - 1, y, y, 'rowBeat')
+      if isBarStart or isBeatStart then
+        local style = isBarStart and 'rowBarStart' or 'rowBeat'
+        for chan = 1, 16 do
+          if chanX[chan] then
+            draw:box(chanX[chan], chanX[chan] + chanW[chan] - 1, y, y, style)
           end
         end
       end
@@ -332,32 +346,40 @@ function newRenderManager(vm, cm)
       if col.x and col.type == 'note' and col.events then
         local colPx = gridOriginX + col.x * gridX
         for _, evt in ipairs(col.events) do
-          local startFrac = vm:fractionalRow(evt.ppq)
-          local endFrac   = vm:fractionalRow(evt.endppq)
-          if endFrac > viewTop and startFrac < viewBot then
-            local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
-            local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
-            local x1 = colPx - 4 -- (slot + 1) * (barW + 1)
---                        ImGui.DrawList_AddRectFilled(drawList, x1-6, y1, x1 + 5, y1+2, tailBord)
---            ImGui.DrawList_AddTriangleFilled(drawList, x1 - 0.5*gridX, y1, x1+2.5*gridX, y1, x1 + gridX, y1+6, tailCol)
-            ImGui.DrawList_AddRectFilled(drawList, x1-2, y1-1, x1 + 4, y1+1, tailBord)
-            ImGui.DrawList_AddRectFilled(drawList, x1-2, y1, x1, y2, tailBord)
-            ImGui.DrawList_AddRectFilled(drawList, x1-2, y2-1, x1 + 4, y2+1, tailBord)
---            ImGui.DrawList_AddRect(drawList, x1-2, y1, x1 + 1, y2+1, tailBord,2)
+          if evt.endppq then
+            local startFrac = vm:fractionalRow(evt.ppq)
+            local endFrac   = vm:fractionalRow(evt.endppq)
+            if endFrac > viewTop and startFrac < viewBot then
+              local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
+              local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
+              local x1 = colPx - 4 -- (slot + 1) * (barW + 1)
+              --                        ImGui.DrawList_AddRectFilled(drawList, x1-6, y1, x1 + 5, y1+2, tailBord)
+              --            ImGui.DrawList_AddTriangleFilled(drawList, x1 - 0.5*gridX, y1, x1+2.5*gridX, y1, x1 + gridX, y1+6, tailCol)
+              ImGui.DrawList_AddRectFilled(drawList, x1-1, y1-1, x1 + 4, y1+1, tailBord)
+              ImGui.DrawList_AddRectFilled(drawList, x1-2, y1, x1, y2, tailBord)
+              ImGui.DrawList_AddRectFilled(drawList, x1-1, y2-1, x1 + 4, y2+1, tailBord)
+              --            ImGui.DrawList_AddRect(drawList, x1-2, y1, x1 + 1, y2+1, tailBord,2)
+            end
           end
         end
       end
     end
 
-    -- Cells
+    -- Cells. Dots (·) are always 'inactive' even when the rest of the
+    -- cell is active, so split runs on dot boundaries.
     for y = 0, gridHeight - 1 do
       local row = scrollRow + y
       if row >= numRows then break end
       for x, col in ipairs(grid.cols) do
         if col.x then
           local evt = col.cells and col.cells[row]
-          local text, textCol = renderCell(col, evt)
-          draw:text(col.x, y, text, textCol or 'text')
+          local text, textCol = renderCell(evt, col, row)
+          textCol = textCol or 'text'
+          local cx = col.x
+          for ch in text:gmatch(utf8.charpattern) do
+            draw:text(cx, y, ch, ch == '·' and 'inactive' or textCol)
+            cx = cx + 1
+          end
         end
       end
     end
@@ -391,7 +413,7 @@ function newRenderManager(vm, cm)
       local charY = cursorRow - scrollRow
       draw:box(charX, charX, charY+0.1, charY-0.1, 'cursor')
       local evt = col.cells and col.cells[cursorRow]
-      local text = renderCell(col, evt)
+      local text = renderCell(evt, col, cursorRow)
       local ch = utf8.offset(text, stopOffset + 1) and text:sub(utf8.offset(text, stopOffset + 1), utf8.offset(text, stopOffset + 2) - 1) or ''
       if ch ~= '' then draw:text(charX, charY, ch, 'cursorText') end
     end
@@ -421,39 +443,50 @@ function newRenderManager(vm, cm)
   ---------- COMMANDS & KEYBOARD
 
   local keymap = {
-    cursorDown  = { ImGui.Key_DownArrow  },
-    cursorUp    = { ImGui.Key_UpArrow    },
-    pageDown    = { ImGui.Key_PageDown   },
-    pageUp      = { ImGui.Key_PageUp     },
-    goTop       = { ImGui.Key_Home       },
-    goBottom    = { ImGui.Key_End        },
-    cursorRight = { ImGui.Key_RightArrow },
-    cursorLeft  = { ImGui.Key_LeftArrow  },
-    selectDown  = { { ImGui.Key_DownArrow,  ImGui.Mod_Shift } },
+    cursorDown  = { ImGui.Key_DownArrow, { ImGui.Key_N,  ImGui.Mod_Super }  },
+    cursorUp    = { ImGui.Key_UpArrow,   { ImGui.Key_P,  ImGui.Mod_Super }    },
+    pageDown    = { ImGui.Key_PageDown,  { ImGui.Key_V,  ImGui.Mod_Super }   },
+    pageUp      = { ImGui.Key_PageUp,    { ImGui.Key_V,  ImGui.Mod_Ctrl }     },
+    goTop       = { ImGui.Key_Home, { ImGui.Key_Comma,  ImGui.Mod_Ctrl, ImGui.Mod_Shift  }       },
+    goBottom    = { ImGui.Key_End, { ImGui.Key_Period,  ImGui.Mod_Ctrl, ImGui.Mod_Shift  }        },
+    goLeft      = { { ImGui.Key_A,  ImGui.Mod_Super  }        },
+    goRight     = { { ImGui.Key_E,  ImGui.Mod_Super  }       },
+    cursorLeft  = { ImGui.Key_LeftArrow, { ImGui.Key_B,  ImGui.Mod_Super }  },
+    cursorRight = { ImGui.Key_RightArrow, { ImGui.Key_F,  ImGui.Mod_Super } },
     selectUp    = { { ImGui.Key_UpArrow,    ImGui.Mod_Shift } },
-    selectRight = { { ImGui.Key_RightArrow, ImGui.Mod_Shift } },
+    selectDown  = { { ImGui.Key_DownArrow,  ImGui.Mod_Shift } },
     selectLeft  = { { ImGui.Key_LeftArrow,  ImGui.Mod_Shift } },
-    tabRight    = { ImGui.Key_Tab },
-    tabLeft     = { { ImGui.Key_Tab, ImGui.Mod_Shift } },
+    selectRight = { { ImGui.Key_RightArrow, ImGui.Mod_Shift } },
+    selectClear = { { ImGui.Key_G, ImGui.Mod_Super } },
+    colLeft     = { { ImGui.Key_B,  ImGui.Mod_Ctrl } },
+    colRight    = { { ImGui.Key_F,  ImGui.Mod_Ctrl } },
+    channelRight  = { ImGui.Key_Tab },
+    channelLeft   = { { ImGui.Key_Tab, ImGui.Mod_Shift } },
     delete      = { ImGui.Key_Period },
     deleteSel   = { ImGui.Key_Delete },
-    copy        = { { ImGui.Key_C, ImGui.Mod_Ctrl } },
-    cut         = { { ImGui.Key_X, ImGui.Mod_Ctrl } },
-    paste       = { { ImGui.Key_V, ImGui.Mod_Ctrl } },
+    copy        = { { ImGui.Key_W, ImGui.Mod_Ctrl } },
+    cut         = { { ImGui.Key_W, ImGui.Mod_Super } },
+    paste       = { { ImGui.Key_Y, ImGui.Mod_Super } },
+    mark        = { { ImGui.Key_Space, ImGui.Mod_Super } },
     quit        = { ImGui.Key_Enter },
     upOctave       = { { ImGui.Key_8,  ImGui.Mod_Shift } },
     downOctave     = { ImGui.Key_Slash },
     noteOff        = { ImGui.Key_1 },
-    growNote       = { ImGui.Key_RightBracket },
-    shrinkNote     = { ImGui.Key_LeftBracket },
-    growNoteFine   = { { ImGui.Key_RightBracket, ImGui.Mod_Shift } },
-    shrinkNoteFine = { { ImGui.Key_LeftBracket,  ImGui.Mod_Shift } },
+    growNote          = { ImGui.Key_RightBracket },
+    shrinkNote        = { ImGui.Key_LeftBracket },
+    nudgeBack    = { { ImGui.Key_LeftBracket,  ImGui.Mod_Ctrl } },
+    nudgeForward = { { ImGui.Key_RightBracket, ImGui.Mod_Ctrl } },
     playPause      = { ImGui.Key_Space },
     playFromTop    = { ImGui.Key_F6 },
     playFromCursor = { ImGui.Key_F7 },
     stop           = { ImGui.Key_F8 },
     addNoteCol     = { { ImGui.Key_N, ImGui.Mod_Ctrl } },
     addTypedCol    = { { ImGui.Key_T, ImGui.Mod_Ctrl } },
+    hideExtraCol   = { { ImGui.Key_H, ImGui.Mod_Ctrl } },
+    toggleDelay    = { { ImGui.Key_D, ImGui.Mod_Ctrl } },
+    doubleRPB      = { { ImGui.Key_Equal, ImGui.Mod_Super } },
+    halveRPB       = { { ImGui.Key_Minus, ImGui.Mod_Super } },
+    setRPB         = { { ImGui.Key_R,     ImGui.Mod_Ctrl } },
   }
 
   for i = 0, 9 do
@@ -567,7 +600,7 @@ function newRenderManager(vm, cm)
   end
 
   local function handleKeys()
-    if colPromptBuf then return end -- popup owns input
+    if modalState then return end -- popup owns input
 
     local grid = vm.grid
     local cursorRow, cursorCol, cursorStop = vm:cursor()
@@ -585,16 +618,18 @@ function newRenderManager(vm, cm)
           end
           if ImGui.IsKeyDown(ctx, key) and mods == ImGui.Mod_None then commandHeld = true end
           if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then
-            if command == 'quit' then
+            local result, state = vm.commands[command]()
+            if result == 'quit' then
               return true
-            elseif command == 'addTypedCol' then
-              colPromptBuf = ''
-              ImGui.OpenPopup(ctx, 'Add Column')
+            elseif result == 'modal' then
+              modalState = state
+              modalState.buf = ''
+              ImGui.OpenPopup(ctx, state.title)
               return
-            else
-              local fallThrough = vm.commands[command]()
-              if not fallThrough then return end
+            elseif result == 'fallthrough' then
               commandHeld = false
+            else
+              return
             end
           end
         end
@@ -606,45 +641,62 @@ function newRenderManager(vm, cm)
       if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_None then
         local col = grid.cols[cursorCol]
         if col then
-          local type = col.type
-
           -- Character queue: hex/decimal edits, octave changes
           -- Only process one event
           local rv, char = ImGui.GetInputQueueCharacter(ctx, 0)
           if rv then
-            local evt = col.cells and col.cells[cursorRow]
-            vm:editEvent(col, evt, cursorStop, char)
+            if vm:markMode() then
+              vm:clearMark()
+            else
+              local evt = col.cells and col.cells[cursorRow]
+              vm:editEvent(col, evt, cursorStop, char)
+            end
+          end
+        end
+      end
+
+      -- Shift-digit: half-step entry at MSB stops (vel, delay, cc/at/pc).
+      -- Overwrites the value with digit in MSB, half-value (8 hex / 5 dec) in LSB.
+      if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_Shift and not vm:markMode() then
+        local col = grid.cols[cursorCol]
+        if col then
+          for d = 0, 9 do
+            if ImGui.IsKeyPressed(ctx, ImGui.Key_0 + d) then
+              local evt = col.cells and col.cells[cursorRow]
+              vm:editEvent(col, evt, cursorStop, string.byte('0') + d, true)
+              break
+            end
           end
         end
       end
     end
   end
 
-  local function drawColPrompt()
-    if not colPromptBuf then return end
+  local function drawModal()
+    if not modalState then return end
     local center_x, center_y = ImGui.Viewport_GetCenter(ImGui.GetWindowViewport(ctx))
     ImGui.SetNextWindowPos(ctx, center_x, center_y, ImGui.Cond_Appearing, 0.5, 0.5)
 
-    if ImGui.BeginPopupModal(ctx, 'Add Column', true, ImGui.WindowFlags_AlwaysAutoResize) then
-      ImGui.Text(ctx, 'cc0-127, pb, at, pc')
+    if ImGui.BeginPopupModal(ctx, modalState.title, true, ImGui.WindowFlags_AlwaysAutoResize) then
+      ImGui.Text(ctx, modalState.prompt)
       if ImGui.IsWindowAppearing(ctx) then
         ImGui.SetKeyboardFocusHere(ctx)
       end
-      local rv, buf = ImGui.InputText(ctx, '##coltype', colPromptBuf,
+      local rv, buf = ImGui.InputText(ctx, '##modal', modalState.buf,
         ImGui.InputTextFlags_EnterReturnsTrue)
       if rv then
-        vm:addTypedCol(buf)
-        colPromptBuf = nil
+        modalState.callback(buf)
+        modalState = nil
         ImGui.CloseCurrentPopup(ctx)
       elseif ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
-        colPromptBuf = nil
+        modalState = nil
         ImGui.CloseCurrentPopup(ctx)
       else
-        colPromptBuf = buf
+        modalState.buf = buf
       end
       ImGui.EndPopup(ctx)
     else
-      colPromptBuf = nil
+      modalState = nil
     end
   end
 
@@ -663,7 +715,7 @@ function newRenderManager(vm, cm)
   function rm:loop()
     if not ctx then return false end
 
-    ImGui.PushFont(ctx, font, 18)
+    ImGui.PushFont(ctx, font, 15)
     
     local styleCount = pushStyles()
 
@@ -684,7 +736,7 @@ function newRenderManager(vm, cm)
         drawStatusBar()
         handleMouse()
         quit = handleKeys()
-        drawColPrompt()
+        drawModal()
       else
         ImGui.Text(ctx, 'Select a MIDI item to begin.')
       end
