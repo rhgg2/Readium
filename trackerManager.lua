@@ -174,9 +174,27 @@ function newTrackerManager(mm, cm)
     end
   end
 
-  -- Host deleted: every attached event goes.
+  -- Host deleted: every attached event goes. For a col-1 host that owned
+  -- any pbs, the last owned pb's value is reasserted at host.endppq (if
+  -- nothing already sits there), so the bend level persists past the hole.
   local function cascadeDelete(host)
-    forEachAttached(host, function(t, loc) deleteEvent(t, loc) end)
+    local lastPbVal, pbAtEnd = nil, false
+    forEachAttached(host, function(t, loc, cc)
+      deleteEvent(t, loc)
+      if t == 'pb' then lastPbVal = cc.val end
+    end)
+    if lastPbVal and host.lane == 1 then
+      for _, cc in mm:ccs() do
+        if cc.chan == host.chan and cc.msgType == 'pb' and cc.ppq == host.endppq then
+          pbAtEnd = true; break
+        end
+      end
+      if not pbAtEnd then
+        addEvent('pb', {
+          ppq = host.endppq, chan = host.chan, msgType = 'pb', val = lastPbVal,
+        })
+      end
+    end
   end
 
   -- Host's interval becomes [newPpq, newEnd]. If both endpoints shift by
@@ -196,6 +214,24 @@ function newTrackerManager(mm, cm)
       elseif shift ~= 0 then assignEvent(t, loc, { ppq = newCCPpq })
       end
     end)
+    -- A col-1 host's restore marker sits at endppq — outside the
+    -- half-open ownership interval, so forEachAttached never touches it.
+    -- When endppq changes, migrate that pb to the new endppq (or delete
+    -- it if something already lives there) so it can't become a zombie
+    -- trapped inside the new interval.
+    if host.lane == 1 and newEnd ~= host.endppq then
+      local oldLoc, newExists
+      for loc, cc in mm:ccs() do
+        if cc.chan == host.chan and cc.msgType == 'pb' then
+          if cc.ppq == host.endppq then oldLoc = loc end
+          if cc.ppq == newEnd      then newExists = true end
+        end
+      end
+      if oldLoc then
+        if newExists then deleteEvent('pb', oldLoc)
+        else              assignEvent('pb', oldLoc, { ppq = newEnd }) end
+      end
+    end
   end
 
   -- Host repitched: attached PAs rewrite to the new pitch. pbs don't care.
@@ -236,17 +272,23 @@ function newTrackerManager(mm, cm)
     cascadeNoteOps()
     local ops = queue
     queue = {}
-
-    local deletes = {}
+    local deletes, seen = {}, {}
     for _, o in ipairs(ops) do
-      if o.op == 'delete' then util:add(deletes, o) end
+      if o.op == 'delete' then
+        local key = o.type .. ':' .. o.evt.loc
+        if not seen[key] then
+          seen[key] = true
+          util:add(deletes, o)
+        end
+      end
     end
     table.sort(deletes, function(a, b) return a.evt.loc > b.evt.loc end)
 
     mm:modify(function()
       for _, o in ipairs(ops) do
         if o.op == 'assign' then
-          if o.type == 'note' then mm:assignNote(o.evt.loc, o.update)
+          if o.type == 'note' then
+            mm:assignNote(o.evt.loc, o.update)
           else mm:assignCC(o.evt.loc, o.update) end
         end
       end
@@ -393,19 +435,23 @@ function newTrackerManager(mm, cm)
     local col1 = channel and firstNoteCol(channel)
     local notes = col1 and col1.events or {}
     local idx   = 1
-    local w = { detune = 0 }
+    local w = { active = nil, detune = 0 }
+    -- A note is "sounding" on [ppq, endppq). In gaps between notes, the
+    -- detune collapses to 0 — pb gets reset when nothing is playing.
     function w:advanceToBefore(ppq)
       while idx <= #notes and notes[idx].ppq < ppq do
-        self.detune = notes[idx].detune or 0
-        idx = idx + 1
+        self.active = notes[idx]; idx = idx + 1
       end
+      self.detune = (self.active and self.active.endppq >= ppq)
+                    and (self.active.detune or 0) or 0
       return self.detune
     end
     function w:advanceTo(ppq)
       while idx <= #notes and notes[idx].ppq <= ppq do
-        self.detune = notes[idx].detune or 0
-        idx = idx + 1
+        self.active = notes[idx]; idx = idx + 1
       end
+      self.detune = (self.active and self.active.endppq > ppq)
+                    and (self.active.detune or 0) or 0
       return self.detune
     end
     return w
@@ -415,6 +461,16 @@ function newTrackerManager(mm, cm)
     return newDetuneWalker(chan):advanceTo(ppq)
   end
 
+  local function centsToRaw(cents)
+    local lim = cfg('pbRange', 2) * 100
+    return util:clamp(math.floor(cents * 8192 / lim + 0.5), -8192, 8191)
+  end
+
+  local function rawToCents(raw)
+    local lim = cfg('pbRange', 2) * 100
+    return math.floor(raw /8192 * lim + 0.5)
+  end
+
   --------------------
   -- Tuning: add missing pitchbend events for 'pitchbend' mode
   -- Precondition: all events have a 'detune' parameter
@@ -422,64 +478,82 @@ function newTrackerManager(mm, cm)
 
   local function addMissingPitchbends()
     local pbRange = cfg('pbRange', 2)
-    
+
+    -- materialise ccs once, keyed by channel, pb-only
+    local pbsByChan = {}
+    for i=1,16 do pbsByChan[i] = { } end
+
+    for loc, evt in mm:ccs() do
+      if evt.msgType == 'pb' then
+        util:add(pbsByChan[evt.chan], util:assign(evt, { loc = loc }))
+      end
+    end
+
+    local function applyPBAt(ppq, chan, raw)
+      local found = false
+      for _, evt in ipairs(pbsByChan[chan]) do
+        if evt.ppq == ppq and not evt.deleted then
+          if found then
+            deleteEvent('pb', evt)
+            evt.deleted = true
+          else
+            assignEvent('pb', evt, { val = raw })
+            found = true
+          end
+        end
+      end
+      if not found then
+        addEvent('pb', { ppq = ppq, chan = chan, msgType = 'pb', val = raw })
+      end
+    end
+
+    local function deletePBAt(ppq, chan)
+      for _, evt in ipairs(pbsByChan[chan]) do
+        if evt.ppq == ppq and not evt.deleted then
+          deleteEvent('pb', evt)
+          evt.deleted = true
+        end
+      end
+    end
+    reaper.ClearConsole()
     -- pitchbend data is keyed to the first note column per channel;
     -- microtuning and secondary note columns shouldn't be mixed.
     for chan, channel in ipairs(channels) do
       local col = firstNoteCol(channel)
       if col then
-        local currentRaw = 0
-        local currentCents = 0
-        local currentLogical = 0
-        local loc = 1
-        local nextNote
+        local pbs = pbsByChan[chan] or {}
+        local idx, cents = 1, 0
 
-        -- Iterate over raw pb messages for this channel
-        for _, cc in mm:ccs() do
-          if cc.chan == chan and cc.msgType == 'pb' then
-            -- iterate over all notes strictly before this pitchbend
-            nextNote = col.events[loc]
-            while nextNote and nextNote.ppq < cc.ppq do
-              local newLogical = currentCents - nextNote.detune
-              if newLogical ~= currentLogical then
-                currentLogical = newLogical
-                addEvent('pb', {
-                  ppq = nextNote.ppq,
-                  chan = chan,
-                  msgType = 'pb',
-                  val = currentRaw,
-                })
-              end
-              loc = loc + 1
-              nextNote = col.events[loc]
-            end
-            -- adopt this pb's value
-            currentRaw = cc.val
-            currentCents = (cc.val / 8192) * pbRange * 100
-            -- a note sitting exactly on this pb is already covered by it;
-            -- consume it and sync currentLogical so later comparisons are correct
-            if nextNote and nextNote.ppq == cc.ppq then
-              currentLogical = currentCents - nextNote.detune
-              loc = loc + 1
-              nextNote = col.events[loc]
-            end
+        local function advanceToBefore(ppq)
+          while idx <= #pbs and pbs[idx].ppq < ppq do
+            cents = rawToCents(pbs[idx].val)
+            idx = idx + 1
           end
+          return cents
+        end
+        local function advanceTo(ppq)
+          while idx <= #pbs and pbs[idx].ppq <= ppq do
+            cents = rawToCents(pbs[idx].val)
+            idx = idx + 1
+          end
+          return cents
         end
 
-        -- handle notes after last pitchbend
-        while nextNote do
-          local newLogical = currentCents - nextNote.detune
-          if newLogical ~= currentLogical then
-            currentLogical = newLogical
-            addEvent('pb', {
-              ppq = nextNote.ppq,
-              chan = chan,
-              msgType = 'pb',
-              val = currentRaw,  -- whatever pb is already in effect
-            })
+        -- detune walker
+        local w = newDetuneWalker(chan)
+
+        for _, note in ipairs(col.events) do
+          local oldPB = advanceToBefore(note.ppq)
+          local oldDetune = w:advanceToBefore(note.ppq)
+          local oldLogical = oldPB - oldDetune
+          local newPB = advanceTo(note.ppq)
+          local newDetune = w:advanceTo(note.ppq)
+          local newLogical = newPB - newDetune
+          if newLogical ~= oldLogical then
+            applyPBAt(note.ppq, chan, centsToRaw(newPB))
+          elseif newPB == oldPB then
+            deletePBAt(note.ppq, chan)
           end
-          loc = loc + 1
-          nextNote = col.events[loc]
         end
       end
     end
@@ -575,20 +649,18 @@ function newTrackerManager(mm, cm)
 
     for chan = 1, 16 do
       local channel      = channels[chan]
-      local col          = nil
       local currentCents = 0
       local w            = newDetuneWalker(chan)
+      local events, anyNonZero = {}, false
 
       for loc, cc in mm:ccs() do
         if cc.chan == chan and cc.msgType == 'pb' then
-          if not col then col = getOrCreateSingletonColumn(channel, 'pb') end
-
           local lastLogicalCents = math.floor(currentCents - w:advanceToBefore(cc.ppq) + 0.5)
           local currentDetune    = w:advanceTo(cc.ppq)
           currentCents           = (cc.val / 8192) * pbRange * 100
           local logicalCents     = math.floor(currentCents - currentDetune + 0.5)
 
-          util:add(col.events, {
+          util:add(events, {
             loc    = loc,
             ppq    = cc.ppq,
             val    = logicalCents,
@@ -596,7 +668,13 @@ function newTrackerManager(mm, cm)
             detune = currentDetune,
             hidden = (logicalCents == lastLogicalCents),
           })
+          if logicalCents ~= 0 then anyNonZero = true end
         end
+      end
+
+      if anyNonZero then
+        local col = getOrCreateSingletonColumn(channel, 'pb')
+        for _, e in ipairs(events) do util:add(col.events, e) end
       end
     end
 
@@ -696,34 +774,151 @@ function newTrackerManager(mm, cm)
 
   -- DEFERRED QUEUE EXTERNAL INTERFACE
 
-  -- pb events surface `val` in logical cents (raw pb cents minus the col-1
-  -- detune active at that ppq); the MIDI layer wants raw 14-bit, so invert.
-  local function centsToRaw(cents, chan, ppq)
-    local lim = cfg('pbRange', 2) * 100
-    local rawCents = cents + detuneAt(chan, ppq)
-    return util:clamp(math.floor(rawCents * 8192 / lim + 0.5), -8192, 8191)
-  end
-
   function tm:deleteEvent(type, evt)
     deleteEvent(type, evt)
   end
 
   function tm:addEvent(type, evt)
     if type == 'pb' and evt.val then
-      evt = util:clone(evt); evt.val = centsToRaw(evt.val, evt.chan, evt.ppq)
+      evt = util:clone(evt)
+      evt.val = centsToRaw(evt.val + detuneAt(evt.chan, evt.ppq))
     end
     addEvent(type, evt)
   end
 
   function tm:assignEvent(type, evt, update)
     if type == 'pb' and update.val then
-      update = util:clone(update); update.val = centsToRaw(update.val, evt.chan, evt.ppq)
+      update = util:clone(update)
+      update.val = centsToRaw(update.val + detuneAt(evt.chan, evt.ppq))
     end
     assignEvent(type, evt, update)
   end
 
   function tm:flush()
     flush()
+  end
+
+  --------------------
+  -- Microtuning realisation
+  --
+  -- tm owns the demix between note intent (pitch + detune) and note
+  -- realisation (raw pb events on the wire). The view layer speaks
+  -- intent; tm keeps realisation in sync.
+  --
+  -- retuneNote shifts every raw pb a note owns by Δdetune (in raw units)
+  -- so logical offsets within the note are preserved, and guarantees a pb
+  -- at note start carrying the new realisation level. realisePbAt is the
+  -- fresh-note anchor primitive: no Δ, just "raw = rawFromCents(detune)"
+  -- at a given (chan, ppq).
+  --
+  -- Ownership follows the design's cascade rule: a pb in [ppq, endppq)
+  -- on the same channel belongs to the note, assuming col-1 notes don't
+  -- overlap (the view layer's placement machinery enforces this).
+  --------------------
+
+  local function rawFromCents(cents)
+    local pbRange = cfg('pbRange', 2)
+    return util:clamp(
+      math.floor(cents * 8192 / (pbRange * 100) + 0.5), -8192, 8191)
+  end
+
+  function tm:realisePbAt(chan, ppq, detune, endppq)
+    local rawVal = rawFromCents(detune)
+    local atStart, atEnd, rawAtEnd = nil, false, 0
+    for loc, cc in mm:ccs() do
+      if cc.chan == chan and cc.msgType == 'pb' then
+        if cc.ppq <= (endppq or ppq) then rawAtEnd = cc.val end
+        if cc.ppq == ppq    then atStart = loc end
+        if endppq and cc.ppq == endppq then atEnd = true end
+      end
+    end
+    if atStart then assignEvent('pb', { loc = atStart }, { val = rawVal })
+    else            addEvent('pb', { ppq = ppq, chan = chan, msgType = 'pb', val = rawVal }) end
+    if endppq and not atEnd then
+      addEvent('pb', { ppq = endppq, chan = chan, msgType = 'pb', val = rawAtEnd })
+    end
+  end
+
+  function tm:retuneNote(note, update)
+    local full = mm:getNote(note.loc)
+    if not full then return end
+
+    local pitch   = update.pitch  or note.pitch
+    local oldDet  = full.detune or 0
+    local newDet  = update.detune or oldDet
+    local delta   = newDet - oldDet
+
+    assignEvent('note', note, { pitch = pitch, detune = newDet })
+
+    if delta == 0 then return end
+
+    local rawDelta = rawFromCents(delta)
+    local raw0, ownedAtStart, pbAtEnd = 0, false, false
+    local owned = {}
+    local rawAtEnd = 0  -- last raw pb in [ppq, endppq); falls back to raw0
+    for loc, cc in mm:ccs() do
+      if cc.chan == full.chan and cc.msgType == 'pb' then
+        if cc.ppq <= full.ppq then raw0 = cc.val end
+        if cc.ppq >= full.ppq and cc.ppq < full.endppq then
+          util:add(owned, { loc = loc, val = cc.val })
+          rawAtEnd = cc.val
+          if cc.ppq == full.ppq then ownedAtStart = true end
+        end
+        if cc.ppq == full.endppq then pbAtEnd = true end
+      end
+    end
+    if #owned == 0 then rawAtEnd = raw0 end
+
+    for _, pb in ipairs(owned) do
+      assignEvent('pb', { loc = pb.loc },
+                  { val = util:clamp(pb.val + rawDelta, -8192, 8191) })
+    end
+    if not ownedAtStart then
+      addEvent('pb', {
+        ppq = full.ppq, chan = full.chan, msgType = 'pb',
+        val = util:clamp(raw0 + rawDelta, -8192, 8191),
+      })
+    end
+    -- Restore the pre-retune raw at endppq so the bend level outside the
+    -- note is undisturbed. Skip if a pb already sits at endppq.
+    if not pbAtEnd then
+      addEvent('pb', {
+        ppq = full.endppq, chan = full.chan, msgType = 'pb',
+        val = util:clamp(rawAtEnd, -8192, 8191),
+      })
+    end
+  end
+
+  -- Delete the pb(s) at (chan, ppq). If a col-1 note starts there with
+  -- nonzero detune, preserve the logical bend by rewriting instead of
+  -- deleting: raw = (logical in effect just before) + note.detune.
+  function tm:deletePbAt(chan, ppq)
+    local pbLocs, priorRaw = {}, 0
+    for loc, cc in mm:ccs() do
+      if cc.chan == chan and cc.msgType == 'pb' then
+        if cc.ppq < ppq then priorRaw = cc.val
+        elseif cc.ppq == ppq then util:add(pbLocs, loc) end
+      end
+    end
+    if #pbLocs == 0 then return end
+
+    local note
+    local channel = channels[chan]
+    local col = channel and firstNoteCol(channel)
+    for _, n in ipairs(col and col.events or {}) do
+      if n.ppq == ppq then note = n; break end
+    end
+
+    local detune = note and (note.detune or 0) or 0
+    if detune ~= 0 then
+      local priorDetune = newDetuneWalker(chan):advanceToBefore(ppq)
+      local logical     = rawToCents(priorRaw) - priorDetune
+      local newRaw      = rawFromCents(logical + detune)
+      assignEvent('pb', { loc = pbLocs[1] }, { val = newRaw })
+      for i = 2, #pbLocs do deleteEvent('pb', pbLocs[i]) end
+    else
+      for _, loc in ipairs(pbLocs) do deleteEvent('pb', loc) end
+    end
   end
 
   -- LIFECYCLE

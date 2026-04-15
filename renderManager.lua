@@ -74,7 +74,11 @@ function newRenderManager(vm, cm)
       return showDelay and '··· ·· ··' or '··· ··'
     end
 
-    local noteTxt = evt.type == 'pa' and '···' or noteName(evt.pitch)
+    local label
+    if evt.type ~= 'pa' then
+      label = select(1, vm:noteProjection(evt)) or noteName(evt.pitch)
+    end
+    local noteTxt = evt.type == 'pa' and '···' or label
     local velTxt  = evt.vel and string.format('%02X', evt.vel) or '··'
     local text    = noteTxt .. ' ' .. velTxt
 
@@ -384,6 +388,35 @@ function newRenderManager(vm, cm)
       end
     end
 
+    -- Off-grid bars: projection gap between note intent and displayed step.
+    -- Drawn only under an active tuning, only for notes with a non-zero gap.
+    if vm:activeTuning() then
+      local barCol = colour('accent')
+      for _, col in ipairs(grid.cols) do
+        if col.x and col.type == 'note' and col.cells then
+          local x0 = gridOriginX + col.x * gridX
+          local x1 = x0 + 3 * gridX
+          local cx = (x0 + x1) / 2
+          local halfW = (x1 - x0) / 2 - 1
+          for y = 0, gridHeight - 1 do
+            local row = scrollRow + y
+            if row >= numRows then break end
+            local evt = col.cells[row]
+            if evt and evt.pitch then
+              local _, gap, halfGap = vm:noteProjection(evt)
+              if gap and gap ~= 0 and halfGap > 0 then
+                local yTop = gridOriginY + y * gridY + 1
+                local offset = util:clamp(gap / halfGap, -1, 1) * halfW
+                ImGui.DrawList_AddLine(drawList, x0, yTop, x1, yTop, barCol, 1)
+                local tickX = cx + offset
+                ImGui.DrawList_AddLine(drawList, tickX, yTop - 1, tickX, yTop + 2, barCol, 1)
+              end
+            end
+          end
+        end
+      end
+    end
+
     -- Selection highlight
     if sel and sel.col2 >= scrollCol and sel.col1 <= vm:lastVisibleFrom(scrollCol) then
       local yFrom = math.max(sel.row1 - scrollRow, 0)
@@ -482,6 +515,9 @@ function newRenderManager(vm, cm)
     stop           = { ImGui.Key_F8 },
     addNoteCol     = { { ImGui.Key_N, ImGui.Mod_Ctrl } },
     addTypedCol    = { { ImGui.Key_T, ImGui.Mod_Ctrl } },
+    cycleTuning    = { { ImGui.Key_T, ImGui.Mod_Super } },
+    transposeUp    = { { ImGui.Key_Equal, ImGui.Mod_Shift } },
+    transposeDown  = { { ImGui.Key_Minus, ImGui.Mod_Shift } },
     hideExtraCol   = { { ImGui.Key_H, ImGui.Mod_Ctrl } },
     toggleDelay    = { { ImGui.Key_D, ImGui.Mod_Ctrl } },
     doubleRPB      = { { ImGui.Key_Equal, ImGui.Mod_Super } },

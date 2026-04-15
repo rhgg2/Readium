@@ -577,9 +577,8 @@ function newMidiManager(take)
     local note = loc and noteTbl[loc]
     if not note then return end
 
-    local chan
-    if t.chan then chan = t.chan - 1 end
-      
+    local chan = (t.chan or note.chan) - 1
+
     -- update the existing note (nil values will do nothing)
     reaper.MIDI_SetNote(take, note.idx, nil, nil, t.ppq, t.endppq, chan, t.pitch, t.vel, true)
 

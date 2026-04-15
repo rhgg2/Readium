@@ -37,6 +37,7 @@
 loadModule('util')
 loadModule('midiManager')
 loadModule('trackerManager')
+loadModule('microtuning')
 
 local function print(...)
   return util:print(...)
@@ -106,6 +107,36 @@ function newViewManager(tm, cm)
 
   local function setcfg(lev, key, val)
     if cm then cm:set(lev, key, val) end
+  end
+
+  ---------- MICROTUNING LENS
+
+  local function activeTuning()
+    local name = cfg('tuning', nil)
+    return name and microtuning.findTuning(name) or nil
+  end
+
+  -- Project a note event onto the active tuning. Returns label, gap, halfGap
+  -- (both in cents), or nil if no tuning is active / evt is not a note.
+  --   gap     = note.cents − displayedStepCents   (sharp is positive)
+  --   halfGap = half the distance to the nearest neighbour step, used to
+  --             normalise gap so full deflection = "just about to snap to
+  --             the next step" regardless of step density.
+  local function noteProjection(evt)
+    local tuning = activeTuning()
+    if not (tuning and evt and evt.pitch) then return nil end
+    local detune    = evt.detune or 0
+    local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
+    local label     = microtuning.stepToText(tuning, step, oct)
+    local tm_, td_  = microtuning.stepToMidi(tuning, step, oct)
+    local gap       = (evt.pitch * 100 + detune) - (tm_ * 100 + td_)
+
+    local steps, n, period = tuning.cents, #tuning.cents, tuning.period
+    local left    = step == 1 and steps[n] - period or steps[step - 1]
+    local right   = step == n and steps[1] + period or steps[step + 1]
+    local halfGap = math.min(steps[step] - left, right - steps[step]) / 2
+
+    return label, gap, halfGap
   end
 
   ---------- PPQ / ROW MAPPING
@@ -491,11 +522,14 @@ function newViewManager(tm, cm)
       if stop == 1 then
         local nk = noteChars[char]; if not nk then return end
         local pitch = util:clamp((currentOctave + 1 + nk[2]) * 12 + nk[1], 0, 127)
+        local detune = 0
+        local tuning = activeTuning()
+        if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
         truncatePitchInChannel(col, pitch, evt and evt.ppq or cursorPPQ, evt)
 
         -- Existing note → repitch in place
         if isNote(evt) then
-          tm:assignEvent('note', evt, { pitch = pitch })
+          tm:retuneNote(evt, { pitch = pitch, detune = detune })
           return commit(pitch, evt.vel)
         end
 
@@ -511,8 +545,9 @@ function newViewManager(tm, cm)
           end
         end
 
-        local new = { pitch = pitch, ppq = cursorPPQ, chan = col.midiChan }
+        local new = { pitch = pitch, detune = detune, ppq = cursorPPQ, chan = col.midiChan }
         placeNewNote(col, new)
+        tm:realisePbAt(col.midiChan, cursorPPQ, detune, new.endppq)
         return commit(pitch, new.vel)
 
       -- Stop 2: octave (only on real notes)
@@ -635,7 +670,8 @@ function newViewManager(tm, cm)
     if not (col and evt) then return end
 
     if col.type ~= 'note' then
-      tm:deleteEvent(col.type, evt)
+      if col.type == 'pb' then tm:deletePbAt(col.midiChan, evt.ppq)
+      else tm:deleteEvent(col.type, evt) end
       return tm:flush()
     end
 
@@ -701,6 +737,26 @@ function newViewManager(tm, cm)
     local newPPQ = util:clamp(note.endppq + step * rowDelta, note.ppq + 1, maxPPQ)
     tm:assignEvent('note', note, { endppq = newPPQ })
     tm:flush()
+  end
+
+  local function transpose(delta)
+    local col, note = cursorNoteAfter()
+    if not note then col, note = cursorNoteBefore() end
+    if not note then return end
+
+    local tuning = activeTuning()
+    local pitch, detune
+    if tuning then
+      pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune or 0, delta)
+    else
+      pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune or 0
+    end
+    if pitch == note.pitch and detune == (note.detune or 0) then return end
+
+--    truncatePitchInChannel(col, pitch, note.ppq, note)
+    tm:retuneNote(note, { pitch = pitch, detune = detune })
+    tm:flush()
+    audition(pitch, note.vel, col.midiChan)
   end
 
   local function adjustPosition(rowDelta)
@@ -1307,6 +1363,9 @@ function newViewManager(tm, cm)
 
   function vm:rowPPQ(row) return rowPPQs[row] end
 
+  function vm:activeTuning()   return activeTuning() end
+  function vm:noteProjection(evt) return noteProjection(evt) end
+
   function vm:rowBeatInfo(row) return rowBeatInfo(row) end
 
   function vm:barBeatSub(row) return barBeatSub(row) end
@@ -1396,6 +1455,8 @@ function newViewManager(tm, cm)
     shrinkNote     = function() adjustDuration(-1) end,
     nudgeBack    = function() adjustPosition(-1) end,
     nudgeForward = function() adjustPosition(1) end,
+    transposeUp   = function() transpose(1) end,
+    transposeDown = function() transpose(-1) end,
     play           = function() tm:play() end,
     playPause      = function() tm:playPause() end,
     playFromTop    = function() tm:playFrom(0) end,
@@ -1422,6 +1483,12 @@ function newViewManager(tm, cm)
           if n then vm:setRowPerBeat(n) end
         end,
       }
+    end,
+    cycleTuning    = function()
+      local names = { '12EDO', '19EDO', '31EDO', '53EDO' }
+      local cur, i = cfg('tuning', nil), 0
+      for k, v in ipairs(names) do if v == cur then i = k; break end end
+      setcfg('track', 'tuning', names[(i + 1) % (#names + 1)])
     end,
     quit           = function() return 'quit' end,
   }
