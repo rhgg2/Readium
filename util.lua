@@ -55,6 +55,33 @@ function util:add(tbl, val)
   return val
 end
 
+-- seek: find an item on one side of a boundary in a key-sorted list.
+-- mode is 'before' | 'at-or-before' | 'after' | 'at-or-after'.
+-- keyFn extracts the scalar key from an item (defaults to .ppq).
+-- filter is an optional predicate to restrict the match.
+function util:seek(items, mode, key, filter, keyFn)
+  keyFn = keyFn or function(x) return x.ppq end
+  local before = mode == 'before' or mode == 'at-or-before'
+  local cmp
+  if     mode == 'before'       then cmp = function(k) return k <  key end
+  elseif mode == 'at-or-before' then cmp = function(k) return k <= key end
+  elseif mode == 'after'        then cmp = function(k) return k >  key end
+  elseif mode == 'at-or-after'  then cmp = function(k) return k >= key end
+  end
+  local hit
+  for _, item in ipairs(items) do
+    if cmp(keyFn(item)) then
+      if not filter or filter(item) then
+        if not before then return item end
+        hit = item
+      end
+    elseif before then
+      break
+    end
+  end
+  return hit
+end
+
 function util:clone(src, exclude)
   if not src then return end
   local dst = {}

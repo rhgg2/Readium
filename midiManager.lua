@@ -54,7 +54,6 @@
 --
 -- NOTES  (location-based access, identified internally by UUID)
 --   mm:getNote(loc)                   -- returns a copy of the note, or nil
---   mm:getNoteByUUID(uuid)            -- returns a copy of the note, or nil
 --   mm:notes()                        -- iterator: for loc, note in mm:notes()
 --   mm:assignNote(loc, t)             -- update note at location
 --     Only provided fields in t are changed. Supports ppq, endppq, chan,
@@ -155,6 +154,10 @@ function newMidiManager(take)
     return result
   end
 
+  local function push(tbl, evt)
+    local loc = #tbl + 1
+    tbl[loc] = evt
+  end
 
   local function loadMetadata()
     if not take then return end
@@ -266,21 +269,6 @@ function newMidiManager(take)
   
   --- UTILS
 
-  local function nextNote()
-    maxNote = maxNote + 1
-    return maxNote
-  end
-  
-  local function nextCC()
-    maxCC = maxCC + 1
-    return maxCC
-  end
-
-  local function nextSysex()
-    maxSysex = maxSysex + 1
-    return maxSysex
-  end
-
   local function assignNewUUID(note)
     maxUUID = maxUUID + 1
     note.uuid = maxUUID
@@ -330,15 +318,15 @@ function newMidiManager(take)
       chan = chan + 1
       if ok then
         local tag = ppq .. '|' .. chan .. '|' .. pitch
-        local loc = nextNote()
-        noteTbl[loc] = {
+        local loc = #noteTbl + 1
+        util:add(noteTbl, {
           idx    = i,
           ppq    = ppq,
           endppq = endppq,
           chan   = chan,
           pitch  = pitch,
           vel    = vel,
-        }
+        })
         notesLUT[tag] = noteTbl[loc]
       end
     end
@@ -384,7 +372,7 @@ function newMidiManager(take)
           entry.val2 = msg3
         end
 
-        ccTbl[nextCC()] = entry
+        util:add(ccTbl, entry)
       end
     end
 
@@ -467,21 +455,22 @@ function newMidiManager(take)
           end
         else
           -- some other notation event
-          sysexTbl[nextSysex()] = {
+          util:add(sysexTbl, {
             idx     = i,
             ppq     = ppq,
             msgType = 'notation',
             val     = msg,
-          }
+          })
         end
       elseif ok then
         -- all other text/sysex events (text meta, sysex, etc.)
-        sysexTbl[nextSysex()] = {
+        local loc = #sysexTbl + 1
+        util:add(sysexTbl, {
             idx     = i,
             ppq     = ppq,
             msgType = textMsgTypes[eventtype] or ('meta_' .. eventtype),
             val     = msg,
-        }
+        })
       end
     end
 
@@ -526,11 +515,6 @@ function newMidiManager(take)
 
   function mm:getNote(loc)
     local note = noteTbl[loc]
-    return util:clone(note, INTERNALS)
-  end
-
-  function mm:getNoteByUUID(uuid)
-    local note = uuidTbl[uuid]
     return util:clone(note, INTERNALS)
   end
 
@@ -613,7 +597,7 @@ function newMidiManager(take)
     local _, noteCount, _, sysexCount = reaper.MIDI_CountEvts(take)
     note.uuidIdx = sysexCount - 1
     note.idx = noteCount - 1
-    noteTbl[nextNote()] = note
+    util:add(noteTbl, note)
 
     saveMetadatum(note.uuid)
 
@@ -741,7 +725,7 @@ function newMidiManager(take)
     local _, _, ccCount = reaper.MIDI_CountEvts(take)
     msg.idx = ccCount - 1
     
-    ccTbl[nextCC()] = msg
+    util:add(ccTbl, msg)
 
     return maxCC -- location in table
   end
@@ -809,8 +793,7 @@ function newMidiManager(take)
 
     local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
     sysex.idx = sysexCount - 1
-    
-    sysexTbl[nextSysex()] = sysex
+    util:add(sysexTbl, sysex)
 
     return maxSysex -- location in table
   end

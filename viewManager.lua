@@ -412,31 +412,6 @@ function newViewManager(tm, cm)
 
   local function isNote(e) return e and e.endppq end
 
-  -- seek: find an event on one side of a ppq boundary in a sorted event list.
-  -- mode is 'before' | 'at-or-before' | 'after' | 'at-or-after'.
-  -- filter is an optional predicate (e.g. isNote) to restrict the match.
-  local function seek(events, mode, ppq, filter)
-    local before = mode == 'before' or mode == 'at-or-before'
-    local cmp
-    if     mode == 'before'       then cmp = function(p) return p <  ppq end
-    elseif mode == 'at-or-before' then cmp = function(p) return p <= ppq end
-    elseif mode == 'after'        then cmp = function(p) return p >  ppq end
-    elseif mode == 'at-or-after'  then cmp = function(p) return p >= ppq end
-    end
-    local hit
-    for _, evt in ipairs(events) do
-      if cmp(evt.ppq) then
-        if not filter or filter(evt) then
-          if not before then return evt end
-          hit = evt
-        end
-      elseif before then
-        break
-      end
-    end
-    return hit
-  end
-
   -- between: iterate events with ppq in [lo, hi). Assumes ppq-sorted input.
   local function between(events, lo, hi)
     local i = 0
@@ -466,8 +441,8 @@ function newViewManager(tm, cm)
   end
 
   local function placeNewNote(col, update)
-    local last = seek(col.events, 'before', update.ppq, isNote)
-    local next = seek(col.events, 'after',  update.ppq, isNote)
+    local last = util:seek(col.events, 'before', update.ppq, isNote)
+    local next = util:seek(col.events, 'after',  update.ppq, isNote)
     if last and last.endppq >= update.ppq then
       tm:assignEvent('note', last, { endppq = update.ppq })
     end
@@ -491,13 +466,13 @@ function newViewManager(tm, cm)
   end
 
   local function overlapLimit(col, note)
-    local next = seek(col.events, 'after', note.ppq, isNote)
+    local next = util:seek(col.events, 'after', note.ppq, isNote)
     if next then return next.ppq + cfg('overlapOffset', 1/16) * resolution end
     return length
   end
 
   local function overlapLimitStart(col, note)
-    local prev = seek(col.events, 'before', note.ppq, isNote)
+    local prev = util:seek(col.events, 'before', note.ppq, isNote)
     if prev then return prev.endppq - cfg('overlapOffset', 1/16) * resolution end
     return 0
   end
@@ -535,7 +510,7 @@ function newViewManager(tm, cm)
 
         -- PA cell → wipe host's PA tail, then fall through
         if evt and evt.type == 'pa' then
-          local host = seek(col.events, 'before', evt.ppq, isNote)
+          local host = util:seek(col.events, 'before', evt.ppq, isNote)
           if host and host.endppq > evt.ppq then
             for _, pa in ipairs(notePAEvents(col, host.pitch, evt.ppq, host.endppq)) do
               tm:deleteEvent('pa', pa)
@@ -547,7 +522,6 @@ function newViewManager(tm, cm)
 
         local new = { pitch = pitch, detune = detune, ppq = cursorPPQ, chan = col.midiChan }
         placeNewNote(col, new)
-        tm:realisePbAt(col.midiChan, cursorPPQ, detune, new.endppq)
         return commit(pitch, new.vel)
 
       -- Stop 2: octave (only on real notes)
@@ -608,7 +582,7 @@ function newViewManager(tm, cm)
         end
 
         if cfg('polyAftertouch', true) then
-          local note = seek(col.events, 'before', cursorPPQ, isNote)
+          local note = util:seek(col.events, 'before', cursorPPQ, isNote)
           if note and note.endppq > cursorPPQ then
             local val = newVel(0)
             tm:addEvent('pa', {
@@ -655,9 +629,9 @@ function newViewManager(tm, cm)
   ----------  EVENT DELETION
 
   local function deleteNote(col, note)
-    local last = seek(col.events, 'before', note.ppq, isNote)
+    local last = util:seek(col.events, 'before', note.ppq, isNote)
     if last and last.endppq >= note.ppq then
-      local after = seek(col.events, 'after', note.ppq, isNote)
+      local after = util:seek(col.events, 'after', note.ppq, isNote)
       tm:assignEvent('note', last, { endppq = after and after.ppq or length })
     end
     tm:deleteEvent('note', note)
@@ -670,8 +644,7 @@ function newViewManager(tm, cm)
     if not (col and evt) then return end
 
     if col.type ~= 'note' then
-      if col.type == 'pb' then tm:deletePbAt(col.midiChan, evt.ppq)
-      else tm:deleteEvent(col.type, evt) end
+      tm:deleteEvent(col.type, evt)
       return tm:flush()
     end
 
@@ -679,7 +652,7 @@ function newViewManager(tm, cm)
     if evt.type == 'pa' then
       if selGrp == 2 then tm:deleteEvent('pa', evt); tm:flush() end
     elseif selGrp == 2 then
-      local prev = seek(col.events, 'before', evt.ppq, isNote)
+      local prev = util:seek(col.events, 'before', evt.ppq, isNote)
       tm:assignEvent('note', evt, { vel = (prev and prev.vel) or cfg('defaultVelocity', 100) })
       tm:flush()
     elseif selGrp == 3 then
@@ -699,14 +672,14 @@ function newViewManager(tm, cm)
     local col = grid.cols[cursorCol]
     local cursorPPQ = rowPPQs[cursorRow]
     if not (col and col.type == 'note' and cursorPPQ) then return end
-    return col, seek(col.events, 'at-or-before', cursorPPQ, isNote)
+    return col, util:seek(col.events, 'at-or-before', cursorPPQ, isNote)
   end
 
   local function cursorNoteAfter()
     local col = grid.cols[cursorCol]
     local cursorPPQ = rowPPQs[cursorRow]
     if not (col and col.type == 'note' and cursorPPQ) then return end
-    return col, seek(col.events, 'at-or-after', cursorPPQ, isNote)
+    return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
   end
 
   local function noteOff()
@@ -714,10 +687,10 @@ function newViewManager(tm, cm)
     local cursorPPQ = rowPPQs[cursorRow]
     if not (col and col.type == 'note' and cursorSelGrp() == 1 and cursorPPQ) then return 'fallthrough' end
 
-    local last = seek(col.events, 'before', cursorPPQ, isNote)
+    local last = util:seek(col.events, 'before', cursorPPQ, isNote)
     if not last then return end
     if last.endppq == cursorPPQ then
-      local next = seek(col.events, 'at-or-after', cursorPPQ, isNote)
+      local next = util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
       tm:assignEvent('note', last, { endppq = next and next.ppq or length })
     else
       local newEnd = util:clamp(cursorPPQ, last.ppq + 1, overlapLimit(col, last))
@@ -833,11 +806,8 @@ function newViewManager(tm, cm)
     end
   end
 
-  -- Queue CC deletions.
-  local function queueDeleteCCs(locs)
-    for _, evt in pairs(locs) do
-      tm:deleteEvent('cc', evt)
-    end
+  local function queueDeleteCCs(col, locs)
+    for _, evt in pairs(locs) do tm:deleteEvent(col.type, evt) end
   end
 
   ---------- SELECTION OPERATIONS
@@ -890,7 +860,7 @@ function newViewManager(tm, cm)
         elseif noteMode == 'delay' then queueResetDelays(col, locs)
         else                            queueDeleteNotes(col, locs) end
       else
-        queueDeleteCCs(locs)
+        queueDeleteCCs(col, locs)
       end
     end
 
@@ -989,7 +959,7 @@ function newViewManager(tm, cm)
         if col.type == 'note' then
           util:add(entry.events, noteEvent(evt))
         elseif col.type == 'pb' then
-          util:add(entry.events, scalarEvent(evt, evt.rawVal))
+          util:add(entry.events, scalarEvent(evt, evt.val))
         else
           util:add(entry.events, scalarEvent(evt, evt.val))
         end
@@ -1023,7 +993,7 @@ function newViewManager(tm, cm)
   end
 
   local function pasteVelocities(events, dstCol, startPPQ, endPPQ)
-    local last = seek(dstCol.events, 'before', startPPQ)
+    local last = util:seek(dstCol.events, 'before', startPPQ)
     local currentVel = last and last.vel or cfg('defaultVelocity', 100)
 
     -- Delete existing PA events in the paste region
@@ -1048,7 +1018,7 @@ function newViewManager(tm, cm)
     -- Pass 2: create PA events for clipboard values landing on sustain rows
     if cfg('polyAftertouch', true) then
       for _, ce in ipairs(events) do
-        local note = seek(dstCol.events, 'before', ce.ppq, isNote)
+        local note = util:seek(dstCol.events, 'before', ce.ppq, isNote)
         if note and note.endppq > ce.ppq
           and note.ppq ~= ce.ppq then
           tm:addEvent('pa', {
@@ -1092,10 +1062,10 @@ function newViewManager(tm, cm)
           util:add(velList, { ppq = evt.ppq, val = evt.vel })
         end
       end
-      local last = seek(dstCol.events, 'before', startPPQ)
+      local last = util:seek(dstCol.events, 'before', startPPQ)
       local currentVel = last and last.vel or cfg('defaultVelocity', 100)
 
-      local nextNote = seek(dstCol.events, 'at-or-after', endPPQ, isNote)
+      local nextNote = util:seek(dstCol.events, 'at-or-after', endPPQ, isNote)
       local nextNotePPQ = nextNote and nextNote.ppq or length
 
       local locs = {}
@@ -1227,7 +1197,7 @@ function newViewManager(tm, cm)
       -- Wipe existing events in the paste region.
       if dst then
         if r.type == 'note' then
-          local last = seek(dst.events, 'before', startPPQ, isNote)
+          local last = util:seek(dst.events, 'before', startPPQ, isNote)
           if last and events[1] and last.endppq > events[1].ppq then
             tm:assignEvent('note', last, { endppq = events[1].ppq })
           end
@@ -1246,7 +1216,7 @@ function newViewManager(tm, cm)
       -- End cap for pasted notes that lack an explicit endppq.
       local capPPQ = endPPQ
       if r.type == 'note' and dst then
-        local nn = seek(dst.events, 'at-or-after', endPPQ, isNote)
+        local nn = util:seek(dst.events, 'at-or-after', endPPQ, isNote)
         if nn then capPPQ = math.min(capPPQ, nn.ppq) end
       end
 
