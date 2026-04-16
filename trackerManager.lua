@@ -91,6 +91,7 @@ function newTrackerManager(mm, cm)
 
   local channels = {}
   local fire  -- installed below, once tm exists
+  local um    -- update manager; set by tm:rebuild
 
   local function cfg(key, default)
     if cm then
@@ -100,97 +101,8 @@ function newTrackerManager(mm, cm)
     return default
   end
 
-  -- Deferred operation queue. Call deleteEvent/assignEvent/addEvent to
-  -- collect mutations, then flush() to execute them all in one modify call.
-
-  local queue = {}
-
-  function deleteEvent(evtType, evtOrLoc)
-    evt = type(evtOrLoc) == 'table' and evtOrLoc or { loc = evtOrLoc }
-    util:add(queue, { op = 'delete', type = evtType, evt = evt })
-  end
-
-  function assignEvent(evtType, evtOrLoc, update)
-    evt = type(evtOrLoc) == 'table' and evtOrLoc or { loc = evtOrLoc }
-    util:add(queue, { op = 'assign', type = evtType, evt = evt, update = update })
-  end
-
-  function addEvent(evtType, evt)
-    if evtType ~= 'note' then evt.msgType = evtType end
-    util:add(queue, { op = 'add', type = evtType, evt = evt })
-  end
-
   --------------------
-  -- PA cascade: poly-aftertouch events are attached to their host note
-  -- by (chan, pitch) within the host's closed interval [ppq, endppq].
-  -- On host delete, resize, translate, or repitch, PAs move or die to
-  -- match. Pb invariants are handled separately by the session, not
-  -- here — PA is a different animal with a different attachment rule.
-  --
-  -- Runs as a pre-pass before dispatch, re-entering the queue via
-  -- deleteEvent/assignEvent.
-  --------------------
-
-  local function firstNoteCol(channel)
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then return col end
-    end
-  end
-
-  local function forEachAttachedPA(host, fn)
-    for loc, cc in mm:ccs() do
-      if cc.msgType == 'pa' and cc.chan == host.chan and cc.pitch == host.pitch
-         and cc.ppq >= host.ppq and cc.ppq <= host.endppq then
-        fn(loc, cc)
-      end
-    end
-  end
-
-  local function cascadePADelete(host)
-    forEachAttachedPA(host, function(loc) deleteEvent('pa', loc) end)
-  end
-
-  local function cascadePAInterval(host, newPpq, newEnd)
-    local dPpq  = newPpq - host.ppq
-    local shift = (dPpq == newEnd - host.endppq) and dPpq or 0
-    forEachAttachedPA(host, function(loc, cc)
-      local newPPQ = cc.ppq + shift
-      if newPPQ < newPpq or newPPQ > newEnd then deleteEvent('pa', loc)
-      elseif shift ~= 0 then assignEvent('pa', loc, { ppq = newPPQ }) end
-    end)
-  end
-
-  local function cascadePARepitch(host, newPitch)
-    forEachAttachedPA(host, function(loc) assignEvent('pa', loc, { pitch = newPitch }) end)
-  end
-
-  -- Pre-pass: translate note ops into PA side-effects. Snapshots queue
-  -- length so cascade-appended ops (never 'note') aren't reconsidered.
-  local function cascadePAOps()
-    for i = 1, #queue do
-      local o = queue[i]
-      if o.type == 'note' then
-        local host = mm:getNote(o.evt.loc)
-        if host then
-          host.loc = o.evt.loc
-          if o.op == 'delete' then
-            cascadePADelete(host)
-          elseif o.op == 'assign' then
-            local u = o.update
-            if u.ppq or u.endppq then
-              cascadePAInterval(host, u.ppq or host.ppq, u.endppq or host.endppq)
-            end
-            if u.pitch and u.pitch ~= host.pitch then
-              cascadePARepitch(host, u.pitch)
-            end
-          end
-        end
-      end
-    end
-  end
-
-  --------------------
-  -- PB <-> cents conversion. 
+  -- PB <-> cents conversion
   --------------------
 
   local function centsToRaw(cents)
@@ -204,112 +116,87 @@ function newTrackerManager(mm, cm)
   end
 
   --------------------
-  -- Session
+  -- PA cascade
   --
-  -- Working model for a dispatch pass. Holds a lazy per-channel view
-  -- of col-1 notes and pb events, provides fix/retune/reduce helpers
-  -- and the Stage 2 editing ops from design/pitchbend.md. Each op
-  -- reads the live state left by previous ops in the same batch, so
-  -- the "all queried values taken from the pre-amend state" rule from
-  -- the design is honoured *per op*, not per batch.
-  --
-  -- State items carry an optional loc (items loaded from mm) or are new
-  -- (no loc). Mutations go through set(): loaded items fold into the
-  -- matching assigns entry; new items are seen at commit via the live
-  -- reference held by their adds entry. Deletions splice the item out of
-  -- its chans list and either record a delete (loaded) or strike the
-  -- corresponding adds entry (new).
-  --
-  -- adds/assigns/deletes are built inline as classifier ops run; commit
-  -- consumes them directly with no further walk of chans. Passthrough
-  -- queue entries (col-2+ notes, CC, PA, AT, PC, sysex) dispatch straight
-  -- into these same tables.
-  --
-  -- pb.val is stored as logical cents throughout the session.
+  -- Poly-aftertouch events are attached to their host note by
+  -- (chan, pitch) within the host's closed interval [ppq, endppq].
+  -- On host delete, resize, or repitch, PAs move or die to match.
+  -- Cascade side-effects route through um's passthrough path.
   --------------------
 
-  local function newSession()
-    local sn = {}
-    local chans = {}        -- chans[c] = { notes = {...}, pbs = {...} }
-    local adds = {}         -- { type, evt }  — for note/pb, evt is the live state item
-    local assigns = {}      -- { type, loc, update }
-    local deletes = {}      -- { type, loc }
-    local pbAt, rawAt, insertPb  -- forward-decl'd for loadChan's preliminary pass
-
-    -- Mutate a field. For loaded items, fold into (or create) the matching
-    -- assigns entry; for new items the live item is already held by its
-    -- adds entry, so the mutation is seen at commit automatically.
-    local function set(item, type, k, v)
-      item[k] = v
-      if not item.loc then return end
-      for _, e in ipairs(assigns) do
-        if e.loc == item.loc and e.type == type then
-          e.update[k] = v; return
-        end
-      end
-      util:add(assigns, { type = type, loc = item.loc, update = { [k] = v } })
-    end
-
-    -- Splice an item out of its list. Loaded items yield a delete and strike
-    -- any pending assign at that loc; new items are removed from adds.
-    local function drop(list, i, type)
-      local item = list[i]
-      table.remove(list, i)
-      if item.loc then
-        util:add(deletes, { type = type, loc = item.loc })
-        for j = #assigns, 1, -1 do
-          local e = assigns[j]
-          if e.loc == item.loc and e.type == type then table.remove(assigns, j) end
-        end
-      else
-        for j = #adds, 1, -1 do
-          if adds[j].evt == item then table.remove(adds, j); break end
-        end
+  local function forEachAttachedPA(host, fn)
+    for loc, cc in mm:ccs() do
+      if cc.msgType == 'pa' and cc.chan == host.chan and cc.pitch == host.pitch
+         and cc.ppq >= host.ppq and cc.ppq <= host.endppq then
+        fn(loc, cc)
       end
     end
+  end
 
-    local function loadChan(chan, wantPrelim)
-      if chans[chan] then return chans[chan] end
-      if wantPrelim == nil then wantPrelim = true end
-      local notes, pbs = {}, {}
-      for loc, n in mm:notes() do
-        if n.chan == chan and (n.lane or 1) == 1 then
-          util:add(notes, util:assign(n, { loc = loc }))
-        end
-      end
-      for loc, cc in mm:ccs() do
-        if cc.chan == chan and cc.msgType == 'pb' then
-          util:add(pbs, { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc })
-        end
-      end
-      table.sort(notes, function(a, b) return a.ppq < b.ppq end)
-      table.sort(pbs,   function(a, b) return a.ppq < b.ppq end)
-      chans[chan] = { notes = notes, pbs = pbs }
+  local function cascadePADelete(host)
+    forEachAttachedPA(host, function(loc) um:deleteEvent('pa', loc) end)
+  end
 
-      -- Preliminary pass (design/pitchbend.md §Stage 2): anchor a pb at
-      -- every col-1 note-on so retune ops have a clean [ppq, endppq)
-      -- boundary. Redundant anchors fall away in reduce().
-      if wantPrelim then
-        for _, n in ipairs(notes) do
-          if not pbAt(chan, n.ppq) then
-            insertPb(chan, { ppq = n.ppq, chan = chan, val = rawAt(chan, n.ppq), msgType = 'pb', loc = loc })
-          end
-        end
-      end
+  local function cascadePAInterval(host, newPpq, newEnd)
+    local dPpq  = newPpq - host.ppq
+    local shift = (dPpq == newEnd - host.endppq) and dPpq or 0
+    forEachAttachedPA(host, function(loc, cc)
+      local newPPQ = cc.ppq + shift
+      if newPPQ < newPpq or newPPQ > newEnd then um:deleteEvent('pa', loc)
+      elseif shift ~= 0 then um:assignEvent('pa', loc, { ppq = newPPQ }) end
+    end)
+  end
 
-      return chans[chan]
+  local function cascadePARepitch(host, newPitch)
+    forEachAttachedPA(host, function(loc) um:assignEvent('pa', loc, { pitch = newPitch }) end)
+  end
+
+  -- Inline PA cascade for a note op. update == nil means delete.
+  local function cascadePA(loc, update)
+    local host = mm:getNote(loc)
+    if not host then return end
+    host.loc = loc
+    if not update then
+      cascadePADelete(host)
+    else
+      if update.ppq or update.endppq then
+        cascadePAInterval(host, update.ppq or host.ppq, update.endppq or host.endppq)
+      end
+      if update.pitch and update.pitch ~= host.pitch then
+        cascadePARepitch(host, update.pitch)
+      end
+    end
+  end
+
+  --------------------
+  -- Update manager
+  --
+  -- Working model for col-1 notes and pb events. Public methods apply
+  -- edits to local state and accumulate mm-facing ops; flush() commits
+  -- them in one mm:modify call. pb.val is stored as logical cents
+  -- throughout; conversion to raw happens at flush time.
+  --
+  -- Created once per tm:rebuild. The isRebuilding instance runs Stage 1
+  -- reconciliation and flushes immediately; the ongoing instance handles
+  -- user edits until the next rebuild.
+  --------------------
+
+  local function createUpdateManager(isRebuilding)
+    local adds = {}
+    local assigns = {}
+    local deletes = {}
+    local chans = {}
+    local notesByLoc = {}
+    local pbsByLoc = {}
+
+    local function sortByPPQ(tbl)
+      table.sort(tbl, function(a, b) return a.ppq < b.ppq end)
     end
 
-    -- Keep notes / pbs sorted after a mutation that may have changed ppq.
-    local function resort(list)
-      table.sort(list, function(a, b) return (a.ppq or 0) < (b.ppq or 0) end)
-    end
-
-    ----- Accessors: raw / logical / detune over the session state.
+    ----- Accessors: raw / logical / detune over the local state.
 
     local function owner(chan, P)
-      return util:seek(loadChan(chan).notes, 'at-or-before', P,
-        function(n) return n.endppq > P end)
+      return util:seek(chans[chan].notes, 'at-or-before', P, function(n) return n.endppq > P end)
     end
 
     local function detuneAt(chan, P)
@@ -318,233 +205,251 @@ function newTrackerManager(mm, cm)
     end
 
     local function detuneBefore(chan, P)
-      local n = util:seek(loadChan(chan).notes, 'before', P,
-        function(n) return n.endppq >= P end)
+      local n = util:seek(chans[chan].notes, 'before', P, function(n) return n.endppq >= P end)
       return (n and n.detune) or 0
     end
 
-    function rawAt(chan, P)
-      local pb = util:seek(loadChan(chan).pbs, 'at-or-before', P)
+    local function rawAt(chan, P)
+      local pb = util:seek(chans[chan].pbs, 'at-or-before', P)
       return pb and pb.val or 0
     end
 
     local function rawBefore(chan, P)
-      local pb = util:seek(loadChan(chan).pbs, 'before', P)
+      local pb = util:seek(chans[chan].pbs, 'before', P)
       return pb and pb.val or 0
     end
 
-    function pbAt(chan, P)
-      local pb = util:seek(loadChan(chan).pbs, 'at-or-before', P)
+    local function pbAt(chan, P)
+      local pb = util:seek(chans[chan].pbs, 'at-or-before', P)
       return pb and pb.ppq == P and pb or nil
     end
 
-    local function logicalAt(chan, P)   return rawAt(chan, P)     - detuneAt(chan, P) end
-    local function logicalBefore(chan, P) return rawBefore(chan, P) - detuneBefore(chan, P) end
-
-    ----- Mutation primitives over state (no mm side-effects yet).
-
-    function insertPb(chan, pb)
-      local pbs = loadChan(chan).pbs
-      local i = 1
-      while i <= #pbs and pbs[i].ppq < pb.ppq do i = i + 1 end
-      table.insert(pbs, i, pb)
-      util:add(adds, { type = 'pb', evt = pb })
+    local function logicalAt(chan, P)
+      return rawAt(chan, P) - detuneAt(chan, P)
     end
 
-    ----- Helpers from the design doc.
+    local function logicalBefore(chan, P)
+      return rawBefore(chan, P) - detuneBefore(chan, P)
+    end
 
-    -- retune(P1, P2, Δ): shift every pb with ppq in [P1, P2) by Δ cents.
-    local function retune(chan, P1, P2, delta)
-      if delta == 0 then return end
-      for _, pb in ipairs(loadChan(chan).pbs) do
-        if pb.ppq >= P1 and pb.ppq < P2 then
-          set(pb, 'pb', 'val', pb.val + delta)
+    local function nextLogicalChange(chan, P)
+      local currentLogical = logicalAt(chan, P)
+      local pb = util:seek(chans[chan].pbs, 'after', P, function(e) return logicalAt(chan, e.ppq) ~= currentLogical end)
+      return (pb and pb.ppq) or math.huge
+    end
+
+    ----- Low-level mutation
+
+    local function addLowlevel(evtType, evt)
+      if evtType == 'note' then
+        local tbl = chans[evt.chan].notes
+        util:add(tbl, evt)
+        sortByPPQ(tbl)
+      elseif evtType == 'pb' then
+        local tbl = chans[evt.chan].pbs
+        evt.msgType = 'pb'
+        util:add(tbl, evt)
+        sortByPPQ(tbl)
+      else
+        evt.msgType = evtType
+      end
+      util:add(adds, { type = evtType, evt = evt })
+    end
+
+    local function assignLowlevel(evtType, evt, update)
+      util:assign(evt, update)
+      if not evt.loc then return end
+      for _, e in ipairs(assigns) do
+        if e.loc == evt.loc and e.type == evtType then
+          util:assign(e.update, update)
+          return
+        end
+      end
+      util:add(assigns, { type = evtType, loc = evt.loc, update = update })
+    end
+
+    local function deleteLowlevel(evtType, evt)
+      local tbl, locTbl
+      if evtType == 'note' then
+        tbl = chans[evt.chan].notes
+        locTbl = notesByLoc
+      elseif evtType == 'pb' then
+        tbl = chans[evt.chan].pbs
+        locTbl = pbsByLoc
+      else return end
+
+      for i, item in ipairs(tbl) do
+        if item == evt then
+          table.remove(tbl, i)
+          break
+        end
+      end
+
+      if evt.loc then
+        locTbl[evt.loc] = nil
+        util:add(deletes, { type = evtType, loc = evt.loc })
+        for j = #assigns, 1, -1 do
+          local e = assigns[j]
+          if e.loc == evt.loc and e.type == evtType then table.remove(assigns, j) end
+        end
+      else
+        for j = #adds, 1, -1 do
+          if adds[j].evt == evt then table.remove(adds, j); break end
         end
       end
     end
 
-    -- reduce(chan): delete orphan pbs and interior no-ops, per invariants.
-    local function reduce(chan)
-      local pbs = loadChan(chan).pbs
+    local function retuneLowlevel(chan, P1, P2, delta)
+      if delta == 0 then return end
+      for _, pb in ipairs(chans[chan].pbs) do
+        if pb.ppq >= P1 and pb.ppq < P2 then
+          assignLowlevel('pb', pb, { val = pb.val + delta })
+        end
+      end
+    end
+
+    local function tidyPbsLowlevel(chan)
+      local pbs = chans[chan].pbs
       local i = 1
       while i <= #pbs do
         local pb = pbs[i]
         local gone = not owner(chan, pb.ppq)
-                 or (logicalAt(chan, pb.ppq) == logicalBefore(chan, pb.ppq)
-                 and detuneAt(chan, pb.ppq)  == detuneBefore(chan, pb.ppq))
-        if gone then drop(pbs, i, 'pb') else i = i + 1 end
+          or (logicalAt(chan, pb.ppq) == logicalBefore(chan, pb.ppq)
+              and detuneAt(chan, pb.ppq)  == detuneBefore(chan, pb.ppq))
+        if gone then deleteLowlevel('pb', pb) else i = i + 1 end
       end
     end
 
-    -- First ppq > P at which logical changes, or +∞. Logical is a step
-    -- function whose breakpoints lie at the union of pb ppqs and note
-    -- boundaries (start or end). Walk that union in order and return
-    -- the first ppq whose logical differs from logical(P).
-    local function nextLogicalChange(chan, P)
-      local ch = loadChan(chan)
-      local curL = logicalAt(chan, P)
-      local bps = {}
-      for _, pb in ipairs(ch.pbs) do
-        if pb.ppq > P then bps[pb.ppq] = true end
-      end
-      for _, n in ipairs(ch.notes) do
-        if n.ppq    > P then bps[n.ppq]    = true end
-        if n.endppq > P then bps[n.endppq] = true end
-      end
-      local sorted = {}
-      for q in pairs(bps) do util:add(sorted, q) end
-      table.sort(sorted)
-      for _, q in ipairs(sorted) do
-        if logicalAt(chan, q) ~= curL then return q end
-      end
-      return math.huge
-    end
+    ----- High-level ops
 
-    ----- Stage 2 ops.
-
-    function sn:setPb(chan, P, L)
+    local function setPb(chan, P, L)
       local Pp    = nextLogicalChange(chan, P)
       local delta = L - logicalAt(chan, P)
-      if not pbAt(chan, P) then
-        insertPb(chan, { ppq = P, chan = chan, val = rawAt(chan, P), msgType = 'pb' })
-      end
-      retune(chan, P, Pp, delta)
-      reduce(chan)
+      if not pbAt(chan, P) then addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) }) end
+      retuneLowlevel(chan, P, Pp, delta)
+      tidyPbsLowlevel(chan)
     end
 
-    function sn:deletePb(chan, P)
+    local function deletePb(chan, P)
       if not pbAt(chan, P) then return end
       local Pp = nextLogicalChange(chan, P)
-      retune(chan, P, Pp, logicalBefore(chan, P) - logicalAt(chan, P))
-      reduce(chan)
+      retuneLowlevel(chan, P, Pp, logicalBefore(chan, P) - logicalAt(chan, P))
+      tidyPbsLowlevel(chan)
     end
 
-    function sn:addNote(n)
-      local chan = n.chan
-      if (n.lane or 1) ~= 1 then
-        -- col-2+ notes never participate in pb ownership. Pass through.
-        util:add(adds, { type = 'note', evt = n })
-        return
-      end
+    local function addNote(n)
       local D = n.detune or 0
-      if not pbAt(chan, n.ppq) then
-        insertPb(chan, { ppq = n.ppq, chan = chan, val = logicalBefore(chan, n.ppq) + D, msgType = 'pb' })
-      end
-      local item = util:assign(n, { detune = D })
-      util:add(loadChan(chan).notes, item)
-      util:add(adds, { type = 'note', evt = item })
-      resort(loadChan(chan).notes)
-      reduce(chan)
+      addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = logicalBefore(n.chan, n.ppq) + D })
+      addLowlevel('note', util:assign(n, { detune = D }))
+      tidyPbsLowlevel(n.chan)
     end
 
-    function sn:deleteNote(item)
-      local notes = loadChan(item.chan).notes
-      for i, n in ipairs(notes) do
-        if n == item then drop(notes, i, 'note'); break end
-      end
-      reduce(item.chan)
+    local function deleteNote(n)
+      deleteLowlevel('note', n)
+      tidyPbsLowlevel(n.chan)
     end
 
-    function sn:retuneNoteOp(item, D2)
-      local D1 = item.detune or 0
+    local function retuneNoteOp(n, D2)
+      local D1 = n.detune or 0
       if D1 == D2 then return end
-      retune(item.chan, item.ppq, item.endppq, D2 - D1)
-      set(item, 'note', 'detune', D2)
-      reduce(item.chan)
+      retuneLowlevel(n.chan, n.ppq, n.endppq, D2 - D1)
+      assignLowlevel('note', n, { detune = D2 })
+      tidyPbsLowlevel(n.chan)
     end
 
-    function sn:resizeNote(item, P1, P2)
-      local chan = item.chan
-      local L = logicalAt(chan, P1)
-      set(item, 'note', 'ppq', P1)
-      set(item, 'note', 'endppq', P2)
-      if not pbAt(chan, P1) then
-        insertPb(chan, { ppq = P1, chan = chan, val = (item.detune or 0) + L, msgType = 'pb' })
-      end
-      resort(loadChan(chan).notes)
-      reduce(chan)
+    local function resizeNote(n, P1, P2)
+      local L = logicalAt(n.chan, P1)
+      assignLowlevel('note', n, { ppq = P1, endppq = P2 })
+      if not pbAt(n.chan, P1) then addLowlevel('pb', { ppq = P1, chan = n.chan, val = (n.detune or 0) + L }) end
+      tidyPbsLowlevel(n.chan)
     end
 
-    -- External setter used by classifyInto to apply metadata fields.
-    function sn:setField(item, k, v) set(item, 'note', k, v) end
+    ----- Public interface (classifier logic baked in)
 
-    -- Resolve a (type, loc) to a state item, loading the channel lazily.
-    function sn:itemFor(type, loc)
-      if type == 'note' then
-        local n = mm:getNote(loc); if not n then return end
-        if (n.lane or 1) ~= 1 then return end
-        for _, it in ipairs(loadChan(n.chan).notes) do
-          if it.loc == loc then return it end
+    local newUm = {}
+
+    function newUm:deleteEvent(evtType, evtOrLoc)
+      local evt = type(evtOrLoc) == 'table' and evtOrLoc or { loc = evtOrLoc }
+      if evtType == 'note' then
+        cascadePA(evt.loc, nil)
+        if notesByLoc[evt.loc] then
+          deleteNote(notesByLoc[evt.loc])
+        else
+          util:add(deletes, { type = 'note', loc = evt.loc })
         end
-      elseif type == 'pb' then
-        local cc = mm:getCC(loc); if not cc then return end
-        for _, it in ipairs(loadChan(cc.chan).pbs) do
-          if it.loc == loc then return it end
-        end
-      end
-    end
-
-    function sn:passthrough(o)
-      if o.op == 'add' then
-        util:add(adds, { type = o.type, evt = o.evt })
-      elseif o.op == 'assign' then
-        util:add(assigns, { type = o.type, loc = o.evt.loc, update = o.update })
+      elseif evtType == 'pb' and pbsByLoc[evt.loc] then
+        local pb = pbsByLoc[evt.loc]
+        deletePb(pb.chan, pb.ppq)
       else
-        util:add(deletes, { type = o.type, loc = o.evt.loc })
+        util:add(deletes, { type = evtType, loc = evt.loc })
       end
     end
 
-    -- Stage 1 rebuild over the full take. Used by tm:rebuild to bring a
-    -- possibly invariant-violating mm state back to conformance. Three
-    -- steps from design/pitchbend.md §Stage 1.
-    function sn:runStage1()
-      for c = 1, 16 do loadChan(c, false) end
-
-      -- Step 1: default detune = 0 on col-1 notes missing it.
-      for c = 1, 16 do
-        for _, n in ipairs(chans[c].notes) do
-          if n.detune == nil then set(n, 'note', 'detune', 0) end
+    function newUm:assignEvent(evtType, evtOrLoc, update)
+      local evt = type(evtOrLoc) == 'table' and evtOrLoc or { loc = evtOrLoc }
+      if evtType == 'note' then
+        if update.chan then print('tm: not allowed to change channel of notes'); return end
+        local hasResize = update.ppq ~= nil or update.endppq ~= nil
+        local hasRetune = update.detune ~= nil
+        if hasResize and hasRetune then
+          print('tm: refuse assignNote — combined resize+retune'); return
         end
-      end
-
-      -- Step 2: reduce.
-      for c = 1, 16 do reduce(c) end
-
-      -- Step 3: add pbs at note starts where logical or detune transitions.
-      for c = 1, 16 do
-        local ordered = {}
-        for _, n in ipairs(chans[c].notes) do util:add(ordered, n) end
-        table.sort(ordered, function(a, b) return a.ppq < b.ppq end)
-        for _, n in ipairs(ordered) do
-          local P = n.ppq
-          if not pbAt(c, P) then
-            local lA, lB = logicalAt(c, P), logicalBefore(c, P)
-            local dA, dB = detuneAt(c, P),  detuneBefore(c, P)
-            if lA ~= lB or dA ~= dB then
-              insertPb(c, { ppq = P, chan = c, val = lB + dA, msgType = 'pb' })
-            end
+        cascadePA(evt.loc, update)
+        if notesByLoc[evt.loc] then
+          local note = notesByLoc[evt.loc]
+          if hasResize then
+            resizeNote(note, update.ppq or note.ppq, update.endppq or note.endppq)
           end
+          if hasRetune then
+            retuneNoteOp(note, update.detune)
+          end
+          if update.vel ~= nil or update.pitch ~= nil or update.lane ~= nil then
+            assignLowlevel('note', note, { vel = update.vel, pitch = update.pitch, lane = update.lane })
+          end
+        else
+          util:add(assigns, { type = 'note', loc = evt.loc, update = update })
         end
+      elseif evtType == 'pb' and pbsByLoc[evt.loc] then
+        if update.ppq then print('tm: not allowed to change ppq of pb events'); return end
+        local pb = pbsByLoc[evt.loc]
+        if update.val ~= nil then
+          setPb(pb.chan, pb.ppq, update.val)
+        end
+      else
+        util:add(assigns, { type = evtType, loc = evt.loc, update = update })
       end
     end
 
-    ----- Commit: walk state and emit mm mutations.
+    function newUm:addEvent(evtType, evt)
+      if evtType == 'note' and (evt.lane or 1) == 1 then
+        addNote(evt)
+      elseif evtType == 'pb' then
+        setPb(evt.chan, evt.ppq, evt.val or 0)
+      else
+        if evtType ~= 'note' then evt.msgType = evtType end
+        util:add(adds, { type = evtType, evt = evt })
+      end
+    end
 
-    function sn:commit()
+    ----- Flush: commit accumulated ops to mm.
+
+    local flushing = false
+
+    function newUm:flush()
+      if flushing then return end
       if #adds == 0 and #assigns == 0 and #deletes == 0 then return end
+      flushing = true
 
       for _, e in ipairs(assigns) do
         if e.type == 'pb' and e.update.val ~= nil then
           e.update.val = centsToRaw(e.update.val)
         end
       end
-
       for _, a in ipairs(adds) do
         if a.type == 'pb' then
           a.evt.val = centsToRaw(a.evt.val)
         end
       end
-
       table.sort(deletes, function(a, b) return a.loc > b.loc end)
 
       mm:modify(function()
@@ -556,120 +461,66 @@ function newTrackerManager(mm, cm)
           if o.type == 'note' then mm:deleteNote(o.loc)
           else mm:deleteCC(o.loc) end
         end
-        for _, a in ipairs(adds) do
-          if a.type == 'note' then mm:addNote(a.evt)
-          else mm:addCC(a.evt)
-          end
+        for _, o in ipairs(adds) do
+          if o.type == 'note' then mm:addNote(o.evt)
+          else mm:addCC(o.evt) end
         end
       end)
+      adds, assigns, deletes = {}, {}, {}
+      flushing = false
     end
 
-    return sn
-  end
+    ----- Init: load state from mm; run Stage 1 if rebuilding.
 
-  --------------------
-  -- Classifier: translate queued high-level ops into Stage 2 session
-  -- ops. Anything the session doesn't understand goes to passthrough.
-  --
-  -- Refusals:
-  --   assignEvent('note', _, {chan=...})             — channel change
-  --   assignEvent('note', _, {detune=..., ppq=...})  — combined retune+resize
-  --   assignEvent('note', _, {detune=..., endppq=...})
-  --   assignEvent('pb',   _, {ppq=...})              — pb move
-  --------------------
+    local function init()
+      for i = 1, 16 do chans[i] = { notes = {}, pbs = {} } end
 
-  local METADATA_KEYS = { 'vel', 'pitch', 'lane' }
-
-  local function classifyInto(sn)
-    return function(o)
-      local t, op = o.type, o.op
-
-      if t == 'note' then
-        if op == 'add' then
-          sn:addNote(o.evt)
-          return
+      for loc, cc in mm:ccs() do
+        if cc.msgType == 'pb' then
+          local evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc }
+          util:add(chans[evt.chan].pbs, evt)
+          pbsByLoc[loc] = evt
         end
-        if op == 'delete' then
-          local item = sn:itemFor('note', o.evt.loc)
-          if item then sn:deleteNote(item)
-          else sn:passthrough(o) end  -- col-2+ or unknown
-          return
-        end
-        if op == 'assign' then
-          local u = o.update
-          if u.chan then
-            print('tm: refuse assignNote — chan change not allowed')
-            return
-          end
-          local hasResize = u.ppq ~= nil or u.endppq ~= nil
-          local hasRetune = u.detune ~= nil
-          if hasResize and hasRetune then
-            print('tm: refuse assignNote — combined resize+retune')
-            return
-          end
-          local item = sn:itemFor('note', o.evt.loc)
-          if not item then sn:passthrough(o); return end  -- col-2+
+      end
+      for i = 1, 16 do sortByPPQ(chans[i].pbs) end
 
-          if hasResize then
-            sn:resizeNote(item, u.ppq or item.ppq, u.endppq or item.endppq)
-          elseif hasRetune then
-            sn:retuneNoteOp(item, u.detune)
-          end
-          -- Apply any metadata fields (vel, pitch, lane) directly.
-          for _, k in ipairs(METADATA_KEYS) do
-            if u[k] ~= nil then sn:setField(item, k, u[k]) end
-          end
-          return
+      local function fixPBAt(chan, ppq)
+        if not pbAt(chan, ppq) then
+          addLowlevel('pb', { ppq = ppq, chan = chan, val = rawAt(chan, ppq) })
         end
       end
 
-      if t == 'pb' then
-        if op == 'add' then
-          sn:setPb(o.evt.chan, o.evt.ppq, o.evt.val or 0)
-          return
-        end
-        if op == 'delete' then
-          local cc = mm:getCC(o.evt.loc); if not cc then return end
-          sn:deletePb(cc.chan, cc.ppq)
-          return
-        end
-        if op == 'assign' then
-          if o.update.ppq then
-            print('tm: refuse assignPb — ppq change not allowed; delete and recreate')
-            return
-          end
-          if o.update.val ~= nil then
-            local cc = mm:getCC(o.evt.loc); if not cc then return end
-            sn:setPb(cc.chan, cc.ppq, o.update.val)
-          end
-          return
+      for loc, n in mm:notes() do
+        if (n.lane or 1) == 1 then
+          local evt = util:assign(n, { loc = loc })
+          util:add(chans[n.chan].notes, evt)
+          notesByLoc[loc] = evt
+          if not isRebuilding then fixPBAt(n.chan, n.ppq) end
         end
       end
+      for i = 1, 16 do sortByPPQ(chans[i].notes) end
 
-      -- Everything else (pa, cc, at, pc, sysex) passes through.
-      sn:passthrough(o)
+      if isRebuilding then
+        for c = 1, 16 do
+          for _, n in ipairs(chans[c].notes) do
+            if n.detune == nil then assignLowlevel('note', n, { detune = 0 }) end
+          end
+          tidyPbsLowlevel(c)
+          for _, n in ipairs(chans[c].notes) do
+            local P = n.ppq
+            if logicalAt(c, P) ~= logicalBefore(c, P) or detuneAt(c, P) ~= detuneBefore(c, P) then
+              fixPBAt(c, P)
+            end
+          end
+        end
+        newUm:flush()
+      end
     end
+
+    init()
+    return newUm
   end
 
-  local flushing = false
-
-  function flush()
-    if #queue == 0 or flushing then return end
-    flushing = true
-    
-    cascadePAOps()
-    if #queue == 0 then return end
-    local ops = queue
-    queue = {}
-
-    local sn = newSession()
-    local classify = classifyInto(sn)
-    for _, o in ipairs(ops) do classify(o) end
-    sn:commit()
-
-    flushing = false
-  end
-  
   --------------------
   -- Column creation
   --   note / pb / pc / at : no identifying field.
@@ -789,6 +640,12 @@ function newTrackerManager(mm, cm)
     return nil
   end
 
+  local function firstNoteCol(channel)
+    for _, col in ipairs(channel.columns) do
+      if col.type == 'note' then return col end
+    end
+  end
+
   --------------------
   -- PUBLIC FUNCTIONS
   --------------------
@@ -825,7 +682,7 @@ function newTrackerManager(mm, cm)
     -- 1) Truncate overlapping notes on the same channel and pitch.
     --    The earlier note is clipped to end where the later one begins.
     --    Direct mm:modify — we're normalising a possibly invariant-
-    --    violating state, so we deliberately bypass the session's
+    --    violating state, so we deliberately bypass the update manager's
     --    stage-2 semantics (which assume invariants already hold).
     --    Stage 1 rebuild at step 3 will fix up pb ownership after.
     do
@@ -881,13 +738,9 @@ function newTrackerManager(mm, cm)
     -- 3) Pitchbend: reconcile against the design invariants, then build
     --    the logical pb display lane per channel from the reconciled mm
     --    state. Stage 1 runs three steps (default detunes, reduce, add
-    --    boundary pbs) inside a session, then commits to mm in one
-    --    modify; after commit mm reflects the invariant-satisfying state.
-    do
-      local sn = newSession()
-      sn:runStage1()
-      sn:commit()
-    end
+    --    boundary pbs) inside the update manager, then flushes to mm;
+    --    after flush mm reflects the invariant-satisfying state.
+    createUpdateManager(true)
 
     local pbRange = cfg('pbRange', 2)
     for chan = 1, 16 do
@@ -965,14 +818,15 @@ function newTrackerManager(mm, cm)
     for _, chan in ipairs(channels) do
       chan.columns = canonicaliseColumns(chan.columns)
     end
-    
+
+    um = createUpdateManager(false)
     rebuilding = false
 
     fire(changed, tm)
   end
 
   --- ACCESSORS
-  
+
   function tm:getChannel(chan)
     return channels and channels[chan]
   end
@@ -1026,34 +880,24 @@ function newTrackerManager(mm, cm)
     reaper.Main_OnCommand(40073, 0)
   end
 
-  -- DEFERRED QUEUE EXTERNAL INTERFACE
+  -- MUTATION INTERFACE
 
-  function tm:deleteEvent(type, evt)
-    deleteEvent(type, evt)
-  end
-
-  -- pb values flow through the queue as logical cents throughout; the
-  -- session converts to raw at commit. No conversion at queue-entry.
-  function tm:addEvent(type, evt)      addEvent(type, evt)             end
-  function tm:assignEvent(type, evt, update) assignEvent(type, evt, update) end
-
-  function tm:flush() flush() end
+  function tm:deleteEvent(type, evt)         um:deleteEvent(type, evt)         end
+  function tm:addEvent(type, evt)            um:addEvent(type, evt)            end
+  function tm:assignEvent(type, evt, update) um:assignEvent(type, evt, update) end
+  function tm:flush()                        um:flush()                        end
 
   --------------------
   -- Microtuning realisation
   --
   -- tm owns the demix between note intent (pitch + detune) and note
   -- realisation (raw pb events on the wire). The view layer speaks
-  -- intent; tm keeps realisation in sync inside the dispatch session —
+  -- intent; tm keeps realisation in sync inside the update manager —
   -- no caller participates in the invariant.
-  --
-  -- retuneNote is a convenience: viewManager passes both pitch and
-  -- detune in one update; the classifier splits into a retune op plus
-  -- a metadata pitch assign.
   --------------------
 
   function tm:retuneNote(note, update)
-    assignEvent('note', note, update)
+    um:assignEvent('note', note, update)
   end
 
   -- LIFECYCLE
@@ -1087,7 +931,7 @@ function newTrackerManager(mm, cm)
   end
 
   -- FACTORY BODY
-  
+
   if mm and cm then tm:attach(mm, cm) end
   return tm
 end
