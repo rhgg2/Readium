@@ -84,7 +84,7 @@ function newViewManager(tm, cm)
   -- Lane of a note grid column: its 1-indexed position among note
   -- columns in the same channel. Returns nil for non-note columns.
   local function laneOf(col)
-    if not (col and col.type == 'note') then return nil end
+    if not (col and col.type == 'note') then return end
     local lane = 0
     for ci = grid.chanFirstCol[col.midiChan], grid.chanLastCol[col.midiChan] do
       local c = grid.cols[ci]
@@ -124,7 +124,7 @@ function newViewManager(tm, cm)
   --             the next step" regardless of step density.
   local function noteProjection(evt)
     local tuning = activeTuning()
-    if not (tuning and evt and evt.pitch) then return nil end
+    if not (tuning and evt and evt.pitch) then return end
     local detune    = evt.detune or 0
     local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
     local label     = microtuning.stepToText(tuning, step, oct)
@@ -971,7 +971,7 @@ function newViewManager(tm, cm)
 
   local function clipboardLoad()
     local raw = reaper.GetExtState('rdm', 'clipboard')
-    if raw == '' then return nil end
+    if raw == '' then return end
     return util:unserialise(raw)
   end
 
@@ -995,7 +995,7 @@ function newViewManager(tm, cm)
     -- Single-column mode
     if c1 == c2 then
       local col = grid.cols[c1]
-      if not col then return nil end
+      if not col then return end
 
       local clipType, events = nil, {}
       local emit
@@ -1012,7 +1012,7 @@ function newViewManager(tm, cm)
         util:add(events, emit(evt))
       end
 
-      if #events == 0 then return nil end
+      if #events == 0 then return end
       return { mode = 'single', type = clipType, numRows = numRows,
                sourceIdx = c1, events = events }
     end
@@ -1053,7 +1053,7 @@ function newViewManager(tm, cm)
       ::nextCol::
     end
 
-    if #cols == 0 then return nil end
+    if #cols == 0 then return end
     return { mode = 'multi', numRows = numRows, startType = cols[1].type, cols = cols }
   end
 
@@ -1236,7 +1236,7 @@ function newViewManager(tm, cm)
     --   pb/pc/at: { type, chan, col }
     local function resolve(clipCol)
       local chan = cursor.midiChan + clipCol.chanDelta
-      if chan < 1 or chan > 16 then return nil end
+      if chan < 1 or chan > 16 then return end
       local info = infoFor(chan)
 
       if clipCol.type == 'note' then

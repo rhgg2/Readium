@@ -80,9 +80,6 @@
 -- SYSEX / TEXT  (location-based access)
 --   mm:getSysex(loc)                  -- returns a copy, or nil
 --   mm:sysexes()                      -- iterator: for loc, sx in mm:sysexes()
---     NOTE: the sysex iterator currently has a bug — the continuation
---     check reads `if note then` instead of `if sysex then`, so it
---     will never yield results.
 --   mm:assignSysex(loc, t)            -- update sysex/text event at location
 --   mm:addSysex(t)                    -- insert a new sysex/text event
 --     t must contain ppq, msgType, and val.
@@ -127,13 +124,23 @@ function newMidiManager(take)
   local sysexTbl  = {}
   local uuidTbl   = {}
   local maxUUID   = 0
-  local maxNote   = 0
-  local maxCC     = 0
-  local maxSysex  = 0
   local lock      = false
   local fire  -- installed below, once mm exists
 
   local INTERNALS = { idx = true, uuidIdx = true }
+
+  -- channel message (CC-family) and text/sysex type LUTs. Keep the name→code
+  -- direction canonical and derive the inverse so the two stay in sync.
+  local chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
+  local chanMsgTypes = {}
+  for k, v in pairs(chanMsgLUT) do chanMsgTypes[v] = k end
+
+  local eventTypeLUT = {
+    sysex = -1, text = 1, copyright = 2, trackname = 3,
+    instrument = 4, lyric = 5, marker = 6, cuepoint = 7, notation = 15,
+  }
+  local textMsgTypes = {}
+  for k, v in pairs(eventTypeLUT) do textMsgTypes[v] = k end
 
   local BASE36 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
@@ -154,13 +161,15 @@ function newMidiManager(take)
     return result
   end
 
-  local function push(tbl, evt)
-    local loc = #tbl + 1
-    tbl[loc] = evt
+  -- parse a notation event's message for our rdm_<uuid> marker.
+  -- returns uuidTxt, chan (1-indexed), pitch when matched, nil otherwise.
+  local function parseUUIDNotation(msg)
+    local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
+    if uuidTxt then return uuidTxt, chan + 1, pitch end
   end
 
   local function loadMetadata()
-    if not take then return end
+    if not take then return {} end
 
     local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
     if not (ok and keysText and keysText ~= '') then return {} end
@@ -191,7 +200,7 @@ function newMidiManager(take)
 
     if not data then
       print('Error! uuid not found')
-      return nil
+      return
     end
 
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util:serialise(data, noteEventFields), true)
@@ -209,7 +218,7 @@ function newMidiManager(take)
     
     -- Collect uuids as both a set (for stale-key check) and a list (for serialisation)
     local newKeys, keyList = {}, {}
-    for uuid, _ in pairs(uuidTbl) do
+    for uuid in pairs(uuidTbl) do
       local uuidTxt = toBase36(uuid)
       newKeys[uuidTxt] = true
       util:add(keyList, uuidTxt)
@@ -241,8 +250,8 @@ function newMidiManager(take)
     
     for i=0, noteCount-1 do
       local ok, selected, muted, ppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-      chan = chan + 1
       if ok then
+        chan = chan + 1
         local tag = ppq .. '|' .. chan .. '|' .. pitch
         if notesSeen[tag] then
           local last = notesSeen[tag]
@@ -297,9 +306,6 @@ function newMidiManager(take)
     uuidTbl   = {}
     maxUUID   = 0
     lock      = false
-    maxNote   = 0
-    maxCC     = 0
-    maxSysex  = 0
 
     local notesLUT = {}
 
@@ -315,11 +321,10 @@ function newMidiManager(take)
 
     for i = 0, noteCount-1 do
       local ok, selected, muted, ppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-      chan = chan + 1
       if ok then
+        chan = chan + 1
         local tag = ppq .. '|' .. chan .. '|' .. pitch
-        local loc = #noteTbl + 1
-        util:add(noteTbl, {
+        notesLUT[tag] = util:add(noteTbl, {
           idx    = i,
           ppq    = ppq,
           endppq = endppq,
@@ -327,23 +332,14 @@ function newMidiManager(take)
           pitch  = pitch,
           vel    = vel,
         })
-        notesLUT[tag] = noteTbl[loc]
       end
     end
 
     -- get cc events
-    local chanMsgTypes = {
-      [0xA0] = 'pa',
-      [0xB0] = 'cc',
-      [0xC0] = 'pc',
-      [0xD0] = 'at',
-      [0xE0] = 'pb'
-    }
-
     for i = 0, ccCount-1 do
       local ok, selected, muted, ppq, chanmsg, chan, msg2, msg3 = reaper.MIDI_GetCC(take, i)
-      chan = chan + 1
       if ok then
+        chan = chan + 1
         local msgType = chanMsgTypes[chanmsg] or ('chanmsg_' .. chanmsg)
         local entry = {
           idx     = i,
@@ -382,13 +378,10 @@ function newMidiManager(take)
     for i = 0, textCount-1 do
       local ok, selected, muted, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
-        local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
-        chan = chan + 1
+        local uuidTxt, chan, pitch = parseUUIDNotation(msg)
         if uuidTxt then
-          -- one of our UUID identifiers
           local uuid = fromBase36(uuidTxt)
-          local tag = ppq .. '|' .. chan .. '|' .. pitch
-          local note = notesLUT[tag]
+          local note = notesLUT[ppq .. '|' .. chan .. '|' .. pitch]
           if note then
             note.uuid = uuid
             note.uuidIdx = i
@@ -403,7 +396,7 @@ function newMidiManager(take)
     -- get metadata lookup table
     local metadata = loadMetadata()
     
-    for uuid, _ in pairs(metadata) do
+    for uuid in pairs(metadata) do
       if uuid > maxUUID then maxUUID = uuid end
     end
 
@@ -428,28 +421,13 @@ function newMidiManager(take)
     reaper.MIDI_Sort(take)
 
     -- Now rescan ALL sysex/text events, including updating uuidIdx for notes
-    local textMsgTypes = {
-      [-1] = 'sysex',
-      [1]  = 'text',
-      [2]  = 'copyright',
-      [3]  = 'trackname',
-      [4]  = 'instrument',
-      [5]  = 'lyric',
-      [6]  = 'marker',
-      [7]  = 'cuepoint',
-      [15] = 'notation',
-    }
-
     _ , _, _, textCount = reaper.MIDI_CountEvts(take)
     for i = 0, textCount-1 do
       local ok, selected, muted, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
-        local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
-        chan = chan + 1
+        local uuidTxt, chan, pitch = parseUUIDNotation(msg)
         if uuidTxt then
-          -- one of our UUID identifiers
-          local tag = ppq .. '|' .. chan .. '|' .. pitch
-          local note = notesLUT[tag]
+          local note = notesLUT[ppq .. '|' .. chan .. '|' .. pitch]
           if note then
             note.uuidIdx = i
           end
@@ -464,7 +442,6 @@ function newMidiManager(take)
         end
       elseif ok then
         -- all other text/sysex events (text meta, sysex, etc.)
-        local loc = #sysexTbl + 1
         util:add(sysexTbl, {
             idx     = i,
             ppq     = ppq,
@@ -475,7 +452,7 @@ function newMidiManager(take)
     end
 
     -- add metadata to notes, defaulting fields absent from older takes
-    for i,note in ipairs(noteTbl) do
+    for _, note in ipairs(noteTbl) do
       util:assign(note, metadata[note.uuid])
       if note.detune == nil then note.detune = 0 end
       uuidTbl[note.uuid] = note
@@ -505,10 +482,11 @@ function newMidiManager(take)
       
     lock = true
     reaper.MIDI_DisableSort(take)
-    pcall(fn)
+    local ok, err = pcall(fn)
     reaper.MIDI_Sort(take)
     self:reload()
     lock = false
+    if not ok then print('Error in modify: ' .. tostring(err)) end
   end
 
   --- NOTE FUNCTIONS. 
@@ -532,7 +510,7 @@ function newMidiManager(take)
   function mm:deleteNote(loc)
     if not (take and checkLock()) then return end
 
-    local note = loc and noteTbl[loc]
+    local note = noteTbl[loc]
     if not note then return end
 
     reaper.MIDI_DeleteNote(take, note.idx)
@@ -545,9 +523,9 @@ function newMidiManager(take)
   function mm:assignNote(loc, t)
     if not take then return end
 
-    if not (t.ppq or t.endppq or t.pitch or t.vel) then
+    if not (t.ppq or t.endppq or t.pitch or t.vel or t.chan) then
       -- just metadata, allow without lock
-      local note = loc and noteTbl[loc]
+      local note = noteTbl[loc]
       if not note then return end
 
       util:assign(note, t)
@@ -558,7 +536,7 @@ function newMidiManager(take)
     
     if not checkLock() then return end
 
-    local note = loc and noteTbl[loc]
+    local note = noteTbl[loc]
     if not note then return end
 
     local chan = (t.chan or note.chan) - 1
@@ -582,7 +560,7 @@ function newMidiManager(take)
 
     if t.ppq == nil or t.endppq == nil or t.chan == nil or t.pitch == nil or t.vel == nil then
       print('Error! Underspecified new note')
-      return nil
+      return
     end
 
     -- create a new note
@@ -601,24 +579,10 @@ function newMidiManager(take)
 
     saveMetadatum(note.uuid)
 
-    return maxNote -- location in table
+    return #noteTbl
   end
 
   --- CC FUNCTIONS
-
-  local chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
-
-  local eventTypeLUT = {
-    sysex      = -1,
-    text       = 1,
-    copyright  = 2,
-    trackname  = 3,
-    instrument = 4,
-    lyric      = 5,
-    marker     = 6,
-    cuepoint   = 7,
-    notation   = 15,
-  }
 
   function mm:getCC(loc)
     local msg = ccTbl[loc]
@@ -639,7 +603,7 @@ function newMidiManager(take)
   function mm:deleteCC(loc)
     if not (take and checkLock()) then return end
 
-    local msg = loc and ccTbl[loc]
+    local msg = ccTbl[loc]
     if not msg then return end
 
     reaper.MIDI_DeleteCC(take, msg.idx)
@@ -672,26 +636,21 @@ function newMidiManager(take)
   function mm:assignCC(loc, t)
     if not (take and checkLock()) then return end
 
-    local msg = loc and ccTbl[loc]
+    local msg = ccTbl[loc]
     if not msg then return end
 
-    local msg2 = nil
-    local msg3 = nil
-    local chanmsg = nil
-
+    local chanmsg, msg2, msg3
     if t.msgType then
-      if not chanMsgLUT[t.msgType] then
-        print('Error! Unspecified message type')
-        return nil
-      end
       chanmsg = chanMsgLUT[t.msgType]
+      if not chanmsg then
+        print('Error! Unspecified message type')
+        return
+      end
       msg2, msg3 = reconstruct(t)
     elseif t.val or t.cc or t.pitch then
-      local merged = util:assign(util:clone(msg), t)
-      msg2, msg3 = reconstruct(merged)
+      msg2, msg3 = reconstruct(util:assign(util:clone(msg), t))
     end
-    local chan
-    if t.chan then chan = t.chan - 1 end
+    local chan = t.chan and t.chan - 1
     reaper.MIDI_SetCC(take, msg.idx, nil, nil, t.ppq, chanmsg, chan, msg2, msg3, true)
 
     -- update the table entry
@@ -707,16 +666,15 @@ function newMidiManager(take)
 
     if t.ppq == nil or t.chan == nil or t.val == nil then
       print('Error! Underspecified new cc event')
-      return nil
+      return
     end
 
     local chanmsg = chanMsgLUT[t.msgType]
-    local msg2, msg3 = reconstruct(t)
-    
     if not chanmsg then
       print('Error! Unspecified message type')
-      return nil
+      return
     end
+    local msg2, msg3 = reconstruct(t)
 
     reaper.MIDI_InsertCC(take, false, false, t.ppq, chanmsg, t.chan - 1, msg2, msg3)
 
@@ -727,7 +685,7 @@ function newMidiManager(take)
     
     util:add(ccTbl, msg)
 
-    return maxCC -- location in table
+    return #ccTbl
   end
 
 
@@ -752,7 +710,7 @@ function newMidiManager(take)
   function mm:deleteSysex(loc)
     if not (take and checkLock()) then return end
 
-    local sysex = loc and sysexTbl[loc]
+    local sysex = sysexTbl[loc]
     if not sysex then return end
 
     reaper.MIDI_DeleteTextSysexEvt(take, sysex.idx)
@@ -762,7 +720,7 @@ function newMidiManager(take)
   function mm:assignSysex(loc, t)
     if not (take and checkLock()) then return end
 
-    local sysex = loc and sysexTbl[loc]
+    local sysex = sysexTbl[loc]
     if not sysex then return end
 
     local eventtype = t.msgType and eventTypeLUT[t.msgType] or eventTypeLUT[sysex.msgType]
@@ -779,12 +737,12 @@ function newMidiManager(take)
     local eventtype = t.msgType and eventTypeLUT[t.msgType]
     if not eventtype then
       print('Error! Unspecified message type')
-      return nil
+      return
     end
     
     if t.ppq == nil or t.msgType == nil or t.val == nil then
       print('Error! Underspecified new sysex/text event')
-      return nil
+      return
     end
 
     reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, eventtype, t.val)
@@ -795,7 +753,7 @@ function newMidiManager(take)
     sysex.idx = sysexCount - 1
     util:add(sysexTbl, sysex)
 
-    return maxSysex -- location in table
+    return #sysexTbl
   end
 
   --- TAKE DATA

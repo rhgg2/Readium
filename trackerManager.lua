@@ -115,64 +115,6 @@ function newTrackerManager(mm, cm)
     return math.floor(raw / 8192 * lim + 0.5)
   end
 
-        --------------------
-  -- PA cascade
-  --
-  -- Poly-aftertouch events are attached to their host note by
-  -- (chan, pitch) within the host's closed interval [ppq, endppq].
-  -- On host delete, resize, or repitch, PAs move or die to match.
-  -- Cascade side-effects route through um's passthrough path.
-  --------------------
-
-  local function forEachAttachedPA(host, fn)
-    for loc, cc in mm:ccs() do
-      if cc.msgType == 'pa' and cc.chan == host.chan and cc.pitch == host.pitch
-         and cc.ppq >= host.ppq and cc.ppq <= host.endppq then
-        fn(loc, cc)
-      end
-    end
-  end
-
-  local function cascadePADelete(host)
-    forEachAttachedPA(host, function(loc) um:deleteEvent('pa', loc) end)
-  end
-
-  local function cascadePAInterval(host, newPpq, newEnd)
-
-    local dPpq  = newPpq - host.ppq    local shift = (dPpq == newEnd - host.endppq) and dPpq or 0
-    forEachAttachedPA(host, function(loc, cc)
-      local newPPQ = cc.ppq + shift
-      print("PA at ", cc.ppq, " moving to ", newPPQ)
-      if newPPQ < newPpq or newPPQ > newEnd then um:deleteEvent('pa', loc)
-      elseif shift ~= 0 then um:assignEvent('pa', loc, { ppq = newPPQ }) end
-    end)
-  end
-
-  local function cascadePARepitch(host, newPitch)
-    forEachAttachedPA(host, function(loc) um:assignEvent('pa', loc, { pitch = newPitch }) end)
-  end
-
-  -- Inline PA cascade for a note op. update == nil means delete.
-  local function cascadePA(loc, update)
-    local host = mm:getNote(loc)
-    if not host then return end
-    host.loc = loc
-    if not update then
-      print("DELETE", loc)
-      cascadePADelete(host)
-    else
-      print("UPDATE", loc)
-      util:print_r(update)
-      if update.ppq or update.endppq then
-        cascadePAInterval(host, update.ppq or host.ppq, update.endppq or host.endppq)
-      end
-      if update.pitch and update.pitch ~= host.pitch then
-        cascadePARepitch(host, update.pitch)
-      end
-    end
-  end
-
-
   --------------------
   -- Update manager
   --
@@ -192,7 +134,7 @@ function newTrackerManager(mm, cm)
     local deletes = {}
     local chans = {}
     local notesByLoc = {}
-    local pbsByLoc = {}
+    local ccsByLoc = {}
 
     local function sortByPPQ(tbl)
       table.sort(tbl, function(a, b) return a.ppq < b.ppq end)
@@ -243,13 +185,25 @@ function newTrackerManager(mm, cm)
       return (pb and pb.ppq) or math.huge
     end
 
+    local function forEachAttachedPA(host, fn)
+      for _, cc in pairs(ccsByLoc) do
+        if cc.msgType == 'pa' and cc.chan == host.chan and cc.pitch == host.pitch
+          and cc.ppq >= host.ppq and cc.ppq < host.endppq then
+          fn(cc)
+        end
+      end
+    end
+
     ----- Low-level mutation
 
     local function addLowlevel(evtType, evt)
       if evtType == 'note' then
-        local tbl = chans[evt.chan].notes
-        util:add(tbl, evt)
-        sortByPPQ(tbl)
+        local col1 = (evt.lane or 1) == 1
+        if col1 then
+          local tbl = chans[evt.chan].notes
+          util:add(tbl, evt)
+          sortByPPQ(tbl)
+        end
       elseif evtType == 'pb' then
         local tbl = chans[evt.chan].pbs
         evt.msgType = 'pb'
@@ -274,13 +228,13 @@ function newTrackerManager(mm, cm)
     end
 
     local function deleteLowlevel(evtType, evt)
-      local tbl, locTbl
+      local tbl
+      local locTbl = ccsByLoc
       if evtType == 'note' then
         tbl = chans[evt.chan].notes
         locTbl = notesByLoc
       elseif evtType == 'pb' then
         tbl = chans[evt.chan].pbs
-        locTbl = pbsByLoc
       end
 
       if tbl then
@@ -295,7 +249,7 @@ function newTrackerManager(mm, cm)
       local loc = evt.loc
 
       if loc then
-        if locTbl then locTbl[loc] = nil end
+        locTbl[loc] = nil
         util:add(deletes, { type = evtType, loc = loc })
         for j = #assigns, 1, -1 do
           local e = assigns[j]
@@ -333,9 +287,22 @@ function newTrackerManager(mm, cm)
 
     ----- High-level ops
 
-    local function setPb(chan, P, L)
+    local function assignPb(pb, update)
+      if update.ppq then print('um: not allowed to change ppq of pb events'); return end
       local chan = pb.chan
       local P = pb.ppq
+      local L = update.val
+      if not L then return end
+      local Pp    = nextLogicalChange(chan, P)
+      local delta = L - logicalAt(chan, P)
+      retuneLowlevel(chan, P, Pp, delta)
+      tidyPbsLowlevel(chan)
+    end
+
+    local function addPb(pb)
+      local chan = pb.chan
+      local P = pb.ppq
+      local L = pb.val or 0
       local Pp    = nextLogicalChange(chan, P)
       local delta = L - logicalAt(chan, P)
       if not pbAt(chan, P) then addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) }) end
@@ -361,92 +328,105 @@ function newTrackerManager(mm, cm)
     end
 
     local function deleteNote(n)
+      forEachAttachedPA(n, function(evt) deleteLowlevel('pa', evt) end)
       deleteLowlevel('note', n)
       tidyPbsLowlevel(n.chan)
     end
 
-    local function retuneNoteOp(n, D2)
-      local D1 = n.detune or 0
-      if D1 == D2 then return end
-      retuneLowlevel(n.chan, n.ppq, n.endppq, D2 - D1)
-      assignLowlevel('note', n, { detune = D2 })
-      tidyPbsLowlevel(n.chan)
-    end
-
     local function resizeNote(n, P1, P2)
+      local col1 = (n.lane or 1) == 1
       local L = logicalAt(n.chan, P1)
       local shift = P1 - n.ppq
       if shift ~= 0 and P2 - n.endppq == shift then
-        local owned = {}
-        for _, pb in ipairs(chans[n.chan].pbs) do
-          if pb.ppq >= n.ppq and pb.ppq < n.endppq then util:add(owned, pb) end
+        if col1 then
+          local pbs = {}
+          for _, pb in ipairs(chans[n.chan].pbs) do
+            if pb.ppq >= n.ppq and pb.ppq < n.endppq then util:add(pbs, pb) end
+          end
+          for _, pb in ipairs(pbs) do deleteLowlevel('pb', pb) end
+          for _, pb in ipairs(pbs) do
+            addLowlevel('pb', { ppq = pb.ppq + shift, chan = n.chan, val = pb.val })
+          end
         end
-        for _, pb in ipairs(owned) do deleteLowlevel('pb', pb) end
-        for _, pb in ipairs(owned) do
-          addLowlevel('pb', { ppq = pb.ppq + shift, chan = n.chan, val = pb.val })
-        end
+        forEachAttachedPA(n, function(evt)
+          local newPPQ = evt.ppq + shift
+          assignLowlevel('pa', evt, { ppq = newPPQ })
+        end)
+      else
+        local lastPA
+        forEachAttachedPA(n, function(evt)
+          if evt.ppq <= P1 or evt.ppq >= P2 then
+            if evt.ppq <= P1 and (not lastPA or evt.ppq > lastPA.ppq) then lastPA = evt end
+            deleteLowlevel('pa', evt)
+          end
+        end)
+        if lastPA then assignLowlevel('note', n, { vel = lastPA.val }) end
       end
+
       assignLowlevel('note', n, { ppq = P1, endppq = P2 })
-      if not pbAt(n.chan, P1) then addLowlevel('pb', { ppq = P1, chan = n.chan, val = (n.detune or 0) + L }) end
-      tidyPbsLowlevel(n.chan)
-    end
-
-    ----- Public interface (classifier logic baked in)
-
-    local newUm = {}
-
-    function newUm:deleteEvent(evtType, evtOrLoc)
-      local evt = type(evtOrLoc) == 'table' and evtOrLoc or { loc = evtOrLoc }
-      if evtType == 'note' then
-        cascadePA(evt.loc, nil)
-        deleteNote(notesByLoc[evt.loc])
-      elseif evtType == 'pb' and pbsByLoc[evt.loc] then
-        deletePb(pbsByLoc[evt.loc])
-      else
-        deleteLowlevel(evtType, evt)
+      if col1 then
+        if not pbAt(n.chan, P1) then addLowlevel('pb', { ppq = P1, chan = n.chan, val = (n.detune or 0) + L }) end
+        tidyPbsLowlevel(n.chan)
       end
     end
 
-    function newUm:assignEvent(evtType, evtOrLoc, update)
-      local evt = type(evtOrLoc) == 'table' and evtOrLoc or { loc = evtOrLoc }
+    local function assignNote(n, update)
+      if update.chan then print('um: not allowed to change channel of notes'); return end
+      if update.lane then print('um: not allowed to change lane of notes'); return end
+
+      if update.ppq ~= nil or update.endppq ~= nil then
+        resizeNote(n, update.ppq or n.ppq, update.endppq or n.endppq)
+        update.ppq, update.endppq = nil, nil
+      end
+      if update.pitch then
+        forEachAttachedPA(n, function(e) assignLowlevel('pa', e, { pitch = update.pitch }) end)
+      end
+      if (n.lane or 1) == 1 and update.detune ~= nil and update.detune ~= (n.detune or 0) then
+        retuneLowlevel(n.chan, n.ppq, n.endppq, update.detune - (n.detune or 0))
+        tidyPbsLowlevel(n.chan)
+      end
+      if next(update) then assignLowlevel('note', n, update) end
+    end
+
+    ----- Public interface
+
+    local um = {}
+
+    function um:deleteEvent(evtType, evtOrLoc)
+      local loc = type(evtOrLoc) == 'table' and evtOrLoc.loc or evtOrLoc
+      if not loc then return end
+      local evt = evtType == 'note' and notesByLoc[loc] or ccsByLoc[loc]
+
       if evtType == 'note' then
-        if update.chan then print('tm: not allowed to change channel of notes'); return end
-        if update.lane then print('tm: not allowed to change lane of notes'); return end
-        local hasResize = update.ppq ~= nil or update.endppq ~= nil
-        local hasRetune = update.detune ~= nil or update.pitch ~= nil
-        cascadePA(evt.loc, update)
-        local note = notesByLoc[evt.loc]
-        if (note.lane or 1) == 1  then
-          if hasResize then
-            resizeNote(note, update.ppq or note.ppq, update.endppq or note.endppq)
-          end
-          if hasRetune then
-            retuneNoteOp(note, update.detune)
-          end
-          if update.vel ~= nil or update.pitch ~= nil then
-            assignLowlevel('note', note, { vel = update.vel, pitch = update.pitch })
-          end
-        else
-          util:add(assigns, { type = 'note', loc = evt.loc, update = update })
-        end
-      elseif evtType == 'pb' and pbsByLoc[evt.loc] then
-        if update.ppq then print('tm: not allowed to change ppq of pb events'); return end
-        local pb = pbsByLoc[evt.loc]
-        if update.val ~= nil then
-          setPb(pb.chan, pb.ppq, update.val)
-        end
+        if evt then deleteNote(evt) end
+      elseif evtType == 'pb' then
+        if evt then deletePb(evt) end
       else
-        assignLowlevel(evtType, evt, update)
+        deleteLowlevel(evtType, evt or { loc = loc })
       end
     end
 
-    function newUm:addEvent(evtType, evt)
+    function um:assignEvent(evtType, evtOrLoc, update)
+      local loc = type(evtOrLoc) == 'table' and evtOrLoc.loc or evtOrLoc
+      if not loc then return end
+      local evt = evtType == 'note' and notesByLoc[loc] or ccsByLoc[loc]
+
+      if evtType == 'note' then
+        if evt then assignNote(evt, update) end
+      elseif evtType == 'pb' then
+        if evt then assignPb(evt, update) end
+      else
+        assignLowlevel(evtType, evt or { loc = loc }, update)
+      end
+    end
+
+    function um:addEvent(evtType, evt)
       if evtType == 'note' then
         addNote(evt)
       elseif evtType == 'pb' then
-        setPb(evt.chan, evt.ppq, evt.val or 0)
+        addPb(evt)
       else
-        addLowlevel(type, evt)
+        addLowlevel(evtType, evt)
       end
     end
 
@@ -454,7 +434,7 @@ function newTrackerManager(mm, cm)
 
     local flushing = false
 
-    function newUm:flush()
+    function um:flush()
       if #adds == 0 and #assigns == 0 and #deletes == 0 then return end
 
       for _, e in ipairs(assigns) do
@@ -491,11 +471,14 @@ function newTrackerManager(mm, cm)
       for i = 1, 16 do chans[i] = { notes = {}, pbs = {} } end
 
       for loc, cc in mm:ccs() do
+        local evt
         if cc.msgType == 'pb' then
-          local evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc }
+          evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc }
           util:add(chans[evt.chan].pbs, evt)
-          pbsByLoc[loc] = evt
+        else
+          evt = util:assign(cc, { loc = loc })
         end
+        ccsByLoc[loc] = evt
       end
       for i = 1, 16 do sortByPPQ(chans[i].pbs) end
 
@@ -531,12 +514,12 @@ function newTrackerManager(mm, cm)
             end
           end
         end
-        newUm:flush()
+        um:flush()
       end
     end
 
     init()
-    return newUm
+    return um
   end
 
   --------------------
@@ -642,7 +625,7 @@ function newTrackerManager(mm, cm)
     for _, col in ipairs(channel.columns) do
       if col.type == 'note' then
         for _, evt in ipairs(col.events) do
-          if evt.pitch == pitch and evt.ppq <= ppq_pos and evt.endppq > ppq_pos then
+          if evt.endppq and evt.pitch == pitch and evt.ppq <= ppq_pos and evt.endppq > ppq_pos then
             return col
           end
         end
@@ -655,7 +638,7 @@ function newTrackerManager(mm, cm)
         end
       end
     end
-    return nil
+    return
   end
 
   local function firstNoteCol(channel)

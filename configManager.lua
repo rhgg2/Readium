@@ -235,7 +235,7 @@ function newConfigManager()
   end
 
   function cm:getAt(level, key)
-    if not checkLevel(level) then return nil end
+    if not checkLevel(level) then return end
     ensureCache()
     local tbl = cache[level] or {}
     if key ~= nil then return tbl[key] end
@@ -250,7 +250,7 @@ function newConfigManager()
         return level
       end
     end
-    return nil
+    return
   end
 
   -- Writing

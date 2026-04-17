@@ -1,7 +1,7 @@
 util = {}
 
 function util:print(...)
-  if ( not ... ) then
+  if not ... then
     reaper.ShowConsoleMsg('nil value\n')
     return
   end
@@ -20,13 +20,13 @@ function util:print_r(root)
     for k,v in pairs(t) do
       local key = tostring(k)
       if cache[v] then
-        table.insert(temp,'+' .. key .. ' {' .. cache[v]..'}')
+        temp[#temp+1] = '+' .. key .. ' {' .. cache[v]..'}'
       elseif type(v) == 'table' then
         local new_key = name .. '.' .. key
         cache[v] = new_key
-        table.insert(temp,'+' .. key .. _dump(v,space .. (next(t,k) and '|' or ' ' ).. string.rep(' ',#key),new_key))
+        temp[#temp+1] = '+' .. key .. _dump(v,space .. (next(t,k) and '|' or ' ' ).. string.rep(' ',#key),new_key)
       else
-        table.insert(temp,'+' .. key .. ' [' .. tostring(v)..']')
+        temp[#temp+1] = '+' .. key .. ' [' .. tostring(v)..']'
       end
     end
     return table.concat(temp,'\n'..space)
@@ -50,8 +50,7 @@ function util:assign(t1,t2)
 end
 
 function util:add(tbl, val)
-  local idx = #tbl+1
-  tbl[idx] = val
+  tbl[#tbl+1] = val
   return val
 end
 
@@ -200,9 +199,7 @@ function util:unserialise(input)
 
     -- number detection
     local n = tonumber(s)
-    if n ~= nil then
-      return n
-    end
+    if n then return n end
 
     -- boolean
     if s == 'true' then return true end
