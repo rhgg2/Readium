@@ -142,15 +142,26 @@ function newViewManager(tm, cm)
   ---------- PPQ / ROW MAPPING
 
   local function ppqToRow(ppq)
-    if ppq >= length then
-      return grid.numRows
-    end
+    if ppq <= 0 then return 0 end
+    if ppq >= length then return grid.numRows end
     local lo, hi = 0, grid.numRows - 1
     while lo < hi do
       local mid = (lo + hi + 1) // 2
       if rowPPQs[mid] <= ppq then lo = mid else hi = mid - 1 end
     end
-    return lo
+    local rowStart = rowPPQs[lo]
+    local rowEnd = rowPPQs[lo + 1] or length
+    return lo + (rowEnd > rowStart and (ppq - rowStart) / (rowEnd - rowStart) or 0)
+  end
+
+  local function rowToPPQ(row)
+    if row <= 0 then return 0 end
+    if row >= grid.numRows then return length end
+    local r = math.floor(row)
+    local frac = row - r
+    local rowStart = rowPPQs[r]
+    local rowEnd = rowPPQs[r + 1] or length
+    return math.floor(rowStart + frac * (rowEnd - rowStart) + 0.5)
   end
 
   ---------- AUDITION
@@ -473,16 +484,30 @@ function newViewManager(tm, cm)
 
   local function overlapLimitStart(col, note)
     local prev = util:seek(col.events, 'before', note.ppq, isNote)
-    if prev then return prev.endppq - cfg('overlapOffset', 1/16) * resolution end
+    if prev then return prev.endppq  end
     return 0
   end
-  
+
+  local function lastNoteEnd(col, note, overlap)
+    local prev = util:seek(col.events, 'before', note.ppq, isNote)
+    local ppq = prev and prev.endppq
+    if ppq and overlap then ppq = ppq - cfg('overlapOffset', 1/16) * resolution end
+    return ppq or 0
+  end
+
+  local function nextNoteStart(col, note, overlap)
+    local next = util:seek(col.events, 'after', note.ppq, isNote)
+    local ppq = next and next.ppq
+    if ppq and overlap then ppq = ppq + cfg('overlapOffset', 1/16) * resolution end
+    return ppq or length
+  end
+
   --- EDIT EVENT
   
   local function editEvent(col, evt, stop, char, half)
     if not col then return end
     local type = col.type
-    local cursorPPQ = rowPPQs[cursorRow]
+    local cursorPPQ = rowToPPQ(cursorRow)
 
     local function commit(auditionPitch, auditionVel)
       tm:flush()
@@ -542,17 +567,17 @@ function newViewManager(tm, cm)
       -- Stops 5,6: delay (row fraction, hex 00..7F of 0x80)
       elseif stop == 5 or stop == 6 then
         if not isNote(evt) then return end
-        local row    = ppqToRow(evt.ppq)
-        local base   = rowPPQs[row]
-        local rowLen = (rowPPQs[row + 1] or length) - base
+        local row    = math.floor(ppqToRow(evt.ppq))
+        local base   = rowToPPQ(row)
+        local rowLen = rowToPPQ(row + 1) - base
         if rowLen <= 0 then return end
         local curVal = math.floor((evt.ppq - base) / rowLen * 0x80 + 0.5)
 
         local newVal
         if char == string.byte('-') then
           if row < 1 or curVal == 0 then return end
-          base   = rowPPQs[row - 1]
-          rowLen = rowPPQs[row] - base
+          base   = rowToPPQ(row - 1)
+          rowLen = rowToPPQ(row) - base
           newVal = 0x80 - curVal
         else
           local d = hexDigit[char]; if not d then return end
@@ -629,12 +654,14 @@ function newViewManager(tm, cm)
   ----------  EVENT DELETION
 
   local function deleteNote(col, note)
-    local last = util:seek(col.events, 'before', note.ppq, isNote)
+    local P = note.ppq
+    tm:deleteEvent('note', note)
+
+    local last = util:seek(col.events, 'before', P, isNote)
     if last and last.endppq >= note.ppq then
-      local after = util:seek(col.events, 'after', note.ppq, isNote)
+      local after = util:seek(col.events, 'after', P, isNote)
       tm:assignEvent('note', last, { endppq = after and after.ppq or length })
     end
-    tm:deleteEvent('note', note)
     tm:flush()
   end
 
@@ -656,8 +683,8 @@ function newViewManager(tm, cm)
       tm:assignEvent('note', evt, { vel = (prev and prev.vel) or cfg('defaultVelocity', 100) })
       tm:flush()
     elseif selGrp == 3 then
-      local base = rowPPQs[ppqToRow(evt.ppq)]
-      if base and base ~= evt.ppq and base >= overlapLimitStart(col, evt) and base < evt.endppq then
+      local base = rowToPPQ(math.floor(ppqToRow(evt.ppq)))
+      if base ~= evt.ppq and base >= overlapLimitStart(col, evt) and base < evt.endppq then
         tm:assignEvent('note', evt, { ppq = base })
         tm:flush()
       end
@@ -668,30 +695,42 @@ function newViewManager(tm, cm)
 
   ---------- NOTE DURATION
 
+  local function cursorNoteInOrAfter()
+    local col = grid.cols[cursorCol]
+    local cursorPPQ = rowToPPQ(cursorRow)
+    if not (col and col.type == 'note') then return end
+    local note = util:seek(col.events, 'at-or-before', cursorPPQ, function (e) return e and e.endppq and e.endppq > cursorPPQ end)
+    if note then return col, note end
+    return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
+  end
+
   local function cursorNoteBefore()
     local col = grid.cols[cursorCol]
-    local cursorPPQ = rowPPQs[cursorRow]
-    if not (col and col.type == 'note' and cursorPPQ) then return end
+    local cursorPPQ = rowToPPQ(cursorRow)
+    if not (col and col.type == 'note') then return end
     return col, util:seek(col.events, 'at-or-before', cursorPPQ, isNote)
   end
 
   local function cursorNoteAfter()
     local col = grid.cols[cursorCol]
-    local cursorPPQ = rowPPQs[cursorRow]
-    if not (col and col.type == 'note' and cursorPPQ) then return end
+    local cursorPPQ = rowToPPQ(cursorRow)
+    if not (col and col.type == 'note') then return end
     return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
   end
 
   local function noteOff()
     local col = grid.cols[cursorCol]
-    local cursorPPQ = rowPPQs[cursorRow]
+    local cursorPPQ = rowToPPQ(cursorRow)
+    local nextCursorPPQ = rowToPPQ(cursorRow + 1)
     if not (col and col.type == 'note' and cursorSelGrp() == 1 and cursorPPQ) then return 'fallthrough' end
 
-    local last = util:seek(col.events, 'before', cursorPPQ, isNote)
+    local last = util:seek(col.events, 'before', nextCursorPPQ, isNote)
     if not last then return end
     if last.endppq == cursorPPQ then
       local next = util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
       tm:assignEvent('note', last, { endppq = next and next.ppq or length })
+    elseif last.ppq >= cursorPPQ then
+      tm:deleteEvent('note', last)
     else
       local newEnd = util:clamp(cursorPPQ, last.ppq + 1, overlapLimit(col, last))
       tm:assignEvent('note', last, { endppq = newEnd })
@@ -700,17 +739,91 @@ function newViewManager(tm, cm)
   end
 
   local function adjustDuration(rowDelta)
-    local col, note = cursorNoteAfter()
-    if not note then col, note = cursorNoteBefore() end
+    local col, note = cursorNoteBefore()
     if not note then return end
 
-    local endRow = math.min(ppqToRow(note.endppq), grid.numRows - 1)
-    local step = (rowPPQs[endRow + 1] or length) - rowPPQs[endRow]
-    local maxPPQ = rowDelta > 0 and overlapLimit(col, note) or length
-    local newPPQ = util:clamp(note.endppq + step * rowDelta, note.ppq + 1, maxPPQ)
+    local newRow = util:clamp(ppqToRow(note.endppq) + rowDelta, 0, grid.numRows - 1)
+          newRow = math.floor(newRow / rowDelta) * rowDelta
+    local minPPQ = math.min(note.endppq, rowToPPQ(math.floor(ppqToRow(note.ppq)) + 1))
+    local maxPPQ = nextNoteStart(col, note, true)
+    local newPPQ = util:clamp(rowToPPQ(newRow), minPPQ, maxPPQ)
     tm:assignEvent('note', note, { endppq = newPPQ })
     tm:flush()
   end
+
+  local function adjustPosition(rowDelta)
+    local col, note = cursorNoteInOrAfter()
+    if not note then return end
+
+    local absDelta = math.abs(rowDelta)
+    local rawRow   = ppqToRow(note.ppq) + rowDelta
+    local reqRow   = (rowDelta > 0 and math.ceil(rawRow / absDelta) or math.floor(rawRow / absDelta)) * absDelta
+    
+    local curLen    = ppqToRow(note.endppq) - ppqToRow(note.ppq)
+    local minLen    = math.min(absDelta, curLen)
+    local minPPQ    = lastNoteEnd(col, note, false)
+    local minRow    = minPPQ and ppqToRow(minPPQ) or 0
+    local maxEndPPQ = nextNoteStart(col, note, false)
+    local maxEndRow = maxEndPPQ and ppqToRow(maxEndPPQ) or grid.numRows
+
+    local newEndRow, newRow
+    if rowDelta > 0 then
+      newEndRow = math.min(reqRow + curLen, maxEndRow)
+      newRow    = math.min(reqRow, newEndRow - minLen)
+    else
+      newRow    = math.max(reqRow, minRow)
+      newEndRow = math.max(reqRow + curLen, newRow + minLen)
+    end
+    local newPPQ = rowToPPQ(newRow)
+    local newEndPPQ = rowToPPQ(newEndRow)
+
+    if newPPQ == note.ppq and newEndPPQ == note.endppq then return end
+
+    local finalDur = newEndPPQ - newPPQ
+    if finalDur ~= note.endppq - note.ppq then
+      if rowDelta > 0 then
+        tm:assignEvent('note', note, { endppq = note.ppq + finalDur })
+      else
+        tm:assignEvent('note', note, { ppq = note.endppq - finalDur })
+      end
+    end
+    tm:assignEvent('note', note, { ppq = newPPQ, endppq = newEndPPQ })
+    tm:flush()
+  end
+    
+  --   local duration = note.endppq - note.ppq
+  --   local reqPPQ
+  --   if alignedRow < 0 then
+  --     reqPPQ = alignedRow * (rowToPPQ(1) - rowToPPQ(0))
+  --   elseif alignedRow > grid.numRows then
+  --     reqPPQ = length + (alignedRow - grid.numRows) * (rowToPPQ(grid.numRows) - rowToPPQ(grid.numRows - 1))
+  --   else
+  --     reqPPQ = rowToPPQ(alignedRow)
+  --   end
+  -- 
+  --   local rowAnchor = math.floor(curRow)
+  --   local minDur    = math.min(rowToPPQ(rowAnchor + absDelta) - rowToPPQ(rowAnchor), duration)
+  --   local minPPQ    = lastNoteEnd(col, note, false)
+  --   local maxEnd    = math.min(nextNoteStart(col, note, false), length)
+  -- 
+  --   local newPPQ, newEnd
+  --   if rowDelta > 0 then
+  --     newEnd = math.min(reqPPQ + duration, maxEnd)
+  --     newPPQ = math.min(reqPPQ, newEnd - minDur)
+  --   else
+  --     newPPQ = math.max(reqPPQ, minPPQ)
+  --     newEnd = math.max(reqPPQ + duration, newPPQ + minDur)
+  --   end
+  -- 
+  --   if newPPQ == note.ppq and newEnd == note.endppq then return end
+  -- 
+  --   local finalDur = newEnd - newPPQ
+  --   if finalDur ~= duration then
+  --     tm:assignEvent('note', note, { endppq = note.ppq + finalDur })
+  --   end
+  --   tm:assignEvent('note', note, { ppq = newPPQ, endppq = newEnd })
+  --   tm:flush()
+  -- end
 
   local function transpose(delta)
     local col, note = cursorNoteAfter()
@@ -730,24 +843,6 @@ function newViewManager(tm, cm)
     tm:retuneNote(note, { pitch = pitch, detune = detune })
     tm:flush()
     audition(pitch, note.vel, col.midiChan)
-  end
-
-  local function adjustPosition(rowDelta)
-    local col, note = cursorNoteAfter()
-    if not note then col, note = cursorNoteBefore() end
-    if not note then return end
-
-    local startRow = math.max(ppqToRow(note.ppq), 1)
-    local step = rowPPQs[startRow] - rowPPQs[startRow - 1]
-    local duration = note.endppq - note.ppq
-    local minPPQ = rowDelta < 0 and overlapLimitStart(col, note) or 0
-    local maxPPQ = (rowDelta > 0 and overlapLimit(col, note) or length) - duration
-    local newPPQ = util:clamp(note.ppq + step * rowDelta, minPPQ, maxPPQ)
-    if newPPQ == note.ppq then return end
-
-    local offset = newPPQ - note.ppq
-    tm:assignEvent('note', note, { ppq = newPPQ, endppq = note.endppq + offset })
-    tm:flush()
   end
 
   -- Queue note deletions with predecessor endppq fixup. PAs are ignored in the
@@ -781,8 +876,8 @@ function newViewManager(tm, cm)
   local function queueResetDelays(col, locs)
     for _, evt in pairs(locs) do
       if evt.type ~= 'pa' then
-        local base = rowPPQs[ppqToRow(evt.ppq)]
-        if base and base ~= evt.ppq and base >= overlapLimitStart(col, evt) and base < evt.endppq then
+        local base = rowToPPQ(math.floor(ppqToRow(evt.ppq)))
+        if base ~= evt.ppq and base >= overlapLimitStart(col, evt) and base < evt.endppq then
           tm:assignEvent('note', evt, { ppq = base })
         end
       end
@@ -823,7 +918,7 @@ function newViewManager(tm, cm)
       c1, c2 = cursorCol, cursorCol
       g1, g2 = cursorSelGrp(), cursorSelGrp()
     end
-    return r1, r2, c1, c2, g1, g2, rowPPQs[r1], rowPPQs[r2 + 1] or length
+    return r1, r2, c1, c2, g1, g2, rowToPPQ(r1), rowToPPQ(r2 + 1)
   end
 
   local function selectedEvents()
@@ -884,25 +979,17 @@ function newViewManager(tm, cm)
     local r1, r2, c1, c2, g1, g2, startPPQ, endPPQ = selBounds()
     local numRows  = r2 - r1 + 1
 
-    local function fractionalRow(ppq)
-      local absRow = ppqToRow(ppq)
-      local rowStart = rowPPQs[absRow]
-      local rowEnd = rowPPQs[absRow + 1] or length
-      local frac = (rowEnd > rowStart) and (ppq - rowStart) / (rowEnd - rowStart) or 0
-      return absRow - r1 + frac
-    end
-
     local function noteEvent(evt)
-      local ce = { row = fractionalRow(evt.ppq),
+      local ce = { row = ppqToRow(evt.ppq) - r1,
                    pitch = evt.pitch, vel = evt.vel, loc = evt.loc }
       if isNote(evt) and evt.endppq < endPPQ then
-        ce.endRow = fractionalRow(evt.endppq)
+        ce.endRow = ppqToRow(evt.endppq) - r1
       end
       return ce
     end
 
     local function scalarEvent(evt, val)
-      return { row = fractionalRow(evt.ppq), val = val, loc = evt.loc }
+      return { row = ppqToRow(evt.ppq) - r1, val = val, loc = evt.loc }
     end
 
     -- Single-column mode
@@ -958,8 +1045,6 @@ function newViewManager(tm, cm)
       for evt in between(col.events, startPPQ, endPPQ) do
         if col.type == 'note' then
           util:add(entry.events, noteEvent(evt))
-        elseif col.type == 'pb' then
-          util:add(entry.events, scalarEvent(evt, evt.val))
         else
           util:add(entry.events, scalarEvent(evt, evt.val))
         end
@@ -982,15 +1067,7 @@ function newViewManager(tm, cm)
     deleteSelection()
   end
 
-  local function rowToPPQ(baseRow, fractRow)
-    local k = math.floor(fractRow)
-    local frac = fractRow - k
-    local absRow = baseRow + k
-    local rowStart = rowPPQs[absRow]
-    if not rowStart then return nil end
-    local rowEnd = rowPPQs[absRow + 1] or length
-    return math.floor(rowStart + frac * (rowEnd - rowStart) + 0.5)
-  end
+
 
   local function pasteVelocities(events, dstCol, startPPQ, endPPQ)
     local last = util:seek(dstCol.events, 'before', startPPQ)
@@ -1035,19 +1112,18 @@ function newViewManager(tm, cm)
   local function pasteSingle(clip)
     local dstCol = grid.cols[cursorCol]
     if not dstCol then return end
-    local startPPQ = rowPPQs[cursorRow]
-    local endPPQ = rowPPQs[cursorRow + clip.numRows] or length
+    local startPPQ = rowToPPQ(cursorRow)
+    local endPPQ = rowToPPQ(cursorRow + clip.numRows)
     local selGrp = cursorSelGrp()
 
     -- Resolve clipboard events to target PPQs, truncating past end
     local events = {}
     for _, ce in ipairs(clip.events) do
-      local ppq = rowToPPQ(cursorRow, ce.row)
-      if not ppq or ppq >= endPPQ then goto nextCe end
+      local ppq = rowToPPQ(cursorRow + ce.row)
+      if ppq >= endPPQ then goto nextCe end
       local e = util:assign({ ppq = ppq }, ce)
       if ce.endRow then
-        local ep = rowToPPQ(cursorRow, ce.endRow)
-        e.endppq = ep and math.min(ep, endPPQ) or endPPQ
+        e.endppq = math.min(rowToPPQ(cursorRow + ce.endRow), endPPQ)
       end
       util:add(events, e)
       ::nextCe::
@@ -1124,8 +1200,8 @@ function newViewManager(tm, cm)
     -- channel as the anchor.
     if clip.startType == 'note' and cursor.type ~= 'note' then return end
 
-    local startPPQ = rowPPQs[cursorRow]
-    local endPPQ = rowPPQs[cursorRow + clip.numRows] or length
+    local startPPQ = rowToPPQ(cursorRow)
+    local endPPQ = rowToPPQ(cursorRow + clip.numRows)
 
     -- Per-channel lookup for destination columns, built lazily. Note
     -- columns are indexed by lane (1..N, dense); cc columns by number;
@@ -1182,12 +1258,11 @@ function newViewManager(tm, cm)
       -- Materialise clip events to target PPQs, sorted.
       local events = {}
       for _, ce in ipairs(clipCol.events) do
-        local ppq = rowToPPQ(cursorRow, ce.row)
-        if ppq and ppq < endPPQ then
+        local ppq = rowToPPQ(cursorRow + ce.row)
+        if ppq < endPPQ then
           local e = util:assign({ ppq = ppq }, ce)
           if ce.endRow then
-            local ep = rowToPPQ(cursorRow, ce.endRow)
-            e.endppq = ep and math.min(ep, endPPQ) or endPPQ
+            e.endppq = math.min(rowToPPQ(cursorRow + ce.endRow), endPPQ)
           end
           util:add(events, e)
         end
@@ -1261,18 +1336,18 @@ function newViewManager(tm, cm)
   end
 
   local function rowBeatInfo(row)
-    local ppq         = rowPPQs[row]
+    local ppq         = rowToPPQ(row)
     local ts          = timeSigAt(ppq)
     if not ts then return false, false end
     local offset      = ppq - ts.ppq
 
     local ppqPerBeat  = resolution * 4 / ts.denom
     local nearestBeat = math.floor(offset / ppqPerBeat + 0.5)
-    local isBeatStart = ppqToRow(ts.ppq + nearestBeat * ppqPerBeat) == row
+    local isBeatStart = math.floor(ppqToRow(ts.ppq + nearestBeat * ppqPerBeat)) == row
 
     local ppqPerBar   = ppqPerBeat * ts.num
     local nearestBar  = math.floor(offset / ppqPerBar  + 0.5)
-    local isBarStart  = ppqToRow(ts.ppq + nearestBar  * ppqPerBar)  == row
+    local isBarStart  = math.floor(ppqToRow(ts.ppq + nearestBar  * ppqPerBar))  == row
     return isBarStart, isBeatStart
   end
 
@@ -1282,15 +1357,15 @@ function newViewManager(tm, cm)
       local ppqPerBeat = resolution * 4 / ts.denom
       local ppqPerBar  = ppqPerBeat * ts.num
       local nextPPQ    = timeSigs[i + 1] and timeSigs[i + 1].ppq or math.huge
-      local nextRow    = timeSigs[i + 1] and ppqToRow(nextPPQ) or math.huge
+      local nextRow    = timeSigs[i + 1] and math.floor(ppqToRow(nextPPQ)) or math.huge
 
       if row < nextRow then
-        local ppq      = rowPPQs[row]
+        local ppq      = rowToPPQ(row)
         local offset   = ppq - ts.ppq
         local inBar    = offset % ppqPerBar
         local beatNum  = inBar // ppqPerBeat
         local beatPPQ  = ppq - offset % ppqPerBeat
-        local beatRow  = ppqToRow(beatPPQ)
+        local beatRow  = math.floor(ppqToRow(beatPPQ))
         return bar + offset // ppqPerBar,
                beatNum + 1,
                row - beatRow + 1,
@@ -1321,17 +1396,8 @@ function newViewManager(tm, cm)
     return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
   end
 
-  function vm:fractionalRow(ppq)
-    if ppq >= length then return grid.numRows or 0 end
-    local row = ppqToRow(ppq)
-    local rowPPQ = rowPPQs[row] or 0
-    local nextPPQ = rowPPQs[row + 1] or length
-    local rowLen = nextPPQ - rowPPQ
-    if rowLen <= 0 then return row end
-    return row + (ppq - rowPPQ) / rowLen
-  end
-
-  function vm:rowPPQ(row) return rowPPQs[row] end
+  function vm:ppqToRow(ppq) return ppqToRow(ppq) end
+  function vm:rowToPPQ(row) return rowToPPQ(row) end
 
   function vm:activeTuning()   return activeTuning() end
   function vm:noteProjection(evt) return noteProjection(evt) end
@@ -1430,7 +1496,7 @@ function newViewManager(tm, cm)
     play           = function() tm:play() end,
     playPause      = function() tm:playPause() end,
     playFromTop    = function() tm:playFrom(0) end,
-    playFromCursor = function() tm:playFrom(rowPPQs[cursorRow] or 0) end,
+    playFromCursor = function() tm:playFrom(rowToPPQ(cursorRow)) end,
     stop           = function() tm:stop() end,
     addNoteCol     = function() vm:addExtraCol('note') end,
     addTypedCol    = function()
@@ -1732,7 +1798,7 @@ function newViewManager(tm, cm)
 
       for _, gridCol in ipairs(grid.cols) do
         for _, evt in ipairs(gridCol.events) do
-          local y = ppqToRow(evt.ppq or 0)
+          local y = math.floor(ppqToRow(evt.ppq or 0))
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
               gridCol.cells[y].overflow = true

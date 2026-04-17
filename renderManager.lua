@@ -83,9 +83,9 @@ function newRenderManager(vm, cm)
     local text    = noteTxt .. ' ' .. velTxt
 
     if showDelay then
-      local basePPQ = vm:rowPPQ(row)
-      local nextPPQ = vm:rowPPQ(row + 1)
-      local rowLen  = nextPPQ and (nextPPQ - basePPQ) or 0
+      local basePPQ = vm:rowToPPQ(row)
+      local nextPPQ = vm:rowToPPQ(row + 1)
+      local rowLen  = nextPPQ - basePPQ
       local val     = rowLen > 0 and math.floor((evt.ppq - basePPQ) / rowLen * 0x80 + 0.5) or 0
       text = text .. ' ' .. (val > 0 and string.format('%02X', val) or '··')
     end
@@ -351,8 +351,8 @@ function newRenderManager(vm, cm)
         local colPx = gridOriginX + col.x * gridX
         for _, evt in ipairs(col.events) do
           if evt.endppq then
-            local startFrac = vm:fractionalRow(evt.ppq)
-            local endFrac   = vm:fractionalRow(evt.endppq)
+            local startFrac = vm:ppqToRow(evt.ppq)
+            local endFrac   = vm:ppqToRow(evt.endppq)
             if endFrac > viewTop and startFrac < viewBot then
               local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
               local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
@@ -458,7 +458,7 @@ function newRenderManager(vm, cm)
   local function drawStatusBar()
     local cursorRow, cursorCol = vm:cursor()
     local rowPerBeat, _, _, currentOctave, advanceBy = vm:displayParams()
-    local ppq      = vm:rowPPQ(cursorRow)
+    local ppq      = vm:rowToPPQ(cursorRow)
     local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
     local col      = vm.grid.cols[cursorCol]
     local colLabel = col and col.label or '?'
@@ -475,58 +475,58 @@ function newRenderManager(vm, cm)
 
   ---------- COMMANDS & KEYBOARD
 
-  local keymap = {
-    cursorDown  = { ImGui.Key_DownArrow, { ImGui.Key_N,  ImGui.Mod_Super }  },
-    cursorUp    = { ImGui.Key_UpArrow,   { ImGui.Key_P,  ImGui.Mod_Super }    },
-    pageDown    = { ImGui.Key_PageDown,  { ImGui.Key_V,  ImGui.Mod_Super }   },
-    pageUp      = { ImGui.Key_PageUp,    { ImGui.Key_V,  ImGui.Mod_Ctrl }     },
-    goTop       = { ImGui.Key_Home, { ImGui.Key_Comma,  ImGui.Mod_Ctrl, ImGui.Mod_Shift  }       },
-    goBottom    = { ImGui.Key_End, { ImGui.Key_Period,  ImGui.Mod_Ctrl, ImGui.Mod_Shift  }        },
-    goLeft      = { { ImGui.Key_A,  ImGui.Mod_Super  }        },
-    goRight     = { { ImGui.Key_E,  ImGui.Mod_Super  }       },
-    cursorLeft  = { ImGui.Key_LeftArrow, { ImGui.Key_B,  ImGui.Mod_Super }  },
-    cursorRight = { ImGui.Key_RightArrow, { ImGui.Key_F,  ImGui.Mod_Super } },
-    selectUp    = { { ImGui.Key_UpArrow,    ImGui.Mod_Shift } },
-    selectDown  = { { ImGui.Key_DownArrow,  ImGui.Mod_Shift } },
-    selectLeft  = { { ImGui.Key_LeftArrow,  ImGui.Mod_Shift } },
-    selectRight = { { ImGui.Key_RightArrow, ImGui.Mod_Shift } },
-    selectClear = { { ImGui.Key_G, ImGui.Mod_Super } },
-    colLeft     = { { ImGui.Key_B,  ImGui.Mod_Ctrl } },
-    colRight    = { { ImGui.Key_F,  ImGui.Mod_Ctrl } },
-    channelRight  = { ImGui.Key_Tab },
-    channelLeft   = { { ImGui.Key_Tab, ImGui.Mod_Shift } },
-    delete      = { ImGui.Key_Period },
-    deleteSel   = { ImGui.Key_Delete },
-    copy        = { { ImGui.Key_W, ImGui.Mod_Ctrl } },
-    cut         = { { ImGui.Key_W, ImGui.Mod_Super } },
-    paste       = { { ImGui.Key_Y, ImGui.Mod_Super } },
-    mark        = { { ImGui.Key_Space, ImGui.Mod_Super } },
-    quit        = { ImGui.Key_Enter },
-    upOctave       = { { ImGui.Key_8,  ImGui.Mod_Shift } },
+  local keymap     = {
+    cursorUp       = { ImGui.Key_UpArrow,    {ImGui.Key_P, ImGui.Mod_Super} },
+    cursorDown     = { ImGui.Key_DownArrow,  {ImGui.Key_N, ImGui.Mod_Super} },
+    goTop          = { ImGui.Key_Home,       {ImGui.Key_Comma, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
+    goBottom       = { ImGui.Key_End,        {ImGui.Key_Period, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
+    pageUp         = { ImGui.Key_PageUp },
+    pageDown       = { ImGui.Key_PageDown },
+    goLeft         = { {ImGui.Key_A, ImGui.Mod_Super} },
+    goRight        = { {ImGui.Key_E, ImGui.Mod_Super} },
+    cursorLeft     = { ImGui.Key_LeftArrow,  {ImGui.Key_B, ImGui.Mod_Super} },
+    cursorRight    = { ImGui.Key_RightArrow, {ImGui.Key_F, ImGui.Mod_Super} },
+    selectUp       = { {ImGui.Key_UpArrow, ImGui.Mod_Shift} },
+    selectDown     = { {ImGui.Key_DownArrow, ImGui.Mod_Shift} },
+    selectLeft     = { {ImGui.Key_LeftArrow, ImGui.Mod_Shift} },
+    selectRight    = { {ImGui.Key_RightArrow, ImGui.Mod_Shift} },
+    selectClear    = { {ImGui.Key_G, ImGui.Mod_Super} },
+    colLeft        = { {ImGui.Key_B, ImGui.Mod_Ctrl} },
+    colRight       = { {ImGui.Key_F, ImGui.Mod_Ctrl} },
+    channelRight   = { ImGui.Key_Tab },
+    channelLeft    = { {ImGui.Key_Tab, ImGui.Mod_Shift} },
+    delete         = { ImGui.Key_Period },
+    deleteSel      = { ImGui.Key_Delete },
+    copy           = { {ImGui.Key_W, ImGui.Mod_Ctrl}, {ImGui.Key_C, ImGui.Mod_Ctrl} },
+    cut            = { {ImGui.Key_W, ImGui.Mod_Super}, {ImGui.Key_X, ImGui.Mod_Ctrl} },
+    paste          = { {ImGui.Key_Y, ImGui.Mod_Super}, {ImGui.Key_V, ImGui.Mod_Ctrl} },
+    mark           = { {ImGui.Key_Space, ImGui.Mod_Super} },
+    quit           = { ImGui.Key_Enter },
+    upOctave       = { {ImGui.Key_8, ImGui.Mod_Shift} },
     downOctave     = { ImGui.Key_Slash },
     noteOff        = { ImGui.Key_1 },
-    growNote          = { ImGui.Key_RightBracket },
-    shrinkNote        = { ImGui.Key_LeftBracket },
-    nudgeBack    = { { ImGui.Key_LeftBracket,  ImGui.Mod_Ctrl } },
-    nudgeForward = { { ImGui.Key_RightBracket, ImGui.Mod_Ctrl } },
+    shrinkNote     = { {ImGui.Key_LeftBracket, ImGui.Mod_Shift} },
+    growNote       = { {ImGui.Key_RightBracket, ImGui.Mod_Shift} },
+    nudgeBack      = { ImGui.Key_LeftBracket },
+    nudgeForward   = { ImGui.Key_RightBracket },
     playPause      = { ImGui.Key_Space },
     playFromTop    = { ImGui.Key_F6 },
     playFromCursor = { ImGui.Key_F7 },
     stop           = { ImGui.Key_F8 },
-    addNoteCol     = { { ImGui.Key_N, ImGui.Mod_Ctrl } },
-    addTypedCol    = { { ImGui.Key_T, ImGui.Mod_Ctrl } },
-    cycleTuning    = { { ImGui.Key_T, ImGui.Mod_Super } },
-    transposeUp    = { { ImGui.Key_Equal, ImGui.Mod_Shift } },
-    transposeDown  = { { ImGui.Key_Minus, ImGui.Mod_Shift } },
-    hideExtraCol   = { { ImGui.Key_H, ImGui.Mod_Ctrl } },
-    toggleDelay    = { { ImGui.Key_D, ImGui.Mod_Ctrl } },
-    doubleRPB      = { { ImGui.Key_Equal, ImGui.Mod_Super } },
-    halveRPB       = { { ImGui.Key_Minus, ImGui.Mod_Super } },
-    setRPB         = { { ImGui.Key_R,     ImGui.Mod_Ctrl } },
+    addNoteCol     = { {ImGui.Key_N, ImGui.Mod_Ctrl} },
+    addTypedCol    = { {ImGui.Key_T, ImGui.Mod_Ctrl} },
+    cycleTuning    = { {ImGui.Key_T, ImGui.Mod_Super} },
+    transposeUp    = { {ImGui.Key_Equal, ImGui.Mod_Shift} },
+    transposeDown  = { {ImGui.Key_Minus, ImGui.Mod_Shift} },
+    hideExtraCol   = { {ImGui.Key_H, ImGui.Mod_Ctrl} },
+    toggleDelay    = { {ImGui.Key_D, ImGui.Mod_Ctrl} },
+    doubleRPB      = { {ImGui.Key_Equal, ImGui.Mod_Super} },
+    halveRPB       = { {ImGui.Key_Minus, ImGui.Mod_Super} },
+    setRPB         = { {ImGui.Key_R, ImGui.Mod_Ctrl} },
   }
 
   for i = 0, 9 do
-    keymap['advBy' .. i] = { { ImGui.Key_0 + i, ImGui.Mod_Ctrl } }
+    keymap['advBy' .. i] = { {ImGui.Key_0 + i, ImGui.Mod_Ctrl} }
   end
 
   ---------- INPUT HANDLING
