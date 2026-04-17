@@ -287,18 +287,6 @@ function newTrackerManager(mm, cm)
 
     ----- High-level ops
 
-    local function assignPb(pb, update)
-      if update.ppq then print('um: not allowed to change ppq of pb events'); return end
-      local chan = pb.chan
-      local P = pb.ppq
-      local L = update.val
-      if not L then return end
-      local Pp    = nextLogicalChange(chan, P)
-      local delta = L - logicalAt(chan, P)
-      retuneLowlevel(chan, P, Pp, delta)
-      tidyPbsLowlevel(chan)
-    end
-
     local function addPb(pb)
       local chan = pb.chan
       local P = pb.ppq
@@ -315,6 +303,24 @@ function newTrackerManager(mm, cm)
       local P = pb.ppq
       local Pp = nextLogicalChange(chan, P)
       retuneLowlevel(chan, P, Pp, logicalBefore(chan, P) - logicalAt(chan, P))
+      tidyPbsLowlevel(chan)
+    end
+
+    local function assignPb(pb, update)
+      if update.ppq and update.ppq ~= pb.ppq then
+        local chan   = pb.chan
+        local newVal = update.val or logicalAt(chan, pb.ppq)
+        deletePb(pb)
+        addPb({ chan = chan, ppq = update.ppq, val = newVal })
+        return
+      end
+      local chan = pb.chan
+      local P = pb.ppq
+      local L = update.val
+      if not L then return end
+      local Pp    = nextLogicalChange(chan, P)
+      local delta = L - logicalAt(chan, P)
+      retuneLowlevel(chan, P, Pp, delta)
       tidyPbsLowlevel(chan)
     end
 

@@ -424,14 +424,15 @@ function newViewManager(tm, cm)
   local function isNote(e) return e and e.endppq end
 
   -- between: iterate events with ppq in [lo, hi). Assumes ppq-sorted input.
-  local function between(events, lo, hi)
+  local function between(events, lo, hi, filter)
+    filter = filter or function(e) return true end
     local i = 0
     return function()
       while true do
         i = i + 1
         local evt = events[i]
         if not evt or evt.ppq >= hi then return end
-        if evt.ppq >= lo then return evt end
+        if evt.ppq >= lo and filter(evt) then return evt end
       end
     end
   end
@@ -693,16 +694,65 @@ function newViewManager(tm, cm)
     end
   end
 
-  ---------- NOTE DURATION
-
-  local function cursorNoteInOrAfter()
-    local col = grid.cols[cursorCol]
-    local cursorPPQ = rowToPPQ(cursorRow)
-    if not (col and col.type == 'note') then return end
-    local note = util:seek(col.events, 'at-or-before', cursorPPQ, function (e) return e and e.endppq and e.endppq > cursorPPQ end)
-    if note then return col, note end
-    return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
+  ---------- SELECTION OPERATIONS
+  
+  local function selBounds()
+    local r1, r2, c1, c2, g1, g2
+    if sel then
+      r1, r2 = sel.row1, sel.row2
+      c1, c2 = sel.col1, sel.col2
+      g1, g2 = sel.selgrp1, sel.selgrp2
+    else
+      r1, r2 = cursorRow, cursorRow
+      c1, c2 = cursorCol, cursorCol
+      g1, g2 = cursorSelGrp(), cursorSelGrp()
+    end
+    return r1, r2, c1, c2, g1, g2, rowToPPQ(r1), rowToPPQ(r2 + 1)
   end
+
+  local function selectedEvents()
+    local r1, r2, c1, c2, g1, g2, startPPQ, endPPQ = selBounds()
+    local singleNoteCol = c1 == c2 and g1 == g2
+      and grid.cols[c1] and grid.cols[c1].type == 'note'
+    local noteMode = 'delete'
+    if singleNoteCol and g1 == 2 then noteMode = 'vel'
+    elseif singleNoteCol and g1 == 3 then noteMode = 'delay' end
+
+    local result = {}
+    for ci = c1, c2 do
+      local col = grid.cols[ci]
+      if not col then goto nextCol end
+
+      local locs = {}
+      for evt in between(col.events, startPPQ, endPPQ) do
+        locs[evt.loc] = evt
+      end
+
+      util:add(result, { col = col, locs = locs })
+      ::nextCol::
+    end
+    return result, noteMode
+  end
+
+  local function deleteSelection()
+    local groups, noteMode = selectedEvents()
+
+    for _, group in ipairs(groups) do
+      local col, locs = group.col, group.locs
+      if col.type == 'note' then
+        if     noteMode == 'vel'   then queueResetVelocities(col, locs)
+        elseif noteMode == 'delay' then queueResetDelays(col, locs)
+        else                            queueDeleteNotes(col, locs) end
+      else
+        queueDeleteCCs(col, locs)
+      end
+    end
+
+    tm:flush()
+    selClear()
+  end
+
+  ---------- NOTE DURATION
 
   local function cursorNoteBefore()
     local col = grid.cols[cursorCol]
@@ -718,7 +768,43 @@ function newViewManager(tm, cm)
     return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
   end
 
+  local function applyNoteOff(col, last, targetPPQ, undo)
+    if undo then
+      local next = util:seek(col.events, 'at-or-after', targetPPQ, isNote)
+      tm:assignEvent('note', last, { endppq = next and next.ppq or length })
+    elseif last.ppq >= targetPPQ then
+      tm:deleteEvent('note', last)
+    else
+      local newEnd = util:clamp(targetPPQ, last.ppq + 1, overlapLimit(col, last))
+      tm:assignEvent('note', last, { endppq = newEnd })
+    end
+  end
+
   local function noteOff()
+    if sel then
+      local targetPPQ = rowToPPQ(sel.row1)
+      local nextPPQ   = rowToPPQ(sel.row1 + 1)
+
+      local hits = {}
+      for ci = sel.col1, sel.col2 do
+        local col = grid.cols[ci]
+        if col and col.type == 'note' then
+          local last = util:seek(col.events, 'before', nextPPQ, isNote)
+          if last then util:add(hits, { col = col, note = last }) end
+        end
+      end
+      if #hits == 0 then return end
+
+      local undo = true
+      for _, h in ipairs(hits) do
+        if h.note.endppq ~= targetPPQ then undo = false; break end
+      end
+
+      for _, h in ipairs(hits) do applyNoteOff(h.col, h.note, targetPPQ, undo) end
+      tm:flush()
+      return
+    end
+
     local col = grid.cols[cursorCol]
     local cursorPPQ = rowToPPQ(cursorRow)
     local nextCursorPPQ = rowToPPQ(cursorRow + 1)
@@ -726,39 +812,91 @@ function newViewManager(tm, cm)
 
     local last = util:seek(col.events, 'before', nextCursorPPQ, isNote)
     if not last then return end
-    if last.endppq == cursorPPQ then
-      local next = util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
-      tm:assignEvent('note', last, { endppq = next and next.ppq or length })
-    elseif last.ppq >= cursorPPQ then
-      tm:deleteEvent('note', last)
-    else
-      local newEnd = util:clamp(cursorPPQ, last.ppq + 1, overlapLimit(col, last))
-      tm:assignEvent('note', last, { endppq = newEnd })
-    end
+    applyNoteOff(col, last, cursorPPQ, last.endppq == cursorPPQ)
     tm:flush()
   end
 
-  local function adjustDuration(rowDelta)
-    local col, note = cursorNoteBefore()
-    if not note then return end
-
-    local newRow = util:clamp(ppqToRow(note.endppq) + rowDelta, 0, grid.numRows - 1)
+  local function adjustDurationCore(col, note, rowDelta)
+    local newRow = util:clamp(ppqToRow(note.endppq) + rowDelta, 0, grid.numRows)
           newRow = math.floor(newRow / rowDelta) * rowDelta
     local minPPQ = math.min(note.endppq, rowToPPQ(math.floor(ppqToRow(note.ppq)) + 1))
     local maxPPQ = nextNoteStart(col, note, true)
     local newPPQ = util:clamp(rowToPPQ(newRow), minPPQ, maxPPQ)
     tm:assignEvent('note', note, { endppq = newPPQ })
+  end
+
+  local function adjustDuration(rowDelta)
+    if sel then
+      for _, group in ipairs(selectedEvents()) do
+        if group.col.type == 'note' then
+          for _, note in pairs(group.locs) do
+            adjustDurationCore(group.col, note, rowDelta)
+          end
+        end
+      end
+    else
+      local col, note = cursorNoteBefore()
+      if note then adjustDurationCore(col, note, rowDelta) end
+    end
     tm:flush()
   end
 
+  local function adjustPositionMulti(rowDelta)
+    if rowDelta == 0 then return end
+    local runs = {}
+    for _, g in ipairs(selectedEvents()) do
+      if g.col.type == 'note' then
+        local ns = {}
+        for _, n in pairs(g.locs) do util:add(ns, n) end
+        if #ns > 0 then
+          table.sort(ns, function(a, b) return a.ppq < b.ppq end)
+          if rowDelta > 0 then
+            local room = math.floor(ppqToRow(nextNoteStart(g.col, ns[#ns], false)) - ppqToRow(ns[#ns].endppq))
+            if room < rowDelta then return end
+          else
+            local room = math.ceil(ppqToRow(lastNoteEnd(g.col, ns[1], false)) - ppqToRow(ns[1].ppq))
+            if room > rowDelta then return end
+          end
+          util:add(runs, { col = g.col, notes = ns })
+        end
+      end
+    end
+    if #runs == 0 then return end
+
+    -- resizeNote moves PBs in the note's ppq range; within each run, process in
+    -- the direction that keeps shifted PBs out of unprocessed notes' ranges.
+    for _, r in ipairs(runs) do
+      local notes = r.notes
+      local s, e, step = 1, #notes, 1
+      if rowDelta > 0 then s, e, step = #notes, 1, -1 end
+      for i = s, e, step do
+        local n = notes[i]
+        tm:assignEvent('note', n, {
+          ppq    = rowToPPQ(ppqToRow(n.ppq)    + rowDelta),
+          endppq = rowToPPQ(ppqToRow(n.endppq) + rowDelta),
+        })
+      end
+    end
+    tm:flush()
+
+    local maxRow = grid.numRows - 1
+    sel.row1      = util:clamp(sel.row1      + rowDelta, 0, maxRow)
+    sel.row2      = util:clamp(sel.row2      + rowDelta, 0, maxRow)
+    selAnchor.row = util:clamp(selAnchor.row + rowDelta, 0, maxRow)
+    cursorRow     = cursorRow + rowDelta
+    clampCursor()
+  end
+
   local function adjustPosition(rowDelta)
-    local col, note = cursorNoteInOrAfter()
+    if sel then return adjustPositionMulti(rowDelta) end
+
+    local col, note = cursorNoteBefore()
     if not note then return end
 
     local absDelta = math.abs(rowDelta)
     local rawRow   = ppqToRow(note.ppq) + rowDelta
     local reqRow   = (rowDelta > 0 and math.ceil(rawRow / absDelta) or math.floor(rawRow / absDelta)) * absDelta
-    
+
     local curLen    = ppqToRow(note.endppq) - ppqToRow(note.ppq)
     local minLen    = math.min(absDelta, curLen)
     local minPPQ    = lastNoteEnd(col, note, false)
@@ -790,7 +928,78 @@ function newViewManager(tm, cm)
     tm:assignEvent('note', note, { ppq = newPPQ, endppq = newEndPPQ })
     tm:flush()
   end
-    
+
+  local copySelection  -- forward decl; assigned in CLIPBOARD section, used by deleteRow
+
+  local function insertRowCore(col, topRow, numRows)
+    local C = rowToPPQ(topRow)
+    local R = rowToPPQ(topRow + numRows) - C
+
+    local shifted = {}
+    for e in between(col.events, C, length) do util:add(shifted, e) end
+    for i = #shifted, 1, -1 do
+      local e = shifted[i]
+      local newPpq = e.ppq + R
+      if newPpq >= length then
+        tm:deleteEvent(col.type, e)
+      elseif isNote(e) then
+        tm:assignEvent('note', e, { ppq = newPpq, endppq = math.min(e.endppq + R, length) })
+      else
+        tm:assignEvent(col.type, e, { ppq = newPpq })
+      end
+    end
+
+    if col.type == 'note' then
+      local spanning = util:seek(col.events, 'before', C, isNote)
+      if spanning and spanning.endppq > C then
+        tm:assignEvent('note', spanning, { endppq = math.min(spanning.endppq + R, length) })
+      end
+    end
+  end
+
+  local function deleteRowCore(col, topRow, numRows)
+    local C = rowToPPQ(topRow)
+    local D = rowToPPQ(topRow + numRows)
+    local R = D - C
+
+    if col.type == 'note' then
+      local spanning = util:seek(col.events, 'before', C, isNote)
+      if spanning and spanning.endppq > C then
+        local newEnd = spanning.endppq > D and spanning.endppq - R or C
+        tm:assignEvent('note', spanning, { endppq = newEnd })
+      end
+    end
+
+    local touched = {}
+    for e in between(col.events, C, length) do util:add(touched, e) end
+    for _, e in ipairs(touched) do
+      if e.ppq < D then
+        tm:deleteEvent(col.type, e)
+      elseif isNote(e) then
+        tm:assignEvent('note', e, { ppq = e.ppq - R, endppq = e.endppq - R })
+      else
+        tm:assignEvent(col.type, e, { ppq = e.ppq - R })
+      end
+    end
+  end
+
+  local function forEachRowOp(core, preSel)
+    if sel then
+      if preSel then preSel() end
+      local n = sel.row2 - sel.row1 + 1
+      for ci = sel.col1, sel.col2 do
+        local col = grid.cols[ci]
+        if col then core(col, sel.row1, n) end
+      end
+    else
+      for _, col in ipairs(grid.cols) do core(col, cursorRow, 1) end
+    end
+    tm:flush()
+  end
+
+  local function insertRow() forEachRowOp(insertRowCore) end
+  local function deleteRow() forEachRowOp(deleteRowCore, copySelection) end
+
   --   local duration = note.endppq - note.ppq
   --   local reqPPQ
   --   if alignedRow < 0 then
@@ -905,64 +1114,6 @@ function newViewManager(tm, cm)
     for _, evt in pairs(locs) do tm:deleteEvent(col.type, evt) end
   end
 
-  ---------- SELECTION OPERATIONS
-
-  local function selBounds()
-    local r1, r2, c1, c2, g1, g2
-    if sel then
-      r1, r2 = sel.row1, sel.row2
-      c1, c2 = sel.col1, sel.col2
-      g1, g2 = sel.selgrp1, sel.selgrp2
-    else
-      r1, r2 = cursorRow, cursorRow
-      c1, c2 = cursorCol, cursorCol
-      g1, g2 = cursorSelGrp(), cursorSelGrp()
-    end
-    return r1, r2, c1, c2, g1, g2, rowToPPQ(r1), rowToPPQ(r2 + 1)
-  end
-
-  local function selectedEvents()
-    local r1, r2, c1, c2, g1, g2, startPPQ, endPPQ = selBounds()
-    local singleNoteCol = c1 == c2 and g1 == g2
-      and grid.cols[c1] and grid.cols[c1].type == 'note'
-    local noteMode = 'delete'
-    if singleNoteCol and g1 == 2 then noteMode = 'vel'
-    elseif singleNoteCol and g1 == 3 then noteMode = 'delay' end
-
-    local result = {}
-    for ci = c1, c2 do
-      local col = grid.cols[ci]
-      if not col then goto nextCol end
-
-      local locs = {}
-      for evt in between(col.events, startPPQ, endPPQ) do
-        locs[evt.loc] = evt
-      end
-
-      util:add(result, { col = col, locs = locs })
-      ::nextCol::
-    end
-    return result, noteMode
-  end
-
-  local function deleteSelection()
-    local groups, noteMode = selectedEvents()
-
-    for _, group in ipairs(groups) do
-      local col, locs = group.col, group.locs
-      if col.type == 'note' then
-        if     noteMode == 'vel'   then queueResetVelocities(col, locs)
-        elseif noteMode == 'delay' then queueResetDelays(col, locs)
-        else                            queueDeleteNotes(col, locs) end
-      else
-        queueDeleteCCs(col, locs)
-      end
-    end
-
-    tm:flush()
-    selClear()
-  end
-
   ---------- CLIPBOARD
 
   local function clipboardSave(clip)
@@ -1057,7 +1208,7 @@ function newViewManager(tm, cm)
     return { mode = 'multi', numRows = numRows, startType = cols[1].type, cols = cols }
   end
 
-  local function copySelection()
+  copySelection = function()
     local clip = collectSelection()
     if clip then clipboardSave(clip) end
   end
@@ -1324,6 +1475,38 @@ function newViewManager(tm, cm)
     end
   end
 
+  -- Duplicate the current selection (or cursor row) immediately below,
+  -- overwriting whatever is there. Shifts the selection down by numRows so
+  -- repeated invocations stack downward. Preserves the user's clipboard.
+  local function duplicateDown()
+    local clip = collectSelection()
+    if not clip then return end
+    local r1, r2, c1, c2, g1, g2 = selBounds()
+    local numRows   = r2 - r1 + 1
+    local targetRow = r2 + 1
+    if targetRow >= (grid.numRows or 0) then return end
+
+    local savedRow, savedCol, savedStop = cursorRow, cursorCol, cursorStop
+    cursorRow, cursorCol = targetRow, c1
+    local col = grid.cols[c1]
+    if col then
+      for s, g in ipairs(col.selGroups) do
+        if g == g1 then cursorStop = s; break end
+      end
+    end
+    clampCursor()
+
+    if clip.mode == 'single' then pasteSingle(clip) else pasteMulti(clip) end
+
+    cursorRow, cursorCol, cursorStop = savedRow + numRows, savedCol, savedStop
+    clampCursor()
+    if sel then
+      sel = { row1 = r1 + numRows, row2 = r2 + numRows,
+              col1 = c1, col2 = c2, selgrp1 = g1, selgrp2 = g2 }
+      selAnchor = { row = sel.row1, col = c1, selgrp = g1 }
+    end
+  end
+
   ---------- TIME SIGNATURE HELPERS
 
   local function timeSigAt(ppq)
@@ -1484,6 +1667,7 @@ function newViewManager(tm, cm)
     copy           = function() copySelection(); clearMark() end,
     cut            = function() cutSelection();  clearMark() end,
     paste          = function() pasteClipboard() end,
+    duplicateDown  = function() duplicateDown() end,
     upOctave       = function() setcfg('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
     downOctave     = function() setcfg('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
     noteOff        = noteOff,
@@ -1491,6 +1675,8 @@ function newViewManager(tm, cm)
     shrinkNote     = function() adjustDuration(-1) end,
     nudgeBack    = function() adjustPosition(-1) end,
     nudgeForward = function() adjustPosition(1) end,
+    insertRow    = function() insertRow() end,
+    deleteRow    = function() deleteRow() end,
     transposeUp   = function() transpose(1) end,
     transposeDown = function() transpose(-1) end,
     play           = function() tm:play() end,
