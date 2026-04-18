@@ -89,7 +89,7 @@ function newRenderManager(vm, cm)
       local val     = rowLen > 0 and math.floor((evt.ppq - basePPQ) / rowLen * 0x80 + 0.5) or 0
       text = text .. ' ' .. (val > 0 and string.format('%02X', val) or '··')
     end
-    return text, evt.overflow and 'overflow'
+    return text
   end
 
   local function renderPB(evt)
@@ -122,7 +122,7 @@ function newRenderManager(vm, cm)
   local colourDefaults = {
     bg           = {218/256, 214/256, 201/256, 1  },
     text         = { 48/256,  48/256,  33/256, 1  },
-    overflow     = {150/256,  90/256,  35/256, 1  },
+    overflow     = {190/256,  90/256,  35/256, 1  },
     negative     = {218/256,  48/256,  33/256, 1  },
     textBar      = { 48/256,  48/256,  33/256, 1  },
     header       = { 48/256,  48/256,  33/256, 1  },
@@ -137,10 +137,13 @@ function newRenderManager(vm, cm)
     scrollHandle = { 48/256,  48/256,  33/256, 1  },
     scrollBg     = {218/256, 214/256, 201/256, 1  },
     accent       = {159/256, 147/256, 115/256, 1  },
+    mute         = {218/256,  48/256,  33/256, 1  },
+    solo         = {220/256, 180/256,  50/256, 1  },
     separator    = {159/256, 147/256, 115/256, 0.3},
     tail         = {100/256, 130/256, 160/256, 0.15},
 --    tailBord     = {100/256, 130/256, 160/256, 0.4},
     tailBord     = {140/256, 170/256, 200/256, 1},
+    ghost        = {100/256, 130/256, 160/256, 0.9},
   }
 
   local colourCache = {}
@@ -267,7 +270,7 @@ function newRenderManager(vm, cm)
     -- Clear last frame's layout; then lay out visible columns left-to-right,
     -- accumulating each channel's x/width as we go.
     for _, col in ipairs(grid.cols) do col.x = nil end
-    local chanX, chanW = {}, {}
+    local chanX, chanW, chanOrder = {}, {}, {}
 
     local cx = 0
     for i = scrollCol, #grid.cols do
@@ -275,7 +278,10 @@ function newRenderManager(vm, cm)
       if cx + col.width > gridWidth then break end
       col.x = cx
       local chan = col.midiChan
-      chanX[chan] = chanX[chan] or cx
+      if chanX[chan] == nil then
+        chanX[chan] = cx
+        util:add(chanOrder, chan)
+      end
       chanW[chan] = (cx + col.width) - chanX[chan]
       cx = cx + col.width + 1
     end
@@ -283,12 +289,16 @@ function newRenderManager(vm, cm)
     local totalWidth = math.max(0, cx - 1)
     local draw = printer(ctx, gridX, gridY, gridOriginX, gridOriginY)
 
-    -- Header row 1: channel labels
+    -- Header row 1: channel labels. Colour signals mute/solo state:
+    -- solo (amber) wins over mute (red), matching the audibility semantic.
     draw:text(-GUTTER, -HEADER, 'Row', 'accent')
     for chan = 1, 16 do
       if chanX[chan] then
+        local key = vm:isChannelSoloed(chan) and 'solo'
+                 or vm:isChannelMuted(chan)  and 'mute'
+                 or 'accent'
         draw:textCentred(chanX[chan], chanX[chan] + chanW[chan] - 1,
-                         -HEADER, 'Ch ' .. chan, 'accent')
+                         -HEADER, 'Ch ' .. chan, key)
       end
     end
 
@@ -315,6 +325,12 @@ function newRenderManager(vm, cm)
 
     -- Separator below headers (1/3 up from the sub-label row)
     draw:hLine(-GUTTER, totalWidth - 1, 0, 'header', -1/3)
+
+    -- Vertical dividers between channels, sitting in the inter-column gap
+    for i = 1, #chanOrder - 1 do
+      local chan = chanOrder[i]
+      draw:vLine(chanX[chan] + chanW[chan], -HEADER, gridHeight - 1, 'separator')
+    end
 
     -- Rows
     for y = 0, gridHeight - 1 do
@@ -377,8 +393,17 @@ function newRenderManager(vm, cm)
       for x, col in ipairs(grid.cols) do
         if col.x then
           local evt = col.cells and col.cells[row]
-          local text, textCol = renderCell(evt, col, row)
-          textCol = textCol or 'text'
+          local ghost = not evt and col.ghosts and col.ghosts[row]
+          local text, textCol
+          if ghost then
+            text    = renderCell({ val = ghost.val }, col, row)
+            textCol = 'ghost'
+          else
+            text, textCol = renderCell(evt, col, row)
+            if col.overflow and col.overflow[row] then textCol = 'overflow' end
+            textCol = textCol or 'text'
+          end
+          if vm:isChannelEffectivelyMuted(col.midiChan) then textCol = 'inactive' end
           local cx = col.x
           for ch in text:gmatch(utf8.charpattern) do
             draw:text(cx, y, ch, ch == '·' and 'inactive' or textCol)
@@ -498,28 +523,33 @@ function newRenderManager(vm, cm)
     insertRow      = { {ImGui.Key_DownArrow, ImGui.Mod_Ctrl} },
     deleteRow      = { {ImGui.Key_UpArrow, ImGui.Mod_Ctrl} },
     delete         = { ImGui.Key_Period },
+    interpolate    = { {ImGui.Key_I, ImGui.Mod_Ctrl} },
     selectUp       = { {ImGui.Key_UpArrow, ImGui.Mod_Shift} },
     selectDown     = { {ImGui.Key_DownArrow, ImGui.Mod_Shift} },
     selectLeft     = { {ImGui.Key_LeftArrow, ImGui.Mod_Shift} },
     selectRight    = { {ImGui.Key_RightArrow, ImGui.Mod_Shift} },
-    mark           = { {ImGui.Key_Space, ImGui.Mod_Super} },
+    cycleBlock     = { {ImGui.Key_Space, ImGui.Mod_Super} },
+    cycleVBlock    = { {ImGui.Key_O, ImGui.Mod_Super} },
+    swapBlockEnds  = { {ImGui.Key_GraveAccent, ImGui.Mod_Ctrl} },
     selectClear    = { {ImGui.Key_G, ImGui.Mod_Super} },
     cut            = { {ImGui.Key_W, ImGui.Mod_Super}, {ImGui.Key_X, ImGui.Mod_Ctrl} },
     copy           = { {ImGui.Key_W, ImGui.Mod_Ctrl}, {ImGui.Key_C, ImGui.Mod_Ctrl} },
     paste          = { {ImGui.Key_Y, ImGui.Mod_Super}, {ImGui.Key_V, ImGui.Mod_Ctrl} },
     duplicateDown  = { {ImGui.Key_D, ImGui.Mod_Ctrl} },
+    duplicateUp    = { {ImGui.Key_D, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
     deleteSel      = { ImGui.Key_Delete },
-    transposeUp    = { {ImGui.Key_Equal, ImGui.Mod_Shift} },
-    transposeDown  = { {ImGui.Key_Minus, ImGui.Mod_Shift} },
+    nudgeCoarseUp   = { ImGui.Key_Equal },
+    nudgeCoarseDown = { ImGui.Key_Minus },
+    nudgeFineUp     = { {ImGui.Key_Equal, ImGui.Mod_Shift} },
+    nudgeFineDown   = { {ImGui.Key_Minus, ImGui.Mod_Shift} },
     addNoteCol     = { {ImGui.Key_N, ImGui.Mod_Ctrl} },
     addTypedCol    = { {ImGui.Key_T, ImGui.Mod_Ctrl} },
-    toggleDelay    = { {ImGui.Key_L, ImGui.Mod_Ctrl} },
     doubleRPB      = { {ImGui.Key_Equal, ImGui.Mod_Super} },
     halveRPB       = { {ImGui.Key_Minus, ImGui.Mod_Super} },
     setRPB         = { {ImGui.Key_R, ImGui.Mod_Ctrl} },
     hideExtraCol   = { {ImGui.Key_H, ImGui.Mod_Ctrl} },
-    upOctave       = { {ImGui.Key_8, ImGui.Mod_Shift} },
-    downOctave     = { ImGui.Key_Slash },
+    inputOctaveUp   = { {ImGui.Key_8, ImGui.Mod_Shift} },
+    inputOctaveDown = { ImGui.Key_Slash },
     playPause      = { ImGui.Key_Space },
     playFromTop    = { ImGui.Key_F6 },
     playFromCursor = { ImGui.Key_F7 },
@@ -555,18 +585,39 @@ function newRenderManager(vm, cm)
     local grid = vm.grid
     local cursorRow, cursorCol, cursorStop, scrollRow, scrollCol = vm:cursor()
 
-    local clicked = ImGui.IsMouseClicked(ctx, 0)
-    local held    = ImGui.IsMouseDown(ctx, 0)
+    local clicked      = ImGui.IsMouseClicked(ctx, 0)
+    local rightClicked = ImGui.IsMouseClicked(ctx, 1)
+    local held         = ImGui.IsMouseDown(ctx, 0)
+
+    -- Right-click on the channel-header row toggles that channel's mute.
+    if rightClicked and ImGui.IsWindowHovered(ctx) then
+      local mouseX, mouseY = ImGui.GetMousePos(ctx)
+      local charY = math.floor((mouseY - gridOriginY) / gridY)
+      local col, _, fracX = nearestStop(mouseX, mouseY)
+      if col and charY == -HEADER and fracX >= 0 then
+        local last = grid.cols[col]
+        if fracX < last.x + last.width + 1 then
+          vm:toggleChannelMute(last.midiChan)
+        end
+      end
+      return
+    end
 
     if clicked and ImGui.IsWindowHovered(ctx) then
       local mouseX, mouseY = ImGui.GetMousePos(ctx)
       local charY = math.floor((mouseY - gridOriginY) / gridY)
       local col, stop, fracX = nearestStop(mouseX, mouseY)
       if not col then return end
-      if charY < 0 or charY >= gridHeight then return end
+      if charY < -HEADER or charY >= gridHeight then return end
       if fracX < 0 then return end
       local last = grid.cols[col]
       if fracX >= last.x + last.width + 1 then return end
+
+      if charY < 0 then
+        if charY == -HEADER then vm:selectChannel(last.midiChan)
+        else vm:selectColumn(col) end
+        return
+      end
 
       local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
 
@@ -724,7 +775,10 @@ function newRenderManager(vm, cm)
       local rv, buf = ImGui.InputText(ctx, '##modal', modalState.buf,
         ImGui.InputTextFlags_EnterReturnsTrue)
       if rv then
-        modalState.callback(buf)
+        local ok, err = pcall(modalState.callback, buf)
+        if not ok then
+          reaper.ShowConsoleMsg('\nModal callback error: ' .. tostring(err) .. '\n')
+        end
         modalState = nil
         ImGui.CloseCurrentPopup(ctx)
       elseif ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then

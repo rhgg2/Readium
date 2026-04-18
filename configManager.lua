@@ -255,6 +255,11 @@ function newConfigManager()
 
   -- Writing
 
+  -- Callbacks receive { config = true, key = <name> } for targeted
+  -- writes, letting consumers filter on keys they actually depend on.
+  -- Bulk paths (setContext, assign) fire without a key — consumers that
+  -- care must treat keyless fires as "any key might have changed".
+
   function cm:set(level, key, value)
     if not checkLevel(level) then return end
     ensureCache()
@@ -262,7 +267,7 @@ function newConfigManager()
     cache[level] = cache[level] or {}
     cache[level][key] = value
     savers[level](cache[level])
-    fire({ config = true }, cm)
+    fire({ config = true, key = key }, cm)
   end
 
   function cm:remove(level, key)
@@ -272,7 +277,7 @@ function newConfigManager()
     if cache[level] then
       cache[level][key] = nil
       savers[level](cache[level])
-      fire({ config = true }, cm)
+      fire({ config = true, key = key }, cm)
     end
   end
 

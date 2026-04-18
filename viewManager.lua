@@ -23,9 +23,10 @@
 --
 --   grid.cols    : flat array of all grid columns across all channels
 --     Each column: { id, type, label, events, width, midiChan,
---                    cells = { [y] = event } }
+--                    cells = { [y] = event }, overflow = { [y] = true } }
 --       width: character width (6 for note columns, 4 for pitchbend, 2 for others)
---       cells: row-indexed events (y is 0-based row index, evt.overflow if >1 at same row)
+--       cells: row-indexed events (y is 0-based row index)
+--       overflow: rows where >1 event landed (only the first is kept in cells)
 --
 -- DISPLAY PARAMETERS
 --   resolution: PPQ per quarter note (from tm:resolution() on take change)
@@ -81,6 +82,20 @@ function newViewManager(tm, cm)
     chanLastCol  = {},
   }
 
+  -- Scalar column types whose consecutive events can be interpolated and
+  -- ghost-rendered. pa lives inside note columns and is not (yet) supported.
+  local ghostable = { cc = true, pb = true, at = true, pc = true }
+
+  -- Interpolation shape cycle. 'step' means no interpolation (no ghosts);
+  -- 'bezier' is excluded from the cycle but honoured if already set.
+  local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end' }
+  local function nextShape(s)
+    for i, n in ipairs(shapeCycle) do
+      if n == s then return shapeCycle[(i % #shapeCycle) + 1] end
+    end
+    return 'linear'
+  end
+
   -- Lane of a note grid column: its 1-indexed position among note
   -- columns in the same channel. Returns nil for non-note columns.
   local function laneOf(col)
@@ -107,6 +122,42 @@ function newViewManager(tm, cm)
 
   local function setcfg(lev, key, val)
     if cm then cm:set(lev, key, val) end
+  end
+
+  ---------- CHANNEL MUTE / SOLO
+  --
+  -- mute and solo are both take-persisted maps ({[chan]=true}), treated
+  -- identically in code. Effective mute = persistent mute ∪ solo-implied
+  -- mute: when any channel is soloed, non-soloed channels are forced
+  -- muted and soloed channels are forced audible (DAW convention — solo
+  -- overrides the persistent mute flag). Persisting both is necessary so
+  -- that on reload tm's lastMuteSet matches the muted flags already on
+  -- the MIDI wire; otherwise reopening a take where solo had silenced
+  -- channels would unmute them.
+
+  local effectiveMuted = {}  -- cached for cheap per-cell render queries
+
+  local function recomputeEffectiveMute()
+    local m = util:clone(cfg('mutedChannels', {}) or {})
+    local s = cfg('soloedChannels', {}) or {}
+    if next(s) then
+      for c = 1, 16 do
+        if s[c] then m[c] = nil
+        else        m[c] = true end
+      end
+    end
+    effectiveMuted = m
+  end
+
+  local function pushMute()
+    recomputeEffectiveMute()
+    if tm then tm:setMutedChannels(effectiveMuted) end
+  end
+
+  local function toggleChannelFlag(key, chan)
+    local s = util:clone(cfg(key, {}) or {})
+    s[chan] = (not s[chan]) or nil
+    setcfg('take', key, s)
   end
 
   ---------- MICROTUNING LENS
@@ -224,53 +275,137 @@ function newViewManager(tm, cm)
     end
   end
 
-  local selAnchor = nil  -- { row, col, selgrp } — fixed end of selection
+  local selAnchor = nil  -- { row, col, stop } — fixed end of selection
+  local hBlockScope   = 0    -- 0 inactive, 1 col, 2 channel, 3 all
+  local vBlockScope   = 0    -- 0 inactive, 1 beat, 2 bar, 3 all-rows
+  local function inBlock() return hBlockScope > 0 or vBlockScope > 0 end
+  -- Drop the sticky flags but leave sel/selAnchor intact, so the just-edited
+  -- region stays visible while the next cursor move clears it.
+  local function unstick() hBlockScope, vBlockScope = 0, 0 end
 
-  local function cursorSelGrp()
-    local col = grid.cols[cursorCol]
-    return col and col.selGroups[cursorStop] or 1
+  local function selGrpAt(col, stop)
+    local c = grid.cols[col]
+    return c and c.selGroups[stop] or 1
+  end
+
+  local function cursorSelGrp() return selGrpAt(cursorCol, cursorStop) end
+
+  local function firstStopForSelGrp(col, g)
+    local c = grid.cols[col]
+    if not c then return 1 end
+    for s, gg in ipairs(c.selGroups) do
+      if gg == g then return s end
+    end
+    return 1
   end
 
   local function selStart()
-    selAnchor = { row = cursorRow, col = cursorCol, selgrp = cursorSelGrp() }
+    selAnchor = { row = cursorRow, col = cursorCol, stop = cursorStop }
+    local g = cursorSelGrp()
     sel = { row1 = cursorRow, row2 = cursorRow,
             col1 = cursorCol, col2 = cursorCol,
-            selgrp1 = selAnchor.selgrp, selgrp2 = selAnchor.selgrp }
+            selgrp1 = g, selgrp2 = g }
   end
 
   local function selUpdate()
     local a = selAnchor
-    local r1, r2 = a.row, cursorRow
-    local c1, c2 = a.col, cursorCol
-    local g1, g2 = a.selgrp, cursorSelGrp()
-    if r1 > r2 then r1, r2 = r2, r1 end
-    if c1 > c2 then c1, c2, g1, g2 = c2, c1, g2, g1
-    elseif c1 == c2 and g1 > g2 then g1, g2 = g2, g1 end
+    local numRows = grid.numRows or 1
+
+    local r1, r2
+    if vBlockScope == 1 or vBlockScope == 2 then
+      local unit = vBlockScope == 1 and rowPerBeat or rowPerBar
+      r1 = math.floor(cursorRow / unit) * unit
+      r2 = math.min(r1 + unit - 1, numRows - 1)
+    elseif vBlockScope == 3 then
+      r1, r2 = 0, numRows - 1
+    else
+      r1, r2 = a.row, cursorRow
+      if r1 > r2 then r1, r2 = r2, r1 end
+    end
+
+    local c1, c2, g1, g2
+    if hBlockScope == 2 then
+      local chan = grid.cols[cursorCol].midiChan
+      c1, c2 = grid.chanFirstCol[chan], grid.chanLastCol[chan]
+      g1, g2 = 1, math.huge
+    elseif hBlockScope == 3 then
+      c1, c2 = 1, #grid.cols
+      g1, g2 = 1, math.huge
+    else
+      c1, c2 = a.col, cursorCol
+      g1, g2 = selGrpAt(a.col, a.stop), cursorSelGrp()
+      if c1 > c2 then c1, c2, g1, g2 = c2, c1, g2, g1
+      elseif c1 == c2 and g1 > g2 then g1, g2 = g2, g1 end
+    end
     sel = { row1 = r1, row2 = r2, col1 = c1, col2 = c2,
             selgrp1 = g1, selgrp2 = g2 }
   end
 
-  local markMode = false
-  local function selClear() sel = nil; selAnchor = nil; markMode = false end
+  local function selClear()
+    sel = nil; selAnchor = nil
+    hBlockScope = 0; vBlockScope = 0; lastCycleRow = nil
+  end
 
-  local function clearMark() selClear(); markMode = false end
+  -- First press anchors scope 1. Repeated presses cycle sticky:
+  -- 1 (col) → 2 (channel) → 3 (all) → 1. selClear exits block mode.
+  local function cycleBlock()
+    if #grid.cols == 0 then return end
+    if not inBlock() then
+      selAnchor  = { row = cursorRow, col = cursorCol, stop = cursorStop }
+      hBlockScope = 1
+    else
+      hBlockScope = (hBlockScope % 3) + 1
+    end
+    selUpdate()
+  end
+
+  -- Mirror of cycleBlock on the vertical axis.
+  -- 1 (beat) → 2 (bar) → 3 (all rows) → 1. Composes freely with hBlockScope.
+  local function cycleVBlock()
+    if (grid.numRows or 0) == 0 then return end
+    if not inBlock() then
+      selAnchor   = { row = cursorRow, col = cursorCol, stop = cursorStop }
+      vBlockScope = 1
+    else
+      vBlockScope = (vBlockScope % 3) + 1
+    end
+    selUpdate()
+  end
+
+  local function swapBlockEnds()
+    if not (sel and selAnchor) then return end
+    if vBlockScope < 1 then
+      selAnchor.row, cursorRow = cursorRow, selAnchor.row
+    end
+    if hBlockScope < 2 then
+      selAnchor.col,  cursorCol  = cursorCol,  selAnchor.col
+      selAnchor.stop, cursorStop = cursorStop, selAnchor.stop
+    end
+    clampCursor()
+    selUpdate()
+  end
 
   local function scrollRowBy(n, selecting)
     killAudition()
-    if selecting or markMode then
+    if selecting or inBlock() then
       if not sel then selStart() end
     else selClear() end
     cursorRow = cursorRow + n
     clampCursor()
-    if selecting or markMode then selUpdate() end
+    if selecting or inBlock() then selUpdate() end
   end
 
   local function scrollStopBy(n, selecting)
     killAudition()
     if #grid.cols == 0 then return end
-    if selecting or markMode then
+    if selecting or inBlock() then
       if not sel then selStart() end
     else selClear() end
+    if hBlockScope >= 2 and selAnchor then
+      selAnchor.col  = cursorCol
+      selAnchor.stop = cursorStop
+      hBlockScope     = 1
+    end
     local dir = n > 0 and 1 or -1
     for _ = 1, math.abs(n) do
       local s = cursorStop + dir
@@ -287,7 +422,7 @@ function newViewManager(tm, cm)
       end
     end
     clampCursor()
-    if selecting or markMode then selUpdate() end
+    if selecting or inBlock() then selUpdate() end
   end
 
   -- Scroll left/right by |n| "units", where a unit is defined by the caller's
@@ -295,10 +430,10 @@ function newViewManager(tm, cm)
   local function scrollUnitBy(n, toFirstStop, toLastStop)
     killAudition()
     if #grid.cols == 0 then return end
-    if not markMode then selClear() end
+    if not inBlock() then selClear() end
     local sgn = n > 0 and 1 or -1
 
-    if markMode then
+    if inBlock() then
       for _ = 1, math.abs(n) do
         if     sgn ==  1 and cursorCol >= selAnchor.col then scrollStopBy(1);  toLastStop()
         elseif sgn ==  1                                then toLastStop();     scrollStopBy(1)
@@ -313,21 +448,21 @@ function newViewManager(tm, cm)
         end
       end
     end
-    if markMode then selUpdate() end
+    if inBlock() then selUpdate() end
   end
 
   local function scrollColBy(n)
     scrollUnitBy(n,
       function()
         cursorStop = 1
-        if markMode and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
+        if inBlock() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
           scrollStopBy(1)
           cursorStop = #grid.cols[cursorCol].stopPos
         end
       end,
       function()
         cursorStop = #grid.cols[cursorCol].stopPos
-        if markMode and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
+        if inBlock() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
           scrollStopBy(1)
           cursorStop = #grid.cols[cursorCol].stopPos
         end
@@ -351,7 +486,7 @@ function newViewManager(tm, cm)
       end)
     -- pc/pb sit left of the note column, so the raw scroll lands on pc.
     -- Snap forward to the first note column of the landing channel.
-    if not markMode then
+    if not inBlock() then
       local first, last = chanRange()
       for ci = first, last do
         if grid.cols[ci].type == 'note' then
@@ -437,15 +572,19 @@ function newViewManager(tm, cm)
     end
   end
 
-  local function truncatePitchInChannel(col, pitch, ppq, excludeEvt)
-    for ci = grid.chanFirstCol[col.midiChan], grid.chanLastCol[col.midiChan] do
+  local function truncatePitchInChannel(chan, pitch, ppq, exclCol, excludeEvt)
+    for ci = grid.chanFirstCol[chan], grid.chanLastCol[chan] do
       local gc = grid.cols[ci]
-      if gc and gc.type == 'note' and gc ~= col then
+      if gc and gc.type == 'note' and gc ~= exclCol then
         for _, evt in ipairs(gc.events) do
           if evt ~= excludeEvt and isNote(evt) and evt.pitch == pitch
             and evt.ppq <= ppq and evt.endppq > ppq then
-            tm:assignEvent('note', evt, { endppq = ppq })
-            evt.endppq = ppq
+            if evt.ppq == ppq then
+              tm:deleteEvent('note', evt)
+            else
+              tm:assignEvent('note', evt, { endppq = ppq })
+              evt.endppq = ppq
+            end
           end
         end
       end
@@ -526,7 +665,7 @@ function newViewManager(tm, cm)
         local detune = 0
         local tuning = activeTuning()
         if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
-        truncatePitchInChannel(col, pitch, evt and evt.ppq or cursorPPQ, evt)
+        truncatePitchInChannel(col.midiChan, pitch, evt and evt.ppq or cursorPPQ, col, evt)
 
         -- Existing note → repitch in place
         if isNote(evt) then
@@ -561,7 +700,7 @@ function newViewManager(tm, cm)
           oct = d
         end
         local pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
-        truncatePitchInChannel(col, pitch, evt.ppq, evt)
+        truncatePitchInChannel(col.midiChan, pitch, evt.ppq, col, evt)
         tm:assignEvent('note', evt, { pitch = pitch })
         return commit(pitch, evt.vel)
 
@@ -668,8 +807,17 @@ function newViewManager(tm, cm)
 
   local function deleteEvent()
     local col = grid.cols[cursorCol]
-    local evt = col and col.cells and col.cells[cursorRow]
-    if not (col and evt) then return end
+    if not col then return end
+    local evt = col.cells and col.cells[cursorRow]
+    if not evt then
+      -- Delete on a ghost cell: unset interpolation on the governing event.
+      local ghost = col.ghosts and col.ghosts[cursorRow]
+      if ghost then
+        tm:assignEvent(col.type, ghost.fromEvt, { shape = 'step' })
+        tm:flush()
+      end
+      return
+    end
 
     if col.type ~= 'note' then
       tm:deleteEvent(col.type, evt)
@@ -734,22 +882,41 @@ function newViewManager(tm, cm)
     return result, noteMode
   end
 
-  local function deleteSelection()
-    local groups, noteMode = selectedEvents()
+  ---------- INTERPOLATION
 
-    for _, group in ipairs(groups) do
-      local col, locs = group.col, group.locs
-      if col.type == 'note' then
-        if     noteMode == 'vel'   then queueResetVelocities(col, locs)
-        elseif noteMode == 'delay' then queueResetDelays(col, locs)
-        else                            queueDeleteNotes(col, locs) end
-      else
-        queueDeleteCCs(col, locs)
+  -- Cycle the shape of A (governing pair A→next) forward one step.
+  local function cycleShape(col, A)
+    if not A then return end
+    tm:assignEvent(col.type, A, { shape = nextShape(A.shape or 'step') })
+  end
+
+  -- Ctrl-I. Selection: advance every interior pair's shape in each scalar
+  -- column; solo: cycle the pair at the cursor, whether on a ghost or on
+  -- the real event that starts the pair.
+  local function interpolate()
+    if sel then
+      local _, _, c1, c2, _, _, startPPQ, endPPQ = selBounds()
+      for ci = c1, c2 do
+        local col = grid.cols[ci]
+        if col and ghostable[col.type] then
+          local prev
+          for evt in between(col.events, startPPQ, endPPQ) do
+            if prev then cycleShape(col, prev) end
+            prev = evt
+          end
+        end
       end
+      tm:flush()
+      return
     end
 
-    tm:flush()
-    selClear()
+    local col = grid.cols[cursorCol]
+    if not (col and ghostable[col.type]) then return end
+    local ghost = col.ghosts and col.ghosts[cursorRow]
+    local A = ghost and ghost.fromEvt
+              or (col.cells and col.cells[cursorRow])
+              or util:seek(col.events, 'before', rowToPPQ(cursorRow + 1))
+    if A then cycleShape(col, A); tm:flush() end
   end
 
   ---------- NOTE DURATION
@@ -766,6 +933,16 @@ function newViewManager(tm, cm)
     local cursorPPQ = rowToPPQ(cursorRow)
     if not (col and col.type == 'note') then return end
     return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
+  end
+
+  -- First event in col that starts anywhere in the cursor row. For note
+  -- columns, PAs are skipped.
+  local function cursorRowEvent(col)
+    if not col then return end
+    local lo, hi = rowToPPQ(cursorRow), rowToPPQ(cursorRow + 1)
+    local pred = col.type == 'note' and isNote or nil
+    local evt = util:seek(col.events, 'at-or-after', lo, pred)
+    if evt and evt.ppq < hi then return evt end
   end
 
   local function applyNoteOff(col, last, targetPPQ, undo)
@@ -1034,11 +1211,48 @@ function newViewManager(tm, cm)
   --   tm:flush()
   -- end
 
-  local function transpose(delta)
-    local col, note = cursorNoteAfter()
-    if not note then col, note = cursorNoteBefore() end
-    if not note then return end
+  -- On a note column the selgrp or selection's noteMode picks the nudge
+  -- target: selgrp 1 / default → pitch, selgrp 2 / 'vel' → velocity,
+  -- selgrp 3 / 'delay' → skip. Keys unioned so the same lookup serves
+  -- both cursor (numeric selgrp) and selection (string noteMode).
+  local noteKind = { [2] = 'vel', [3] = 'skip', vel = 'vel', delay = 'skip' }
 
+  -- Snap v to the next multiple of interval in the dir direction; values
+  -- already on a boundary move a full interval. Used for value-typed
+  -- coarse nudges. Pitch coarse is additive (octave transposition), not
+  -- a snap.
+  local function snapTo(v, dir, interval)
+    if dir > 0 then return (math.floor(v / interval) + 1) * interval end
+    return (math.ceil(v / interval) - 1) * interval
+  end
+
+  local function pitchStep(coarse)
+    if not coarse then return 1 end
+    local t = activeTuning()
+    return t and t.octaveStep or 12
+  end
+
+  -- Coarse snap interval per column type. nil = no coarse (pc).
+  local function valueInterval(col)
+    if col.type == 'cc' or col.type == 'at' then return 8
+    elseif col.type == 'pb'                 then return 100
+    end
+  end
+
+  local function valueBounds(col)
+    if col.type == 'pb' then local lim = cfg('pbRange', 2) * 100; return -lim, lim end
+    return 0, 127
+  end
+
+  -- Compute a snapped or fine-nudged target within [lo, hi]; returns the
+  -- new value (possibly unchanged).
+  local function nudgedScalar(v, lo, hi, dir, interval)
+    local target = interval and snapTo(v, dir, interval) or (v + dir)
+    return util:clamp(target, lo, hi)
+  end
+
+  local function nudgePitch(col, note, dir, coarse, audible)
+    local delta  = dir * pitchStep(coarse)
     local tuning = activeTuning()
     local pitch, detune
     if tuning then
@@ -1047,11 +1261,69 @@ function newViewManager(tm, cm)
       pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune or 0
     end
     if pitch == note.pitch and detune == (note.detune or 0) then return end
-
---    truncatePitchInChannel(col, pitch, note.ppq, note)
     tm:retuneNote(note, { pitch = pitch, detune = detune })
+    if audible then audition(pitch, note.vel, col.midiChan) end
+  end
+
+  local function nudgeVel(note, dir, coarse)
+    local newVel = nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
+    if newVel ~= note.vel then tm:assignEvent('note', note, { vel = newVel }) end
+  end
+
+  local function nudgeValue(col, evt, dir, coarse)
+    local lo, hi   = valueBounds(col)
+    local newVal   = nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
+    if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
+  end
+
+  local function applyNudge(col, evt, kind, dir, coarse, audible)
+    if     kind == 'val'   then nudgeValue(col, evt, dir, coarse)
+    elseif kind == 'vel'   then nudgeVel(evt, dir, coarse)
+    elseif kind == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
+  end
+
+  -- Column-typed nudge. Selection rule: if any note event is selected,
+  -- transpose (or velocity-nudge) the notes and leave value events alone;
+  -- otherwise nudge val on every value event. Delay-selgrp is a no-op.
+  -- Solo cursor: first event in the cursor row, column- and selgrp-typed.
+  local function nudge(dir, coarse)
+    if sel then
+      local groups, noteMode = selectedEvents()
+      local selNoteKind = noteKind[noteMode] or 'pitch'
+      if selNoteKind == 'skip' then return end
+
+      local anyNote = false
+      for _, g in ipairs(groups) do
+        if g.col.type == 'note' then
+          for _, e in pairs(g.locs) do
+            if isNote(e) then anyNote = true; break end
+          end
+          if anyNote then break end
+        end
+      end
+
+      for _, g in ipairs(groups) do
+        local kind = g.col.type == 'note' and selNoteKind
+                     or (not anyNote and 'val' or nil)
+        if kind then
+          for _, e in pairs(g.locs) do
+            if kind == 'val' or isNote(e) then
+              applyNudge(g.col, e, kind, dir, coarse, false)
+            end
+          end
+        end
+      end
+      tm:flush()
+      return
+    end
+
+    local col = grid.cols[cursorCol]
+    local evt = cursorRowEvent(col)
+    if not evt then return end
+    local kind = col.type == 'note' and (noteKind[cursorSelGrp()] or 'pitch') or 'val'
+    if kind == 'skip' then return end
+    applyNudge(col, evt, kind, dir, coarse, true)
     tm:flush()
-    audition(pitch, note.vel, col.midiChan)
   end
 
   -- Queue note deletions with predecessor endppq fixup. PAs are ignored in the
@@ -1114,6 +1386,24 @@ function newViewManager(tm, cm)
     for _, evt in pairs(locs) do tm:deleteEvent(col.type, evt) end
   end
 
+    local function deleteSelection()
+    local groups, noteMode = selectedEvents()
+
+    for _, group in ipairs(groups) do
+      local col, locs = group.col, group.locs
+      if col.type == 'note' then
+        if     noteMode == 'vel'   then queueResetVelocities(col, locs)
+        elseif noteMode == 'delay' then queueResetDelays(col, locs)
+        else                            queueDeleteNotes(col, locs) end
+      else
+        queueDeleteCCs(col, locs)
+      end
+    end
+
+    tm:flush()
+    selClear()
+  end
+
   ---------- CLIPBOARD
 
   local function clipboardSave(clip)
@@ -1133,7 +1423,7 @@ function newViewManager(tm, cm)
     local function noteEvent(evt)
       local ce = { row = ppqToRow(evt.ppq) - r1,
                    pitch = evt.pitch, vel = evt.vel, loc = evt.loc }
-      if isNote(evt) and evt.endppq < endPPQ then
+      if isNote(evt) and evt.endppq <= endPPQ then
         ce.endRow = ppqToRow(evt.endppq) - r1
       end
       return ce
@@ -1292,18 +1582,20 @@ function newViewManager(tm, cm)
       local last = util:seek(dstCol.events, 'before', startPPQ)
       local currentVel = last and last.vel or cfg('defaultVelocity', 100)
 
+      local lastNote = util:seek(dstCol.events, 'before', startPPQ, isNote)
       local nextNote = util:seek(dstCol.events, 'at-or-after', endPPQ, isNote)
       local nextNotePPQ = nextNote and nextNote.ppq or length
+      local lane = laneOf(dstCol)
 
-      local locs = {}
+      -- Delete in-region events directly: queueDeleteNotes' survivor-extension
+      -- fixup is for leaving a hole, but we're filling it. An extended lastNote
+      -- would overlap the new notes and force the allocator to spill on rebuild.
+      if lastNote and events[1] and lastNote.endppq > events[1].ppq then
+        tm:assignEvent('note', lastNote, { endppq = events[1].ppq })
+      end
       for evt in between(dstCol.events, startPPQ, endPPQ) do
-        locs[evt.loc] = evt
+        tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
       end
-
-      if last and events and events[1] and last.endppq > events[1].ppq then
-        tm:assignEvent('note', last, { endppq = events[1].ppq })
-      end
-      queueDeleteNotes(dstCol, locs)
 
       local vi = 1
       for _, ce in ipairs(events) do
@@ -1311,10 +1603,12 @@ function newViewManager(tm, cm)
           currentVel = util:clamp(velList[vi].val, 1, 127)
           vi = vi + 1
         end
+        truncatePitchInChannel(dstCol.midiChan, ce.pitch, ce.ppq, dstCol)
         tm:addEvent('note', {
           ppq = ce.ppq,
           endppq = ce.endppq or nextNotePPQ,
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
+          lane = lane,
         })
       end
       tm:flush()
@@ -1420,18 +1714,20 @@ function newViewManager(tm, cm)
       end
       table.sort(events, function(a, b) return a.ppq < b.ppq end)
 
-      -- Wipe existing events in the paste region.
+      -- Wipe existing events in the paste region. For notes, delete directly
+      -- rather than via queueDeleteNotes — its survivor-extension fixup is for
+      -- leaving a hole, but we're filling it. An extended last-survivor would
+      -- overlap the new notes and force the allocator to spill on rebuild.
+      -- Attached PAs cascade-delete with their host note.
       if dst then
         if r.type == 'note' then
           local last = util:seek(dst.events, 'before', startPPQ, isNote)
           if last and events[1] and last.endppq > events[1].ppq then
             tm:assignEvent('note', last, { endppq = events[1].ppq })
           end
-          local locs = {}
-          for evt in between(dst.events, startPPQ, endPPQ) do
-            if isNote(evt) then locs[evt.loc] = evt end
+          for evt in between(dst.events, startPPQ, endPPQ, isNote) do
+            tm:deleteEvent('note', evt)
           end
-          queueDeleteNotes(dst, locs)
         else
           for evt in between(dst.events, startPPQ, endPPQ) do
             tm:deleteEvent(r.type, evt)
@@ -1449,6 +1745,7 @@ function newViewManager(tm, cm)
       -- Write clip events.
       for _, e in ipairs(events) do
         if r.type == 'note' then
+          truncatePitchInChannel(r.chan, e.pitch, e.ppq, dst)
           tm:addEvent('note', {
             ppq = e.ppq, endppq = e.endppq or capPPQ,
             chan = r.chan, pitch = e.pitch, vel = e.vel,
@@ -1475,35 +1772,62 @@ function newViewManager(tm, cm)
     end
   end
 
-  -- Duplicate the current selection (or cursor row) immediately below,
-  -- overwriting whatever is there. Shifts the selection down by numRows so
-  -- repeated invocations stack downward. Preserves the user's clipboard.
-  local function duplicateDown()
+  -- Drop the top `trim` rows of a clip in place, re-indexing surviving events.
+  -- A note whose start row falls within the trimmed band is dropped entirely.
+  local function trimClipTop(clip, trim)
+    local function filter(events)
+      local i = 1
+      for _, e in ipairs(events) do
+        if e.row >= trim then
+          e.row = e.row - trim
+          if e.endRow then e.endRow = e.endRow - trim end
+          events[i] = e
+          i = i + 1
+        end
+      end
+      for j = #events, i, -1 do events[j] = nil end
+    end
+    clip.numRows = clip.numRows - trim
+    if clip.mode == 'single' then
+      filter(clip.events)
+    else
+      for _, c in ipairs(clip.cols) do filter(c.events) end
+    end
+  end
+
+  -- Duplicate the current selection (or cursor row) to the adjacent block in
+  -- the given direction (dir=1 below, dir=-1 above), overwriting what's there.
+  -- The selection follows so repeated invocations stack. Going up past row 0
+  -- trims the top of the clip — the start of the block is cut off, not the end.
+  -- Preserves the user's clipboard.
+  local function duplicate(dir)
     local clip = collectSelection()
     if not clip then return end
     local r1, r2, c1, c2, g1, g2 = selBounds()
     local numRows   = r2 - r1 + 1
-    local targetRow = r2 + 1
-    if targetRow >= (grid.numRows or 0) then return end
+    local targetRow = dir > 0 and r2 + 1 or r1 - numRows
+    local trim      = targetRow < 0 and -targetRow or 0
+    targetRow       = math.max(targetRow, 0)
+    local effRows   = numRows - trim
+    if effRows <= 0 or targetRow >= (grid.numRows or 0) then return end
+
+    if trim > 0 then trimClipTop(clip, trim) end
 
     local savedRow, savedCol, savedStop = cursorRow, cursorCol, cursorStop
     cursorRow, cursorCol = targetRow, c1
-    local col = grid.cols[c1]
-    if col then
-      for s, g in ipairs(col.selGroups) do
-        if g == g1 then cursorStop = s; break end
-      end
-    end
+    cursorStop = firstStopForSelGrp(c1, g1)
     clampCursor()
 
     if clip.mode == 'single' then pasteSingle(clip) else pasteMulti(clip) end
 
-    cursorRow, cursorCol, cursorStop = savedRow + numRows, savedCol, savedStop
+    local shift = targetRow - r1
+    cursorRow, cursorCol, cursorStop = savedRow + shift, savedCol, savedStop
     clampCursor()
     if sel then
-      sel = { row1 = r1 + numRows, row2 = r2 + numRows,
+      sel = { row1 = targetRow, row2 = targetRow + effRows - 1,
               col1 = c1, col2 = c2, selgrp1 = g1, selgrp2 = g2 }
-      selAnchor = { row = sel.row1, col = c1, selgrp = g1 }
+      selAnchor = { row = sel.row1, col = c1, stop = firstStopForSelGrp(c1, g1) }
+      hBlockScope = 0; vBlockScope = 0
     end
   end
 
@@ -1611,6 +1935,31 @@ function newViewManager(tm, cm)
   function vm:selUpdate() selUpdate() end
   function vm:selClear() selClear() end
 
+  -- Anchor a sticky, all-rows selection of the given horizontal scope.
+  -- scope 1 spans a single column (stop1..stop2); scope 2 spans a channel.
+  local function selectSpan(scope, col, stop1, stop2)
+    cursorCol, cursorStop = col, stop2
+    selAnchor = { row = cursorRow, col = col, stop = stop1 }
+    hBlockScope, vBlockScope = scope, 3
+    selUpdate()
+  end
+
+  function vm:selectChannel(chan)
+    local first = grid.chanFirstCol[chan]
+    if first then selectSpan(2, first, 1, 1) end
+  end
+
+  function vm:isChannelMuted(chan)            return (cfg('mutedChannels',  {}) or {})[chan] == true end
+  function vm:isChannelSoloed(chan)           return (cfg('soloedChannels', {}) or {})[chan] == true end
+  function vm:isChannelEffectivelyMuted(chan) return effectiveMuted[chan] == true end
+  function vm:toggleChannelMute(chan)         toggleChannelFlag('mutedChannels',  chan) end
+  function vm:toggleChannelSolo(chan)         toggleChannelFlag('soloedChannels', chan) end
+
+  function vm:selectColumn(col)
+    local c = grid.cols[col]
+    if c then selectSpan(1, col, 1, #c.stopPos) end
+  end
+
   function vm:editEvent(col, evt, stop, char, half)
     editEvent(col, evt, stop, char, half)
   end
@@ -1621,18 +1970,42 @@ function newViewManager(tm, cm)
     end
   end
 
-  --- Parse a type string like "cc74", "pb", "at", "pc" and add as extra column.
+  --- Column indices spanned by the current selection, or just the cursor col.
+  local function selectedCols()
+    if not sel then return { cursorCol } end
+    local out = {}
+    for ci = sel.col1, sel.col2 do util:add(out, ci) end
+    return out
+  end
+
+  --- Unique midi channels spanned by the selection (or cursor col).
+  local function selectedChans()
+    local seen, out = {}, {}
+    for _, ci in ipairs(selectedCols()) do
+      local c = grid.cols[ci]
+      if c and not seen[c.midiChan] then
+        seen[c.midiChan] = true
+        util:add(out, c.midiChan)
+      end
+    end
+    return out
+  end
+
+  --- Parse a type string like "cc74", "pb", "at", "pc", "dly" and add as extra column.
+  --- When a selection is active, applies to every channel (or note col, for dly) in it.
   local function addTypedColFromString(typeStr)
     local type, idStr = typeStr:lower():match('^(%a+)(%d*)$')
     if not type then return end
     local id = idStr ~= '' and tonumber(idStr) or nil
 
-    if type == 'cc' then
+    if type == 'dly' then
+      vm:showDelay(selectedCols())
+    elseif type == 'cc' then
       if not id or id < 0 or id > 127 then return end
-    elseif not util:oneOf('pb at pc', type) then
-      return
+      vm:addExtraCol(type, id, selectedChans())
+    elseif util:oneOf('pb at pc', type) then
+      vm:addExtraCol(type, id, selectedChans())
     end
-    vm:addExtraCol(type, id)
   end
 
   -- Command table — renderManager maps keys to these
@@ -1656,20 +2029,22 @@ function newViewManager(tm, cm)
     colLeft        = function() scrollColBy(-1) end,
     channelRight   = function() scrollChannelBy(1) end,
     channelLeft    = function() scrollChannelBy(-1) end,
-    mark           = function()
-      if markMode then clearMark() else selStart(); markMode = true end
-    end,
+    cycleBlock     = function() cycleBlock() end,
+    cycleVBlock    = function() cycleVBlock() end,
+    swapBlockEnds  = function() swapBlockEnds() end,
     delete         = function()
-      if markMode then deleteSelection(); markMode = false
+      if inBlock() then deleteSelection()
       else selClear(); deleteEvent(); scrollRowBy(advanceBy) end
     end,
-    deleteSel      = function() deleteSelection(); clearMark() end,
-    copy           = function() copySelection(); clearMark() end,
-    cut            = function() cutSelection();  clearMark() end,
+    interpolate    = function() interpolate() end,
+    deleteSel      = function() deleteSelection() end,
+    copy           = function() copySelection(); selClear() end,
+    cut            = function() cutSelection() end,
     paste          = function() pasteClipboard() end,
-    duplicateDown  = function() duplicateDown() end,
-    upOctave       = function() setcfg('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
-    downOctave     = function() setcfg('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
+    duplicateDown  = function() duplicate( 1) end,
+    duplicateUp    = function() duplicate(-1) end,
+    inputOctaveUp   = function() setcfg('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
+    inputOctaveDown = function() setcfg('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
     noteOff        = noteOff,
     growNote       = function() adjustDuration(1) end,
     shrinkNote     = function() adjustDuration(-1) end,
@@ -1677,8 +2052,10 @@ function newViewManager(tm, cm)
     nudgeForward = function() adjustPosition(1) end,
     insertRow    = function() insertRow() end,
     deleteRow    = function() deleteRow() end,
-    transposeUp   = function() transpose(1) end,
-    transposeDown = function() transpose(-1) end,
+    nudgeCoarseUp   = function() nudge( 1, true)  end,
+    nudgeCoarseDown = function() nudge(-1, true)  end,
+    nudgeFineUp     = function() nudge( 1, false) end,
+    nudgeFineDown   = function() nudge(-1, false) end,
     play           = function() tm:play() end,
     playPause      = function() tm:playPause() end,
     playFromTop    = function() tm:playFrom(0) end,
@@ -1688,12 +2065,11 @@ function newViewManager(tm, cm)
     addTypedCol    = function()
       return 'modal', {
         title    = 'Add Column',
-        prompt   = 'cc0-127, pb, at, pc',
+        prompt   = 'cc0-127, pb, at, pc, dly',
         callback = addTypedColFromString,
       }
     end,
     hideExtraCol   = function() vm:hideExtraCol() end,
-    toggleDelay    = function() vm:toggleDelay() end,
     doubleRPB      = function() vm:setRowPerBeat(rowPerBeat * 2) end,
     halveRPB       = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
     setRPB         = function()
@@ -1715,46 +2091,85 @@ function newViewManager(tm, cm)
     quit           = function() return 'quit' end,
   }
 
-  -- In mark mode, these commands' first press is swallowed as a cancel:
-  -- the mark clears and no edit occurs. Press again to actually run them.
-  for _, name in ipairs({ 'paste', 'noteOff',
-      'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward' }) do
+  -- In mark mode, paste's first press is swallowed as a cancel: it pastes at
+  -- cursor (not over selection), so we want an explicit second press.
+  for _, name in ipairs({ 'paste' }) do
     local orig = vm.commands[name]
     vm.commands[name] = function()
-      if markMode then clearMark() else return orig() end
+      if inBlock() then selClear() else return orig() end
     end
   end
 
-  function vm:markMode() return markMode end
-  function vm:clearMark() clearMark() end
+  -- These commands operate on the current selection when sticky, then drop the
+  -- sticky flags so the edited region stays visible but doesn't extend on move.
+  for _, name in ipairs({
+    'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
+    'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward',
+    'duplicateDown', 'duplicateUp', 'interpolate', 'insertRow', 'deleteRow', 'noteOff',
+  }) do
+    local orig = vm.commands[name]
+    vm.commands[name] = function()
+      local r, s = orig()
+      unstick()
+      return r, s
+    end
+  end
 
-  --- Add an extra view-only column to the current channel.
+  -- After these, the affected events are gone; an empty sel rect isn't useful
+  -- feedback, so clear the selection entirely.
+  for _, name in ipairs({ 'delete', 'deleteSel', 'cut' }) do
+    local orig = vm.commands[name]
+    vm.commands[name] = function()
+      local r, s = orig()
+      selClear()
+      return r, s
+    end
+  end
+
+  function vm:markMode() return inBlock() end
+  function vm:clearMark() selClear() end
+
+  --- Add an extra view-only column to one or more channels.
   --- type: 'note', 'cc', 'pb', 'at', 'pc'. cc: CC number (cc type only).
-  function vm:addExtraCol(type, cc)
-    local col = grid.cols[cursorCol]
-    if not col then return end
-    local chan = col.midiChan
+  --- chans: list of midi channels (1..16); defaults to the cursor's channel.
+  function vm:addExtraCol(type, cc, chans)
+    if not chans then
+      local col = grid.cols[cursorCol]
+      if not col then return end
+      chans = { col.midiChan }
+    end
 
     if type == 'note' then
       -- Note columns are managed via cfg.noteColumns, not the extras list.
       local nc = cfg('noteColumns', {}) or {}
-      nc[chan] = (nc[chan] or 1) + 1
+      for _, chan in ipairs(chans) do
+        nc[chan] = (nc[chan] or 1) + 1
+      end
       setcfg('take', 'noteColumns', nc)
       return
     end
 
-    local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
-    for ci = first, last do
-      local c = grid.cols[ci]
-      if c.type == type and (type ~= 'cc' or c.cc == cc) then return end
-    end
-
     local extras = cfg('extraColumns', {})
-    local chanExtras = extras[chan] or {}
-    util:add(chanExtras, { type = type, cc = cc })
-    extras[chan] = chanExtras
-    setcfg('take', 'extraColumns', extras)
-    vm:rebuild()
+    local changed = false
+    for _, chan in ipairs(chans) do
+      local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
+      local exists = false
+      if first and last then
+        for ci = first, last do
+          local c = grid.cols[ci]
+          if c.type == type and (type ~= 'cc' or c.cc == cc) then
+            exists = true; break
+          end
+        end
+      end
+      if not exists then
+        local chanExtras = extras[chan] or {}
+        util:add(chanExtras, { type = type, cc = cc })
+        extras[chan] = chanExtras
+        changed = true
+      end
+    end
+    if changed then setcfg('take', 'extraColumns', extras) end
   end
 
   --- Delete the empty column under the cursor.
@@ -1764,8 +2179,25 @@ function newViewManager(tm, cm)
   --- For cc/pb/at/pc extras: remove from the extras list.
   function vm:hideExtraCol()
     local col = grid.cols[cursorCol]
-    if not col or #col.events > 0 then return end
+    if not col then return end
     local chan = col.midiChan
+
+    -- Note col with delay shown: strip the delay first; the column itself
+    -- only goes on a subsequent hide.
+    if col.type == 'note' then
+      local lane = laneOf(col)
+      local nd = cfg('noteDelay', {})
+      local chanMap = nd[chan]
+      if chanMap and chanMap[lane] then
+        chanMap[lane] = nil
+        nd[chan] = next(chanMap) and chanMap or nil
+        setcfg('take', 'noteDelay', next(nd) and nd or nil)
+        vm:rebuild()
+        return
+      end
+    end
+
+    if #col.events > 0 then return end
 
     if col.type == 'note' then
       local noteCols = {}
@@ -1821,17 +2253,26 @@ function newViewManager(tm, cm)
     end
   end
 
-  --- Toggle the delay sub-column on the note column under the cursor.
-  function vm:toggleDelay()
-    local col = grid.cols[cursorCol]
-    if not (col and col.type == 'note') then return end
-    local lane = laneOf(col)
+  --- Show the delay sub-column on one or more note columns (idempotent).
+  --- cols: list of grid column indices; defaults to the cursor column.
+  --- Non-note columns in the list are skipped.
+  function vm:showDelay(cols)
+    cols = cols or { cursorCol }
     local nd = cfg('noteDelay', {})
-    local chanMap = nd[col.midiChan] or {}
-    chanMap[lane] = (not chanMap[lane]) or nil
-    nd[col.midiChan] = next(chanMap) and chanMap or nil
-    setcfg('take', 'noteDelay', next(nd) and nd or nil)
-    vm:rebuild()
+    local changed = false
+    for _, ci in ipairs(cols) do
+      local col = grid.cols[ci]
+      if col and col.type == 'note' then
+        local lane = laneOf(col)
+        local chanMap = nd[col.midiChan] or {}
+        if not chanMap[lane] then
+          chanMap[lane] = true
+          nd[col.midiChan] = chanMap
+          changed = true
+        end
+      end
+    end
+    if changed then setcfg('take', 'noteDelay', nd) end
   end
 
   for i = 0, 9 do
@@ -1983,13 +2424,43 @@ function newViewManager(tm, cm)
       grid.numRows = numRows
 
       for _, gridCol in ipairs(grid.cols) do
+        gridCol.overflow = {}
         for _, evt in ipairs(gridCol.events) do
           local y = math.floor(ppqToRow(evt.ppq or 0))
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
-              gridCol.cells[y].overflow = true
+              gridCol.overflow[y] = true
             else
               gridCol.cells[y] = evt
+            end
+          end
+        end
+      end
+
+      -- Ghost cells: sampled intermediate values between consecutive scalar
+      -- events A, B when A.shape is a non-step curve. The shape of A governs
+      -- the pair (A, B). Ghosts are skipped on rows already holding a real
+      -- event.
+      for _, gridCol in ipairs(grid.cols) do
+        if ghostable[gridCol.type] then
+          gridCol.ghosts = {}
+          local evts = gridCol.events
+          for i = 1, #evts - 1 do
+            local A, B = evts[i], evts[i+1]
+            local shape = A.shape
+            if shape and shape ~= 'step' then
+              local rA, rB = ppqToRow(A.ppq), ppqToRow(B.ppq)
+              local yA, yB = math.floor(rA), math.floor(rB)
+              local span, delta = rB - rA, (B.val or 0) - (A.val or 0)
+              for y = yA + 1, yB - 1 do
+                if y >= 0 and y < numRows and not gridCol.cells[y] then
+                  local t   = (y - rA) / span
+                  local val = (A.val or 0) + util:curveSample(shape, A.tension, t) * delta
+                  gridCol.ghosts[y] = {
+                    val = math.floor(val + 0.5), fromEvt = A, toEvt = B,
+                  }
+                end
+              end
             end
           end
         end
@@ -1998,6 +2469,7 @@ function newViewManager(tm, cm)
       -- Clamp cursor/scroll after layout changes
       clampCursor()
     end
+    pushMute()
     rebuilding = false
   end
 
@@ -2009,10 +2481,14 @@ function newViewManager(tm, cm)
     end
   end
 
+  -- Mute/solo changes don't affect grid shape — only colour and the
+  -- effective set pushed to tm. Skip the full rebuild for those keys.
+  local muteKeys = { mutedChannels = true, soloedChannels = true }
+
   local configCallback = function(changed, _cm)
-    if changed.config then
-      vm:rebuild({ take = false, data = true })
-    end
+    if not changed.config then return end
+    if muteKeys[changed.key] then pushMute()
+    else vm:rebuild({ take = false, data = true }) end
   end
 
   function vm:attach(newTM, newCM)

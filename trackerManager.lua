@@ -92,6 +92,7 @@ function newTrackerManager(mm, cm)
   local channels = {}
   local fire  -- installed below, once tm exists
   local um    -- update manager; set by tm:rebuild
+  local lastMuteSet = {}  -- { [chan] = true }, pushed by vm via tm:setMutedChannels
 
   local function cfg(key, default)
     if cm then
@@ -314,18 +315,22 @@ function newTrackerManager(mm, cm)
         addPb({ chan = chan, ppq = update.ppq, val = newVal })
         return
       end
-      local chan = pb.chan
-      local P = pb.ppq
-      local L = update.val
-      if not L then return end
-      local Pp    = nextLogicalChange(chan, P)
-      local delta = L - logicalAt(chan, P)
-      retuneLowlevel(chan, P, Pp, delta)
-      tidyPbsLowlevel(chan)
+      if update.val then
+        local chan = pb.chan
+        local P = pb.ppq
+        local Pp    = nextLogicalChange(chan, P)
+        local delta = update.val - logicalAt(chan, P)
+        retuneLowlevel(chan, P, Pp, delta)
+        tidyPbsLowlevel(chan)
+      end
+      -- Pass any remaining fields (e.g. shape/tension) through to mm.
+      local rest = util:clone(update, { val = true, ppq = true })
+      if next(rest) then assignLowlevel('pb', pb, rest) end
     end
 
     local function addNote(n)
       local D = n.detune or 0
+      if lastMuteSet[n.chan] then n.muted = true end
       addLowlevel('note', util:assign(n, { detune = D }))
       if (n.lane or 1) == 1 then
         addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = logicalBefore(n.chan, n.ppq) + D })
@@ -479,7 +484,8 @@ function newTrackerManager(mm, cm)
       for loc, cc in mm:ccs() do
         local evt
         if cc.msgType == 'pb' then
-          evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc }
+          evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc,
+                  shape = cc.shape, tension = cc.tension }
           util:add(chans[evt.chan].pbs, evt)
         else
           evt = util:assign(cc, { loc = loc })
@@ -673,10 +679,6 @@ function newTrackerManager(mm, cm)
 
     changed = changed or { take = false, data = true }
 
-    -- Seed each channel with the configured number of note columns. The
-    -- allocator may grow this further when a lane-less note can't fit;
-    -- we persist any growth back to cfg at the end of rebuild so the
-    -- column count is stable across future rebuilds.
     local noteColsCfg = cfg('noteColumns', {}) or {}
     channels = {}
     for i = 1, 16 do
@@ -687,11 +689,6 @@ function newTrackerManager(mm, cm)
     end
 
     -- 1) Truncate overlapping notes on the same channel and pitch.
-    --    The earlier note is clipped to end where the later one begins.
-    --    Direct mm:modify — we're normalising a possibly invariant-
-    --    violating state, so we deliberately bypass the update manager's
-    --    stage-2 semantics (which assume invariants already hold).
-    --    Stage 1 rebuild at step 3 will fix up pb ownership after.
     do
       local groups, work = {}, {}
       for loc, note in mm:notes() do
@@ -781,6 +778,8 @@ function newTrackerManager(mm, cm)
             rawVal = cc.val,
             detune = d,
             hidden = (logicalCents == lastLogical),
+            shape  = cc.shape,
+            tension = cc.tension,
           })
           lastLogical = logicalCents
           if logicalCents ~= 0 then anyNonZero = true end
@@ -806,10 +805,12 @@ function newTrackerManager(mm, cm)
         end
       elseif cc.msgType == 'cc' then
         local col = getOrCreateCCColumn(channel, cc.cc)
-        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc })
+        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc,
+                               shape = cc.shape, tension = cc.tension })
       elseif cc.msgType == 'at' or cc.msgType == 'pc' then
         local col = getOrCreateSingletonColumn(channel, cc.msgType)
-        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc })
+        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc,
+                               shape = cc.shape, tension = cc.tension })
       end
     end
 
@@ -894,6 +895,28 @@ function newTrackerManager(mm, cm)
   function tm:assignEvent(type, evt, update) um:assignEvent(type, evt, update) end
   function tm:flush()                        um:flush()                        end
 
+  -- Channel mute: vm is the sole source of truth. It pushes the effective
+  -- set (persistent mute ∪ solo-implied mute). tm idempotently syncs the
+  -- REAPER-native muted flag on every note to match, and tags any
+  -- subsequently-added notes via lastMuteSet in the update manager.
+  function tm:setMutedChannels(set)
+    lastMuteSet = util:clone(set or {})
+    if not um then return end
+    for _, ch in ipairs(channels) do
+      local want = lastMuteSet[ch.chan] == true
+      for _, col in ipairs(ch.columns) do
+        if col.type == 'note' then
+          for _, n in ipairs(col.events) do
+            if (n.muted == true) ~= want then
+              um:assignEvent('note', n, { muted = want })
+            end
+          end
+        end
+      end
+    end
+    um:flush()
+  end
+
   --------------------
   -- Microtuning realisation
   --
@@ -915,8 +938,12 @@ function newTrackerManager(mm, cm)
     end
   end
 
+  -- Keys owned purely by vm (render-time state) — tm has no structural
+  -- dependency on them, so skip the full rebuild when one of these fires.
+  local vmOnlyKeys = { mutedChannels = true, soloedChannels = true }
+
   local configCallback = function(changed, _cm)
-    if changed.config then
+    if changed.config and not vmOnlyKeys[changed.key] then
       tm:rebuild({ take = false, data = true })
     end
   end

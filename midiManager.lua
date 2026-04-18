@@ -57,11 +57,13 @@
 --   mm:notes()                        -- iterator: for loc, note in mm:notes()
 --   mm:assignNote(loc, t)             -- update note at location
 --     Only provided fields in t are changed. Supports ppq, endppq, chan,
---     pitch, vel, plus any custom metadata fields. If ppq, chan, or pitch
---     change, the associated notation event is updated to match.
+--     pitch, vel, muted, plus any custom metadata fields. If ppq, chan, or
+--     pitch change, the associated notation event is updated to match.
 --     Assigning util.REMOVE to a metadata field removes it.
+--     Pass muted=true to mute, muted=false to unmute (util.REMOVE is not
+--     supported here; muted is a REAPER-native flag, not metadata).
 --   mm:addNote(t)                     -- insert a new MIDI note
---     t must contain ppq, endppq, chan, pitch, and vel.
+--     t must contain ppq, endppq, chan, pitch, and vel. muted is optional.
 --     A UUID is assigned automatically. Returns the new location.
 --   mm:deleteNote(loc)                -- delete note and its notation event
 --
@@ -72,8 +74,12 @@
 --     Supports msgType change. val is decoded per type:
 --       cc -> t.cc, t.val       pb -> t.val (-8192..8191)
 --       pa -> t.pitch, t.val    pc/at -> t.val
+--     shape, tension, and muted may also be set (see addCC).
 --   mm:addCC(t)                       -- insert a new CC event
 --     t must contain ppq, chan, and val. Defaults msgType to 'cc'.
+--     Optional: shape (one of 'step', 'linear', 'slow', 'fast-start',
+--     'fast-end', 'bezier'; default 'step') and tension (float, -1..1,
+--     only meaningful for 'bezier'). Optional muted (bool).
 --     Returns the new location.
 --   mm:deleteCC(loc)                  -- delete CC at location
 --
@@ -99,10 +105,16 @@
 --   write changes back. Iterators must not be interleaved with modify()
 --   calls; collect entries first, then mutate inside a single modify().
 --
+-- MUTED
+--   Notes and CCs expose REAPER's per-event muted flag. The field is
+--   present and true when the event is muted, and absent otherwise —
+--   muted=false is never stored. Callers pass muted=true to mute and
+--   muted=false to unmute; nil (or omission) leaves the flag unchanged.
+--
 -- METADATA
 --   Any fields on a note table beyond the standard event fields
---   (idx, ppq, endppq, chan, pitch, vel, uuid, uuidIdx) are treated as
---   custom metadata and persisted to the take's extension data via
+--   (idx, ppq, endppq, chan, pitch, vel, muted, uuid, uuidIdx) are
+--   treated as custom metadata and persisted to the take's extension data via
 --   util:serialise(). These survive project save/load and are restored
 --   on mm:load(). Standard event fields are stripped before saving.
 --------------------
@@ -134,6 +146,11 @@ function newMidiManager(take)
   local chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
   local chanMsgTypes = {}
   for k, v in pairs(chanMsgLUT) do chanMsgTypes[v] = k end
+
+  -- CC point shape (REAPER MIDI_SetCCShape codes 0..5)
+  local shapeLUT = { step = 0, linear = 1, slow = 2, ['fast-start'] = 3, ['fast-end'] = 4, bezier = 5 }
+  local shapeNames = {}
+  for k, v in pairs(shapeLUT) do shapeNames[v] = k end
 
   local eventTypeLUT = {
     sysex = -1, text = 1, copyright = 2, trackname = 3,
@@ -189,7 +206,7 @@ function newMidiManager(take)
   -- note-event fields stripped when serialising per-note metadata
   local noteEventFields = {
     idx = true, ppq = true, endppq = true, chan = true,
-    pitch = true, vel = true, uuid = true, uuidIdx = true,
+    pitch = true, vel = true, muted = true, uuid = true, uuidIdx = true,
   }
 
   local function saveMetadatum(uuid)
@@ -324,14 +341,16 @@ function newMidiManager(take)
       if ok then
         chan = chan + 1
         local tag = ppq .. '|' .. chan .. '|' .. pitch
-        notesLUT[tag] = util:add(noteTbl, {
+        local entry = {
           idx    = i,
           ppq    = ppq,
           endppq = endppq,
           chan   = chan,
           pitch  = pitch,
           vel    = vel,
-        })
+        }
+        if muted then entry.muted = true end
+        notesLUT[tag] = util:add(noteTbl, entry)
       end
     end
 
@@ -347,6 +366,7 @@ function newMidiManager(take)
           msgType = msgType,
           chan    = chan,
         }
+        if muted then entry.muted = true end
 
         if msgType == 'pa' then
           -- poly AT: note (msg2) and velocity (msg3)
@@ -367,6 +387,10 @@ function newMidiManager(take)
           entry.val = msg2
           entry.val2 = msg3
         end
+
+        local _, shape, tension = reaper.MIDI_GetCCShape(take, i)
+        entry.shape = shapeNames[shape] or 'step'
+        if entry.shape == 'bezier' then entry.tension = tension end
 
         util:add(ccTbl, entry)
       end
@@ -523,7 +547,7 @@ function newMidiManager(take)
   function mm:assignNote(loc, t)
     if not take then return end
 
-    if not (t.ppq or t.endppq or t.pitch or t.vel or t.chan) then
+    if not (t.ppq or t.endppq or t.pitch or t.vel or t.chan or t.muted ~= nil) then
       -- just metadata, allow without lock
       local note = noteTbl[loc]
       if not note then return end
@@ -533,7 +557,7 @@ function newMidiManager(take)
       saveMetadatum(note.uuid)
       return
     end
-    
+
     if not checkLock() then return end
 
     local note = noteTbl[loc]
@@ -542,10 +566,11 @@ function newMidiManager(take)
     local chan = (t.chan or note.chan) - 1
 
     -- update the existing note (nil values will do nothing)
-    reaper.MIDI_SetNote(take, note.idx, nil, nil, t.ppq, t.endppq, chan, t.pitch, t.vel, true)
+    reaper.MIDI_SetNote(take, note.idx, nil, t.muted, t.ppq, t.endppq, chan, t.pitch, t.vel, true)
 
     -- merge fields into the note
     util:assign(note, t)
+    if note.muted == false then note.muted = nil end
 
     -- if ppq, chan, or pitch changed, update the notation event to match
     if (t.ppq or t.chan or t.pitch) and note.uuidIdx then
@@ -564,9 +589,10 @@ function newMidiManager(take)
     end
 
     -- create a new note
-    reaper.MIDI_InsertNote(take, false, false, t.ppq, t.endppq, t.chan - 1, t.pitch, t.vel, true)
+    reaper.MIDI_InsertNote(take, false, t.muted or false, t.ppq, t.endppq, t.chan - 1, t.pitch, t.vel, true)
     -- copy table, assign new UUID
     local note = util:clone(t)
+    if not note.muted then note.muted = nil end
     local uuid = assignNewUUID(note)
     -- create notation event for UUID
     reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, toBase36(note.uuid)), true)
@@ -651,12 +677,19 @@ function newMidiManager(take)
       msg2, msg3 = reconstruct(util:assign(util:clone(msg), t))
     end
     local chan = t.chan and t.chan - 1
-    reaper.MIDI_SetCC(take, msg.idx, nil, nil, t.ppq, chanmsg, chan, msg2, msg3, true)
+    reaper.MIDI_SetCC(take, msg.idx, nil, t.muted, t.ppq, chanmsg, chan, msg2, msg3, true)
 
     -- update the table entry
     util:assign(msg, t)
+    if msg.muted == false then msg.muted = nil end
     if msg.msgType ~= 'cc' then msg.cc = nil end
     if msg.msgType ~= 'pa' then msg.pitch = nil end
+
+    if t.shape or t.tension then
+      local shape = shapeLUT[msg.shape] or 0
+      reaper.MIDI_SetCCShape(take, msg.idx, shape, msg.tension or 0, true)
+    end
+    if msg.shape ~= 'bezier' then msg.tension = nil end
   end
 
   function mm:addCC(t)
@@ -676,13 +709,19 @@ function newMidiManager(take)
     end
     local msg2, msg3 = reconstruct(t)
 
-    reaper.MIDI_InsertCC(take, false, false, t.ppq, chanmsg, t.chan - 1, msg2, msg3)
+    reaper.MIDI_InsertCC(take, false, t.muted or false, t.ppq, chanmsg, t.chan - 1, msg2, msg3)
 
     local msg = util:clone(t)
+    if not msg.muted then msg.muted = nil end
 
     local _, _, ccCount = reaper.MIDI_CountEvts(take)
     msg.idx = ccCount - 1
-    
+
+    if t.shape or t.tension then
+      reaper.MIDI_SetCCShape(take, msg.idx, shapeLUT[t.shape] or 0, t.tension or 0, true)
+    end
+    if msg.shape ~= 'bezier' then msg.tension = nil end
+
     util:add(ccTbl, msg)
 
     return #ccTbl
