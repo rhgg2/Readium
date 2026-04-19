@@ -54,6 +54,7 @@
 
 loadModule('util')
 loadModule('midiManager')
+loadModule('timing')
 
 local function print(...)
   return util:print(...)
@@ -114,6 +115,44 @@ function newTrackerManager(mm, cm)
   local function rawToCents(raw)
     local lim = cfg('pbRange', 2) * 100
     return math.floor(raw / 8192 * lim + 0.5)
+  end
+
+  --------------------
+  -- Swing and delay
+  --
+  -- Slot schema is { name, period }, resolved against the swing registry
+  -- (timing.presets + cfg.swings). Identity or missing slot ⇒ nil, which
+  -- applySwing / unapplySwing treat as passthrough.
+  --
+  -- Both period and delay are in QN units (quarter notes), matching
+  -- REAPER's native PPQ coordinate. Period is a QN scalar; delay is
+  -- stored in signed milli-QN (1000 = one QN late). QN is preferred
+  -- over "beat" because "beat" is time-sig-denominator-dependent and
+  -- ambiguous in 6/8, 12/8, etc — a jig feel is period = {3,2} (dotted
+  -- quarter) regardless of the denom.
+  --
+  -- Delay metadata lives on notes (defaulted to 0 by midiManager on
+  -- load). Intent PPQ is the event's desired position; realised PPQ
+  -- is what midiManager stores. The invariant
+  --
+  --     e.ppq = intentPPQ(e) + delayToPPQ(delay(e))
+  --
+  -- is maintained at the vm boundary: tm:rebuild strips delay from
+  -- col.events before exposing them; um:addEvent / um:assignEvent
+  -- add it back before routing writes to mm.
+  --------------------
+
+  local function delayToPPQ(d) return mm and mm:resolution() * (d or 0) / 1000 or 0 end
+
+  local function resolveSlot(slot)
+    if not slot then return nil end
+    local shape = timing.findShape(slot.name, cfg('swings'))
+    if not shape or shape == timing.id then return nil end
+    return { shape = shape, period = slot.period }
+  end
+
+  local function slotPPQ(slot)
+    return mm:resolution() * timing.periodQN(slot.period)
   end
 
   --------------------
@@ -417,13 +456,34 @@ function newTrackerManager(mm, cm)
       end
     end
 
+    -- vm speaks intent; tm internals (and mm) speak realised. Realise
+    -- note ppq/endppq at the boundary. A delay change with no ppq update
+    -- pins intent and shifts realised by the delay delta.
+    local function realiseNoteUpdate(evt, update)
+      local dOld = delayToPPQ(evt.delay)
+      local dNew = delayToPPQ(update.delay ~= nil and update.delay or evt.delay)
+      if update.ppq ~= nil then
+        update.ppq = update.ppq + dNew
+      elseif dNew ~= dOld then
+        update.ppq = evt.ppq + (dNew - dOld)
+      end
+      if update.endppq ~= nil then
+        update.endppq = update.endppq + dNew
+      elseif dNew ~= dOld and evt.endppq then
+        update.endppq = evt.endppq + (dNew - dOld)
+      end
+    end
+
     function um:assignEvent(evtType, evtOrLoc, update)
       local loc = type(evtOrLoc) == 'table' and evtOrLoc.loc or evtOrLoc
       if not loc then return end
       local evt = evtType == 'note' and notesByLoc[loc] or ccsByLoc[loc]
 
       if evtType == 'note' then
-        if evt then assignNote(evt, update) end
+        if evt then
+          realiseNoteUpdate(evt, update)
+          assignNote(evt, update)
+        end
       elseif evtType == 'pb' then
         if evt then assignPb(evt, update) end
       else
@@ -433,6 +493,11 @@ function newTrackerManager(mm, cm)
 
     function um:addEvent(evtType, evt)
       if evtType == 'note' then
+        local d = delayToPPQ(evt.delay)
+        if d ~= 0 then
+          evt.ppq = evt.ppq + d
+          if evt.endppq then evt.endppq = evt.endppq + d end
+        end
         addNote(evt)
       elseif evtType == 'pb' then
         addPb(evt)
@@ -815,14 +880,30 @@ function newTrackerManager(mm, cm)
     end
 
 
-    -- 5) Sort every column's events by ppq
+    -- 5) Strip delay from col.events so vm sees intent-frame PPQs.
+    --    tm's own mutation state (update manager's chans[c].notes/pbs)
+    --    stays in realised frame; only what we expose to vm is shifted.
+    --    Realise-on-write in um:addEvent / um:assignEvent closes the loop.
+    for _, chan in ipairs(channels) do
+      for _, col in ipairs(chan.columns) do
+        for _, evt in ipairs(col.events) do
+          local d = delayToPPQ(evt.delay)
+          if d ~= 0 then
+            evt.ppq = evt.ppq - d
+            if evt.endppq then evt.endppq = evt.endppq - d end
+          end
+        end
+      end
+    end
+
+    -- 6) Sort every column's events by (intent) ppq.
     for _, chan in ipairs(channels) do
       for _, col in ipairs(chan.columns) do
         table.sort(col.events, function(a, b) return a.ppq < b.ppq end)
       end
     end
 
-    -- 6) Canonicalise column order within each channel.
+    -- 7) Canonicalise column order within each channel.
     for _, chan in ipairs(channels) do
       chan.columns = canonicaliseColumns(chan.columns)
     end
@@ -869,6 +950,76 @@ function newTrackerManager(mm, cm)
   function tm:timeSigs()
     return mm and mm:timeSigs() or {}
   end
+
+  function tm:swingGlobal()     return resolveSlot(cfg('swing')) end
+  function tm:swingColumn(chan)
+    local cs = cfg('colSwing')
+    return cs and resolveSlot(cs[chan])
+  end
+
+  -- E_c forward: straight PPQ → realised PPQ on channel chan. Column
+  -- inner, global outer (see design/swing.md). Missing slots pass through.
+  function tm:applySwing(chan, ppq)
+    local c = self:swingColumn(chan)
+    if c then ppq = timing.tile(c.shape, slotPPQ(c), ppq) end
+    local g = self:swingGlobal()
+    if g then ppq = timing.tile(g.shape, slotPPQ(g), ppq) end
+    return ppq
+  end
+
+  -- E_c inverse: realised PPQ → straight PPQ.
+  function tm:unapplySwing(chan, ppq)
+    local g = self:swingGlobal()
+    if g then ppq = timing.tileInverse(g.shape, slotPPQ(g), ppq) end
+    local c = self:swingColumn(chan)
+    if c then ppq = timing.tileInverse(c.shape, slotPPQ(c), ppq) end
+    return ppq
+  end
+
+  -- Snapshot of all slots resolved once, with T_ppq baked in. Use this
+  -- in hot loops (rebuilds, renders) to avoid the per-call cfg reads in
+  -- applySwing/unapplySwing. Always returns a valid pass-through struct
+  -- when there's no context or no slots — callers needn't nil-check.
+  function tm:swingSnapshot()
+    local global, column
+    if mm then
+      local function withT(s)
+        if s then s.T = slotPPQ(s) end
+        return s
+      end
+      global = withT(resolveSlot(cfg('swing')))
+      column = {}
+      local cs = cfg('colSwing')
+      if cs then
+        for chan, slot in pairs(cs) do column[chan] = withT(resolveSlot(slot)) end
+      end
+    else
+      column = {}
+    end
+    return {
+      global = global,
+      column = column,
+      apply = function(chan, ppq)
+        local c = column[chan]
+        if c      then ppq = timing.tile(c.shape,      c.T, ppq) end
+        if global then ppq = timing.tile(global.shape, global.T, ppq) end
+        return ppq
+      end,
+      unapply = function(chan, ppq)
+        if global then ppq = timing.tileInverse(global.shape, global.T, ppq) end
+        local c = column[chan]
+        if c      then ppq = timing.tileInverse(c.shape,      c.T, ppq) end
+        return ppq
+      end,
+    }
+  end
+
+  -- Delay unit is signed milli-QN; 1000 means one QN late.
+  function tm:delayToPPQ(d)  return delayToPPQ(d) end
+  function tm:ppqToDelay(p)  return mm and 1000 * p / mm:resolution() or 0 end
+
+  function tm:straightPPQ(n)    return n.ppq    - self:delayToPPQ(n.delay) end
+  function tm:straightEndPPQ(n) return n.endppq - self:delayToPPQ(n.delay) end
 
   function tm:playFrom(ppq)
     if not (mm and mm:take()) then return end

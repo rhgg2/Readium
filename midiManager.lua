@@ -479,6 +479,7 @@ function newMidiManager(take)
     for _, note in ipairs(noteTbl) do
       util:assign(note, metadata[note.uuid])
       if note.detune == nil then note.detune = 0 end
+      if note.delay  == nil then note.delay  = 0 end
       uuidTbl[note.uuid] = note
     end
 

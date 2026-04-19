@@ -71,7 +71,7 @@ function newRenderManager(vm, cm)
 
     local showDelay = col and col.showDelay
     if not evt then
-      return showDelay and '··· ·· ··' or '··· ··'
+      return showDelay and '··· ·· ···' or '··· ··'
     end
 
     local label
@@ -83,11 +83,14 @@ function newRenderManager(vm, cm)
     local text    = noteTxt .. ' ' .. velTxt
 
     if showDelay then
-      local basePPQ = vm:rowToPPQ(row)
-      local nextPPQ = vm:rowToPPQ(row + 1)
-      local rowLen  = nextPPQ - basePPQ
-      local val     = rowLen > 0 and math.floor((evt.ppq - basePPQ) / rowLen * 0x80 + 0.5) or 0
-      text = text .. ' ' .. (val > 0 and string.format('%02X', val) or '··')
+      local d = evt.delay or 0
+      if d == 0 then
+        return text .. ' ···'
+      end
+      text = text .. ' ' .. string.format('%03d', math.abs(d))
+      -- Digits sit at char positions 8,9,10 regardless of whether the prefix
+      -- uses ASCII note names or multi-byte '···' for pa. Use char indices.
+      if d < 0 then return text, nil, { [8] = 'negative', [9] = 'negative', [10] = 'negative' } end
     end
     return text
   end
@@ -114,7 +117,8 @@ function newRenderManager(vm, cm)
   }
 
   local function renderCell(evt, col, row)
-    return renderFns[col.type] and renderFns[col.type](evt, col, row)
+    local fn = renderFns[col.type]
+    if fn then return fn(evt, col, row) end
   end
 
   ---------- COLOUR
@@ -122,7 +126,8 @@ function newRenderManager(vm, cm)
   local colourDefaults = {
     bg           = {218/256, 214/256, 201/256, 1  },
     text         = { 48/256,  48/256,  33/256, 1  },
-    overflow     = {190/256,  90/256,  35/256, 1  },
+    offGrid      = { 86/256, 138/256,  64/256, 1  },
+    overflow     = {210/256,  90/256,  35/256, 1  },
     negative     = {218/256,  48/256,  33/256, 1  },
     textBar      = { 48/256,  48/256,  33/256, 1  },
     header       = { 48/256,  48/256,  33/256, 1  },
@@ -144,6 +149,7 @@ function newRenderManager(vm, cm)
 --    tailBord     = {100/256, 130/256, 160/256, 0.4},
     tailBord     = {140/256, 170/256, 200/256, 1},
     ghost        = {100/256, 130/256, 160/256, 0.9},
+    ghostNegative= {218/256, 130/256, 120/256, 0.9},
   }
 
   local colourCache = {}
@@ -367,8 +373,8 @@ function newRenderManager(vm, cm)
         local colPx = gridOriginX + col.x * gridX
         for _, evt in ipairs(col.events) do
           if evt.endppq then
-            local startFrac = vm:ppqToRow(evt.ppq)
-            local endFrac   = vm:ppqToRow(evt.endppq)
+            local startFrac = vm:ppqToRow_c(col.midiChan, evt.ppq)
+            local endFrac   = vm:ppqToRow_c(col.midiChan, evt.endppq)
             if endFrac > viewTop and startFrac < viewBot then
               local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
               local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
@@ -394,19 +400,25 @@ function newRenderManager(vm, cm)
         if col.x then
           local evt = col.cells and col.cells[row]
           local ghost = not evt and col.ghosts and col.ghosts[row]
-          local text, textCol
+          local text, textCol, overrides
           if ghost then
-            text    = renderCell({ val = ghost.val }, col, row)
-            textCol = 'ghost'
+            local cellCol
+            text, cellCol = renderCell({ val = ghost.val }, col, row)
+            textCol = cellCol == 'negative' and 'ghostNegative' or 'ghost'
           else
-            text, textCol = renderCell(evt, col, row)
-            if col.overflow and col.overflow[row] then textCol = 'overflow' end
+            text, textCol, overrides = renderCell(evt, col, row)
+            if col.overflow and col.overflow[row] then textCol, overrides = 'overflow', nil end
             textCol = textCol or 'text'
+            if textCol == 'text' and col.offGrid and col.offGrid[row] then
+              textCol = 'offGrid'
+            end
           end
-          if vm:isChannelEffectivelyMuted(col.midiChan) then textCol = 'inactive' end
-          local cx = col.x
+          if vm:isChannelEffectivelyMuted(col.midiChan) then textCol, overrides = 'inactive', nil end
+          local cx, i = col.x, 0
           for ch in text:gmatch(utf8.charpattern) do
-            draw:text(cx, y, ch, ch == '·' and 'inactive' or textCol)
+            i = i + 1
+            local c = (overrides and overrides[i]) or (ch == '·' and 'inactive' or textCol)
+            draw:text(cx, y, ch, c)
             cx = cx + 1
           end
         end
@@ -483,9 +495,9 @@ function newRenderManager(vm, cm)
   local function drawStatusBar()
     local cursorRow, cursorCol = vm:cursor()
     local rowPerBeat, _, _, currentOctave, advanceBy = vm:displayParams()
-    local ppq      = vm:rowToPPQ(cursorRow)
-    local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
     local col      = vm.grid.cols[cursorCol]
+    local ppq      = col and vm:rowToPPQ_c(col.midiChan, cursorRow) or vm:rowToPPQ(cursorRow)
+    local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
     local tsLabel  = ts and string.format('%d/%d', ts.num, ts.denom) or '?'
 
@@ -538,8 +550,8 @@ function newRenderManager(vm, cm)
     duplicateDown  = { {ImGui.Key_D, ImGui.Mod_Ctrl} },
     duplicateUp    = { {ImGui.Key_D, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
     deleteSel      = { ImGui.Key_Delete },
-    nudgeCoarseUp   = { ImGui.Key_Equal },
-    nudgeCoarseDown = { ImGui.Key_Minus },
+    nudgeCoarseUp   = { {ImGui.Key_Equal, ImGui.Mod_Ctrl} },
+    nudgeCoarseDown = { {ImGui.Key_Minus, ImGui.Mod_Ctrl} },
     nudgeFineUp     = { {ImGui.Key_Equal, ImGui.Mod_Shift} },
     nudgeFineDown   = { {ImGui.Key_Minus, ImGui.Mod_Shift} },
     addNoteCol     = { {ImGui.Key_N, ImGui.Mod_Ctrl} },
@@ -556,6 +568,7 @@ function newRenderManager(vm, cm)
     stop           = { ImGui.Key_F8 },
     quit           = { ImGui.Key_Enter },
     cycleTuning    = { {ImGui.Key_T, ImGui.Mod_Super} },
+    cycleSwing     = { {ImGui.Key_S, ImGui.Mod_Super} },
   }
 
   for i = 0, 9 do
