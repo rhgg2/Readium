@@ -230,6 +230,11 @@ function newTrackerManager(mm, cm)
       return (pb and pb.ppq) or math.huge
     end
 
+    local function nextNotePPQ(chan, P)
+      local n = util:seek(chans[chan].notes, 'after', P)
+      return (n and n.ppq) or math.huge
+    end
+
     local function forEachAttachedPA(host, fn)
       for _, cc in pairs(ccsByLoc) do
         if cc.msgType == 'pa' and cc.chan == host.chan and cc.pitch == host.pitch
@@ -316,34 +321,45 @@ function newTrackerManager(mm, cm)
       end
     end
 
+    -- Fake-pb housekeeping: a pb at a note boundary is "fake" iff it
+    -- exists solely to absorb the raw step from the owner note's detune.
+    -- Upgrading/downgrading keeps the pb and the owner note's tag in sync.
+
+    local function unmarkFake(chan, P)
+      local pb = pbAt(chan, P)
+      if not (pb and pb.fake) then return end
+      assignLowlevel('pb', pb, { fake = util.REMOVE })
+      local o = owner(chan, P)
+      if o then assignLowlevel('note', o, { fakePb = util.REMOVE }) end
+    end
+
+    local function markFake(chan, P)
+      local pb = pbAt(chan, P)
+      if pb then assignLowlevel('pb', pb, { fake = true }) end
+      local o = owner(chan, P)
+      if o then assignLowlevel('note', o, { fakePb = true }) end
+    end
+
     ----- High-level ops
 
     local function addPb(pb)
-      local chan = pb.chan
-      local P = pb.ppq
-      local L = pb.val or 0
-      local Pp    = nextRealChange(chan, P)
+      local chan, P, L = pb.chan, pb.ppq, pb.val or 0
       local delta = L - logicalAt(chan, P)
-      local oldPb = pbAt(chan, P)
-      if oldPb and oldPb.fake then
-        assignLowlevel('pb', oldPb, { fake = util.REMOVE })
-        if owner(chan, P) then assignLowlevel('note', owner(chan, P), { fakePb = util.REMOVE }) end
+      if pbAt(chan, P) then
+        unmarkFake(chan, P)
       else
         addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) })
       end
-      retuneLowlevel(chan, P, Pp, delta)
+      retuneLowlevel(chan, P, nextRealChange(chan, P), delta)
     end
 
     local function deletePb(pb)
-      local chan = pb.chan
-      local P = pb.ppq
-      local Pp = nextRealChange(chan, P)
-      retuneLowlevel(chan, P, Pp, logicalBefore(chan, P) - logicalAt(chan, P))
+      local chan, P = pb.chan, pb.ppq
+      retuneLowlevel(chan, P, nextRealChange(chan, P), logicalBefore(chan, P) - logicalAt(chan, P))
       if detuneAt(chan, P) == detuneBefore(chan, P) then
         deleteLowlevel('pb', pb)
       else
-        assignLowlevel('pb', pb, { fake = true })
-        if owner(chan, P) then assignLowlevel('note', owner(chan, P), { fakePb = true }) end
+        markFake(chan, P)
       end
     end
 
@@ -356,15 +372,10 @@ function newTrackerManager(mm, cm)
         return
       end
       if update.val then
-        local chan = pb.chan
-        local P = pb.ppq
-        local Pp    = nextRealChange(chan, P)
+        local chan, P = pb.chan, pb.ppq
         local delta = update.val - logicalAt(chan, P)
-        if pb.fake then
-          assignLowlevel('pb', pb, { fake = util.REMOVE })
-          if owner(chan, P) then assignLowlevel('note', owner(chan, P), { fakePb = util.REMOVE }) end
-        end
-        retuneLowlevel(chan, P, Pp, delta)
+        unmarkFake(chan, P)
+        retuneLowlevel(chan, P, nextRealChange(chan, P), delta)
       end
       -- Pass any remaining fields (e.g. shape/tension) through to mm.
       local rest = util:clone(update, { val = true, ppq = true })
@@ -375,40 +386,33 @@ function newTrackerManager(mm, cm)
       local D = n.detune or 0
       if lastMuteSet[n.chan] then n.muted = true end
       if (n.lane or 1) == 1 then
+        -- n isn't yet in chans[].notes, so owner-tagging goes inline; C is the
+        -- prevailing detune just before n.ppq.
         local C = detuneAt(n.chan, n.ppq)
-        local nextNote = util:seek(chans[n.chan].notes, 'after', n.ppq)
-        local P = nextNote and nextNote.ppq or math.huge
         if D ~= C and not pbAt(n.chan, n.ppq) then
-          addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = rawAt(n.chan, n.ppq), fake = true})
+          addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = rawAt(n.chan, n.ppq), fake = true })
           util:assign(n, { fakePb = true })
         end
-        retuneLowlevel(n.chan, n.ppq, P, D-C)
+        retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D - C)
       end
       addLowlevel('note', util:assign(n, { detune = D }))
     end
 
     local function deleteNote(n, keepPAs)
       if not keepPAs then forEachAttachedPA(n, function(evt) deleteLowlevel('pa', evt) end) end
-      local D1 = detuneBefore(n.chan, n.ppq)
-      local D2 = detuneAt(n.chan, n.ppq)
+      local D1, D2 = detuneBefore(n.chan, n.ppq), detuneAt(n.chan, n.ppq)
       local pb = pbAt(n.chan, n.ppq)
-      if pb and pb.fake then
-        deleteLowlevel('pb', pb)
-      end
+      if pb and pb.fake then deleteLowlevel('pb', pb) end
       deleteLowlevel('note', n)
-      local nextNote = util:seek(chans[n.chan].notes, 'after', n.ppq)
-      local P = nextNote and nextNote.ppq or math.huge
-      retuneLowlevel(n.chan, n.ppq, P, D1-D2)
+      retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D1 - D2)
     end
 
     local function resizeNote(n, P1, P2)
-      local col1 = (n.lane or 1) == 1
-      local L = logicalAt(n.chan, P1)
+      local col1  = (n.lane or 1) == 1
       local shift = P1 - n.ppq
       if shift ~= 0 and P2 - n.endppq == shift then
         forEachAttachedPA(n, function(evt)
-          local newPPQ = evt.ppq + shift
-          assignLowlevel('pa', evt, { ppq = newPPQ })
+          assignLowlevel('pa', evt, { ppq = evt.ppq + shift })
         end)
       else
         local lastPA
@@ -421,36 +425,42 @@ function newTrackerManager(mm, cm)
         if lastPA then assignLowlevel('note', n, { vel = lastPA.val }) end
       end
 
-      local D = n.detune
-      local C1 = detuneBefore(n.chan, n.ppq)
-      local pb = pbAt(n.chan, n.ppq)
-      local nextNote1 = util:seek(chans[n.chan].notes, 'after', n.ppq)
-      local NP1 = nextNote1 and nextNote1.ppq or math.huge
+      if not col1 then
+        assignLowlevel('note', n, { ppq = P1, endppq = P2 })
+        return
+      end
+
+      -- col-1 microtuning: withdraw n's detune at the old seat, move the
+      -- note, then apply at the new seat. L is the logical pb the user
+      -- authored at P1 *before* the move — if it differs from prevailing
+      -- logical there we seat a real pb to carry it.
+      local oldPpq = n.ppq
+      local D   = n.detune
+      local L   = logicalAt(n.chan, P1)
+      local C1  = detuneBefore(n.chan, oldPpq)
+      local NP1 = nextNotePPQ(n.chan, oldPpq)
+      local oldPb = pbAt(n.chan, oldPpq)
 
       assignLowlevel('note', n, { ppq = P1, endppq = P2 })
-      local addPb  = L ~= logicalBefore(n.chan, P1)
 
-      if col1 then
+      -- Withdraw at old seat.
+      if oldPb and oldPb.fake then
+        deleteLowlevel('pb', oldPb)
+        assignLowlevel('note', n, { fakePb = util.REMOVE })
+      end
+      retuneLowlevel(n.chan, oldPpq, NP1, C1 - D)
 
-        if pb and pb.fake then
-          deleteLowlevel('pb', pb)
-          assignLowlevel('note', n, { fakePb = util.REMOVE })
-        end
-        retuneLowlevel(n.chan, n.ppq, NP1, C1-D)
-        
-        local C2 = detuneBefore(n.chan, P1)
-        
-        local nextNote2 = util:seek(chans[n.chan].notes, 'after', P1)
-        local NP2 = nextNote2 and nextNote2.ppq or math.huge
-        if not pbAt(n.chan, P1) and addPb then
+      -- Apply at new seat. Real pb wins over fake; pre-existing pb wins over both.
+      local C2 = detuneBefore(n.chan, P1)
+      if not pbAt(n.chan, P1) then
+        if L ~= logicalBefore(n.chan, P1) then
           addLowlevel('pb', { chan = n.chan, ppq = P1, val = rawBefore(n.chan, P1) })
-        end
-        if not pbAt(n.chan, P1) and D ~= C2 then
+        elseif D ~= C2 then
           addLowlevel('pb', { chan = n.chan, ppq = P1, val = rawBefore(n.chan, P1), fake = true })
           assignLowlevel('note', n, { fakePb = true })
         end
-        retuneLowlevel(n.chan, P1, NP2, D-C2)
       end
+      retuneLowlevel(n.chan, P1, nextNotePPQ(n.chan, P1), D - C2)
     end
 
     local function assignNote(n, update)
@@ -465,14 +475,19 @@ function newTrackerManager(mm, cm)
         forEachAttachedPA(n, function(e) assignLowlevel('pa', e, { pitch = update.pitch }) end)
       end
       if (n.lane or 1) == 1 and update.detune ~= nil and update.detune ~= (n.detune or 0) then
-        local nextNote = util:seek(chans[n.chan].notes, 'after', n.ppq)
-        local P = nextNote and nextNote.ppq or math.huge
-        if update.detune ~= n.detune and not pbAt(n.chan, n.ppq) then
-          addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = rawAt(n.chan, n.ppq) })
+        if not pbAt(n.chan, n.ppq) then
+          addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = rawAt(n.chan, n.ppq), fake = true })
+          util:assign(n, { fakePb = true })
         end
-        retuneLowlevel(n.chan, n.ppq, P, update.detune - (n.detune or 0))
-        if update.detune == detuneBefore(n.chan, n.ppq) and rawAt(n.chan, n.ppq) == rawBefore(n.chan, n.ppq) and pbAt(n.chan, n.ppq) then
-          deleteLowlevel('pb', pbAt(n.chan, n.ppq))
+        retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), update.detune - (n.detune or 0))
+        -- Boundary became redundant (detune matches prior, no raw step) — drop it.
+        if update.detune == detuneBefore(n.chan, n.ppq)
+           and rawAt(n.chan, n.ppq) == rawBefore(n.chan, n.ppq) then
+          local pb = pbAt(n.chan, n.ppq)
+          if pb then
+            deleteLowlevel('pb', pb)
+            if n.fakePb then assignLowlevel('note', n, { fakePb = util.REMOVE }) end
+          end
         end
       end
       if next(update) then assignLowlevel('note', n, update) end
@@ -843,10 +858,8 @@ function newTrackerManager(mm, cm)
       local channel = channels[chan]
       local col1    = firstNoteCol(channel)
       local notes   = (col1 and col1.events) or {}
-      -- detune prevailing at ppq P using the latest-starting-note-wins
-      -- rule on already-built col-1 notes. Closed on the right here only
-      -- to match the pb's "just before event takes effect" semantics for
-      -- display purposes.
+      -- Detune prevailing at ppq P: latest-starting-note-wins over the
+      -- already-built col-1 notes.
       local function detuneAtP(P)
         local best
         for _, n in ipairs(notes) do
@@ -857,13 +870,16 @@ function newTrackerManager(mm, cm)
         return (best and best.detune) or 0
       end
 
-      local events, anyNonZero, lastLogical = {}, false, 0
+      local events, anyNonZero = {}, false
       for loc, cc in mm:ccs() do
         if cc.chan == chan and cc.msgType == 'pb' then
           local d = detuneAtP(cc.ppq)
           local currentCents = (cc.val / 8192) * pbRange * 100
           local logicalCents = math.floor(currentCents - d + 0.5)
-          local hidden = util:seek(notes, 'at-or-before', cc.ppq, function(e) return e.endppq ~= nil and e.ppq == cc.ppq and e.fakePb end)
+          -- A col-1 note starting at cc.ppq with fakePb means this pb is
+          -- the detune-boundary absorber for that note — hide from display.
+          local hidden = util:seek(notes, 'at-or-before', cc.ppq,
+                                   function(e) return e.ppq == cc.ppq and e.fakePb end) ~= nil
           util:add(events, {
             loc    = loc,
             ppq    = cc.ppq,
@@ -874,7 +890,6 @@ function newTrackerManager(mm, cm)
             shape  = cc.shape,
             tension = cc.tension,
           })
-          lastLogical = logicalCents
           if logicalCents ~= 0 then anyNonZero = true end
         end
       end
