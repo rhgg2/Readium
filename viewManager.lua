@@ -220,7 +220,7 @@ function newViewManager(tm, cm)
   -- Per-channel row↔PPQ: compose the straight-grid map with the channel's
   -- effective swing. PPQs on both sides are intent (delay-stripped by tm);
   -- swing is the only transform between row space and intent space.
-  local function rowToPPQ_c(chan, row) return swing.apply(chan, rowToPPQ(row))   end
+  local function rowToPPQ_c(chan, row) return math.floor(swing.apply(chan, rowToPPQ(row)))   end
   local function ppqToRow_c(chan, ppq) return ppqToRow(swing.unapply(chan, ppq)) end
 
   ---------- AUDITION
