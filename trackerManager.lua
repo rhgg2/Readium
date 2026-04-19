@@ -323,7 +323,20 @@ function newTrackerManager(mm, cm)
 
     -- Fake-pb housekeeping: a pb at a note boundary is "fake" iff it
     -- exists solely to absorb the raw step from the owner note's detune.
-    -- Upgrading/downgrading keeps the pb and the owner note's tag in sync.
+    -- forcePb seats a pb if none exists; markFake/unmarkFake keep the pb
+    -- and the owner note's tag in sync.
+
+    local function forcePb(chan, P)
+      if pbAt(chan, P) then return false end
+      addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) })
+      return true
+    end
+
+    local function markFake(n)
+      local pb = pbAt(n.chan, n.ppq)
+      if pb then assignLowlevel('pb', pb, { fake = true }) end
+      assignLowlevel('note', n, { fakePb = true })
+    end
 
     local function unmarkFake(chan, P)
       local pb = pbAt(chan, P)
@@ -333,23 +346,12 @@ function newTrackerManager(mm, cm)
       if o then assignLowlevel('note', o, { fakePb = util.REMOVE }) end
     end
 
-    local function markFake(chan, P)
-      local pb = pbAt(chan, P)
-      if pb then assignLowlevel('pb', pb, { fake = true }) end
-      local o = owner(chan, P)
-      if o then assignLowlevel('note', o, { fakePb = true }) end
-    end
-
     ----- High-level ops
 
     local function addPb(pb)
       local chan, P, L = pb.chan, pb.ppq, pb.val or 0
       local delta = L - logicalAt(chan, P)
-      if pbAt(chan, P) then
-        unmarkFake(chan, P)
-      else
-        addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) })
-      end
+      if not forcePb(chan, P) then unmarkFake(chan, P) end
       retuneLowlevel(chan, P, nextRealChange(chan, P), delta)
     end
 
@@ -359,7 +361,8 @@ function newTrackerManager(mm, cm)
       if detuneAt(chan, P) == detuneBefore(chan, P) then
         deleteLowlevel('pb', pb)
       else
-        markFake(chan, P)
+        local o = owner(chan, P)
+        if o then markFake(o) end
       end
     end
 
@@ -386,13 +389,8 @@ function newTrackerManager(mm, cm)
       local D = n.detune or 0
       if lastMuteSet[n.chan] then n.muted = true end
       if (n.lane or 1) == 1 then
-        -- n isn't yet in chans[].notes, so owner-tagging goes inline; C is the
-        -- prevailing detune just before n.ppq.
         local C = detuneAt(n.chan, n.ppq)
-        if D ~= C and not pbAt(n.chan, n.ppq) then
-          addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = rawAt(n.chan, n.ppq), fake = true })
-          util:assign(n, { fakePb = true })
-        end
+        if D ~= C and forcePb(n.chan, n.ppq) then markFake(n) end
         retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D - C)
       end
       addLowlevel('note', util:assign(n, { detune = D }))
@@ -452,13 +450,10 @@ function newTrackerManager(mm, cm)
 
       -- Apply at new seat. Real pb wins over fake; pre-existing pb wins over both.
       local C2 = detuneBefore(n.chan, P1)
-      if not pbAt(n.chan, P1) then
-        if L ~= logicalBefore(n.chan, P1) then
-          addLowlevel('pb', { chan = n.chan, ppq = P1, val = rawBefore(n.chan, P1) })
-        elseif D ~= C2 then
-          addLowlevel('pb', { chan = n.chan, ppq = P1, val = rawBefore(n.chan, P1), fake = true })
-          assignLowlevel('note', n, { fakePb = true })
-        end
+      if L ~= logicalBefore(n.chan, P1) then
+        forcePb(n.chan, P1)
+      elseif D ~= C2 and forcePb(n.chan, P1) then
+        markFake(n)
       end
       retuneLowlevel(n.chan, P1, nextNotePPQ(n.chan, P1), D - C2)
     end
@@ -475,10 +470,7 @@ function newTrackerManager(mm, cm)
         forEachAttachedPA(n, function(e) assignLowlevel('pa', e, { pitch = update.pitch }) end)
       end
       if (n.lane or 1) == 1 and update.detune ~= nil and update.detune ~= (n.detune or 0) then
-        if not pbAt(n.chan, n.ppq) then
-          addLowlevel('pb', { ppq = n.ppq, chan = n.chan, val = rawAt(n.chan, n.ppq), fake = true })
-          util:assign(n, { fakePb = true })
-        end
+        if forcePb(n.chan, n.ppq) then markFake(n) end
         retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), update.detune - (n.detune or 0))
         -- Boundary became redundant (detune matches prior, no raw step) — drop it.
         if update.detune == detuneBefore(n.chan, n.ppq)
