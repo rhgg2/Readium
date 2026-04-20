@@ -1146,6 +1146,54 @@ function newViewManager(tm, cm)
     tm:flush()
   end
 
+  -- Explicit, destructive: snap each event in `groups` to the nearest row
+  -- under the current grid + swing in its own column. Notes preserve their
+  -- straight length in rows (round(endRow − startRow)), then re-round the
+  -- end. Columns that are already on-grid produce no writes.
+  local function reGridScope(groups)
+    for _, g in ipairs(groups) do
+      local col, chan = g.col, g.col.midiChan
+      for _, e in pairs(g.locs) do
+        local sRow   = ppqToRow(e.ppq, chan)
+        local newRow = math.floor(sRow + 0.5)
+        local newPPQ = rowToPPQ(newRow, chan)
+        if isNote(e) then
+          local eRow      = ppqToRow(e.endppq, chan)
+          local newEndRow = newRow + math.floor((eRow - sRow) + 0.5)
+          local newEndPPQ = rowToPPQ(newEndRow, chan)
+          if newPPQ ~= e.ppq or newEndPPQ ~= e.endppq then
+            tm:assignEvent('note', e, { ppq = newPPQ, endppq = newEndPPQ })
+          end
+        elseif newPPQ ~= e.ppq then
+          tm:assignEvent(col.type, e, { ppq = newPPQ })
+        end
+      end
+    end
+    tm:flush()
+  end
+
+  local function reGridAll()
+    local groups = {}
+    for _, col in ipairs(grid.cols) do
+      local locs = {}
+      for _, e in ipairs(col.events) do locs[e.loc] = e end
+      util:add(groups, { col = col, locs = locs })
+    end
+    reGridScope(groups)
+  end
+
+  -- With a selection: snap the selected events. Without: confirm before
+  -- snapping the whole take.
+  local function reGrid()
+    if sel then reGridScope((selectedEvents())); return end
+    return 'modal', {
+      title    = 'reGrid',
+      prompt   = 'No selection — reGrid whole take? (y/n)',
+      kind     = 'confirm',
+      callback = function(yes) if yes then reGridAll() end end,
+    }
+  end
+
   local copySelection  -- forward decl; assigned in CLIPBOARD section, used by deleteRow
 
   local function insertRowCore(col, topRow, numRows)
@@ -1221,9 +1269,9 @@ function newViewManager(tm, cm)
 
   -- On a note column the selgrp or selection's noteMode picks the nudge
   -- target: selgrp 1 / default → pitch, selgrp 2 / 'vel' → velocity,
-  -- selgrp 3 / 'delay' → skip. Keys unioned so the same lookup serves
+  -- selgrp 3 / 'delay' → delay. Keys unioned so the same lookup serves
   -- both cursor (numeric selgrp) and selection (string noteMode).
-  local noteKind = { [2] = 'vel', [3] = 'skip', vel = 'vel', delay = 'skip' }
+  local noteKind = { [2] = 'vel', [3] = 'delay', vel = 'vel', delay = 'delay' }
 
   -- Snap v to the next multiple of interval in the dir direction; values
   -- already on a boundary move a full interval. Used for value-typed
@@ -1278,6 +1326,13 @@ function newViewManager(tm, cm)
     if newVel ~= note.vel then tm:assignEvent('note', note, { vel = newVel }) end
   end
 
+  local function nudgeDelay(col, note, dir, coarse)
+    local minD, maxD = delayRange(col, note)
+    local old = note.delay or 0
+    local new = nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
+    if new ~= old then tm:assignEvent('note', note, { delay = new }) end
+  end
+
   local function nudgeValue(col, evt, dir, coarse)
     local lo, hi   = valueBounds(col)
     local newVal   = nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
@@ -1287,18 +1342,18 @@ function newViewManager(tm, cm)
   local function applyNudge(col, evt, kind, dir, coarse, audible)
     if     kind == 'val'   then nudgeValue(col, evt, dir, coarse)
     elseif kind == 'vel'   then nudgeVel(evt, dir, coarse)
+    elseif kind == 'delay' then nudgeDelay(col, evt, dir, coarse)
     elseif kind == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
   end
 
   -- Column-typed nudge. Selection rule: if any note event is selected,
-  -- transpose (or velocity-nudge) the notes and leave value events alone;
-  -- otherwise nudge val on every value event. Delay-selgrp is a no-op.
-  -- Solo cursor: first event in the cursor row, column- and selgrp-typed.
+  -- transpose / velocity- / delay-nudge the notes and leave value events
+  -- alone; otherwise nudge val on every value event. Solo cursor: first
+  -- event in the cursor row, column- and selgrp-typed.
   local function nudge(dir, coarse)
     if sel then
       local groups, noteMode = selectedEvents()
       local selNoteKind = noteKind[noteMode] or 'pitch'
-      if selNoteKind == 'skip' then return end
 
       local anyNote = false
       for _, g in ipairs(groups) do
@@ -1329,7 +1384,6 @@ function newViewManager(tm, cm)
     local evt = cursorRowEvent(col)
     if not evt then return end
     local kind = col.type == 'note' and (noteKind[cursorSelGrp()] or 'pitch') or 'val'
-    if kind == 'skip' then return end
     applyNudge(col, evt, kind, dir, coarse, true)
     tm:flush()
   end
@@ -2103,6 +2157,8 @@ function newViewManager(tm, cm)
       for k, v in ipairs(names) do if v == cur then i = k; break end end
       setcfg('track', 'tuning', names[(i + 1) % (#names + 1)])
     end,
+    reGrid         = function() return reGrid() end,
+    reGridAll      = function() reGridAll() end,
     cycleSwing     = function()
       -- 'off' is the nil-slot sentinel for cycling; in storage, no key == id.
       local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
@@ -2132,6 +2188,7 @@ function newViewManager(tm, cm)
     'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
     'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward',
     'duplicateDown', 'duplicateUp', 'interpolate', 'insertRow', 'deleteRow', 'noteOff',
+    'reGrid', 'reGridAll',
   }) do
     local orig = vm.commands[name]
     vm.commands[name] = function()

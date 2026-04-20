@@ -47,7 +47,7 @@ function newRenderManager(vm, cm)
   local font        = nil
   local dragging    = false
   local dragWinX, dragWinY = 0, 0
-  local modalState = nil   -- nil = closed, else { title, prompt, callback, buf }
+  local modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
 
   ---------- CONFIG HELPERS
 
@@ -782,23 +782,37 @@ function newRenderManager(vm, cm)
 
     if ImGui.BeginPopupModal(ctx, modalState.title, true, ImGui.WindowFlags_AlwaysAutoResize) then
       ImGui.Text(ctx, modalState.prompt)
-      if ImGui.IsWindowAppearing(ctx) then
-        ImGui.SetKeyboardFocusHere(ctx)
-      end
-      local rv, buf = ImGui.InputText(ctx, '##modal', modalState.buf,
-        ImGui.InputTextFlags_EnterReturnsTrue)
-      if rv then
-        local ok, err = pcall(modalState.callback, buf)
-        if not ok then
-          reaper.ShowConsoleMsg('\nModal callback error: ' .. tostring(err) .. '\n')
+
+      local function close(invoke, ...)
+        if invoke then
+          local ok, err = pcall(modalState.callback, ...)
+          if not ok then
+            reaper.ShowConsoleMsg('\nModal callback error: ' .. tostring(err) .. '\n')
+          end
         end
         modalState = nil
         ImGui.CloseCurrentPopup(ctx)
-      elseif ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
-        modalState = nil
-        ImGui.CloseCurrentPopup(ctx)
+      end
+
+      if modalState.kind == 'confirm' then
+        if ImGui.IsKeyPressed(ctx, ImGui.Key_Y) or ImGui.IsKeyPressed(ctx, ImGui.Key_Enter) then
+          close(true, true)
+        elseif ImGui.IsKeyPressed(ctx, ImGui.Key_N) or ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
+          close(true, false)
+        end
       else
-        modalState.buf = buf
+        if ImGui.IsWindowAppearing(ctx) then
+          ImGui.SetKeyboardFocusHere(ctx)
+        end
+        local rv, buf = ImGui.InputText(ctx, '##modal', modalState.buf,
+          ImGui.InputTextFlags_EnterReturnsTrue)
+        if rv then
+          close(true, buf)
+        elseif ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
+          close(false)
+        else
+          modalState.buf = buf
+        end
       end
       ImGui.EndPopup(ctx)
     else
