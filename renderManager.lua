@@ -373,8 +373,8 @@ function newRenderManager(vm, cm)
         local colPx = gridOriginX + col.x * gridX
         for _, evt in ipairs(col.events) do
           if evt.endppq then
-            local startFrac = vm:ppqToRow_c(col.midiChan, evt.ppq)
-            local endFrac   = vm:ppqToRow_c(col.midiChan, evt.endppq)
+            local startFrac = vm:ppqToRow(evt.ppq, col.midiChan)
+            local endFrac   = vm:ppqToRow(evt.endppq, col.midiChan)
             if endFrac > viewTop and startFrac < viewBot then
               local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
               local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
@@ -496,7 +496,7 @@ function newRenderManager(vm, cm)
     local cursorRow, cursorCol = vm:cursor()
     local rowPerBeat, _, _, currentOctave, advanceBy = vm:displayParams()
     local col      = vm.grid.cols[cursorCol]
-    local ppq      = col and vm:rowToPPQ_c(col.midiChan, cursorRow) or vm:rowToPPQ(cursorRow)
+    local ppq      = vm:rowToPPQ(cursorRow, col and col.midiChan)
     local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
     local tsLabel  = ts and string.format('%d/%d', ts.num, ts.denom) or '?'

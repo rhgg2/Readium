@@ -142,7 +142,10 @@ function newTrackerManager(mm, cm)
   -- add it back before routing writes to mm.
   --------------------
 
-  local function delayToPPQ(d) return mm and mm:resolution() * (d or 0) / 1000 or 0 end
+  -- Round at source so the map is an integer bijection: every arithmetic
+  -- use (intent ± delayToPPQ(d)) stays in ℤ, and realise/strip round-trip
+  -- is algebraic rather than approximate.
+  local function delayToPPQ(d) return mm and math.floor(mm:resolution() * (d or 0) / 1000 + 0.5) or 0 end
 
   local function resolveSlot(slot)
     if not slot then return nil end
@@ -869,9 +872,11 @@ function newTrackerManager(mm, cm)
           local currentCents = (cc.val / 8192) * pbRange * 100
           local logicalCents = math.floor(currentCents - d + 0.5)
           -- A col-1 note starting at cc.ppq with fakePb means this pb is
-          -- the detune-boundary absorber for that note — hide from display.
-          local hidden = util:seek(notes, 'at-or-before', cc.ppq,
-                                   function(e) return e.ppq == cc.ppq and e.fakePb end) ~= nil
+          -- the detune-boundary absorber for that note. Hide from display
+          -- unless interp shape pulls it back into view as a ramp anchor.
+          local fake = util:seek(notes, 'at-or-before', cc.ppq,
+                                 function(e) return e.ppq == cc.ppq and e.fakePb end) ~= nil
+          local hidden = fake and (cc.shape == nil or cc.shape == 'step')
           util:add(events, {
             loc    = loc,
             ppq    = cc.ppq,

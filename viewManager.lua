@@ -194,7 +194,16 @@ function newViewManager(tm, cm)
 
   ---------- PPQ / ROW MAPPING
 
-  local function ppqToRow(ppq)
+  -- Row ↔ intent-PPQ. rowPPQs is the uniform, pre-swing row grid
+  -- (time-sig-driven); swing composes on top. The optional `chan`
+  -- selects the column's swing slot; omitted means "no column context" —
+  -- column tile drops out and only the global slot (if any) applies.
+  -- If neither slot is installed, these degenerate to the straight map.
+  -- rowToPPQ rounds once at the end, so output is an integer PPQ;
+  -- ppqToRow keeps its fractional result so off-grid detection and
+  -- sub-row interpolation at call sites can choose their own snap.
+  local function ppqToRow(ppq, chan)
+    ppq = swing.unapply(chan, ppq)
     if ppq <= 0 then return 0 end
     if ppq >= length then return grid.numRows end
     local lo, hi = 0, grid.numRows - 1
@@ -207,21 +216,23 @@ function newViewManager(tm, cm)
     return lo + (rowEnd > rowStart and (ppq - rowStart) / (rowEnd - rowStart) or 0)
   end
 
-  local function rowToPPQ(row)
+  local function rowToPPQ(row, chan)
     if row <= 0 then return 0 end
     if row >= grid.numRows then return length end
     local r = math.floor(row)
     local frac = row - r
     local rowStart = rowPPQs[r]
     local rowEnd = rowPPQs[r + 1] or length
-    return math.floor(rowStart + frac * (rowEnd - rowStart) + 0.5)
+    return math.floor(swing.apply(chan, rowStart + frac * (rowEnd - rowStart)) + 0.5)
   end
 
-  -- Per-channel row↔PPQ: compose the straight-grid map with the channel's
-  -- effective swing. PPQs on both sides are intent (delay-stripped by tm);
-  -- swing is the only transform between row space and intent space.
-  local function rowToPPQ_c(chan, row) return math.floor(swing.apply(chan, rowToPPQ(row)))   end
-  local function ppqToRow_c(chan, ppq) return ppqToRow(swing.unapply(chan, ppq)) end
+  -- The displayed row of an intent PPQ: fractional ppqToRow rounded to
+  -- the nearest integer. Use at identity-repair sites — bounds, lengths,
+  -- equality comparisons — where σ_c float drift could otherwise make an
+  -- on-grid event read as off by one. Shift/move ops should keep the
+  -- fractional ppqToRow directly, so off-grid offsets flow through the
+  -- edit instead of being silently snapped away.
+  local function snapRow(ppq, chan) return math.floor(ppqToRow(ppq, chan) + 0.5) end
 
   ---------- AUDITION
 
@@ -656,7 +667,7 @@ function newViewManager(tm, cm)
   local function editEvent(col, evt, stop, char, half)
     if not col then return end
     local type = col.type
-    local cursorPPQ = rowToPPQ_c(col.midiChan, cursorRow)
+    local cursorPPQ = rowToPPQ(cursorRow, col.midiChan)
 
     local function commit(auditionPitch, auditionVel)
       tm:flush()
@@ -850,7 +861,7 @@ function newViewManager(tm, cm)
       tm:flush()
     elseif selGrp == 3 then
       local chan = col.midiChan
-      local base = rowToPPQ_c(chan, math.floor(ppqToRow_c(chan, evt.ppq)))
+      local base = rowToPPQ(snapRow(evt.ppq, chan), chan)
       local minStart = overlapBounds(col, evt.ppq, evt, false)
       if base ~= evt.ppq and base >= minStart and base < evt.endppq then
         tm:assignEvent('note', evt, { ppq = base })
@@ -875,7 +886,7 @@ function newViewManager(tm, cm)
   -- frame. Rows are the user's mental model; per-column swing means two
   -- columns over the same row range cover different intent-PPQ spans.
   local function selBoundsFor(col, r1, r2)
-    return rowToPPQ_c(col.midiChan, r1), rowToPPQ_c(col.midiChan, r2 + 1)
+    return rowToPPQ(r1, col.midiChan), rowToPPQ(r2 + 1, col.midiChan)
   end
 
   local function selectedEvents()
@@ -906,6 +917,8 @@ function newViewManager(tm, cm)
   ---------- INTERPOLATION
 
   -- Cycle the shape of A (governing pair A→next) forward one step.
+  -- For pb absorbers, visibility is derived from shape ∧ fakePb in tm,
+  -- so flipping shape alone restores the pb's prior visibility.
   local function cycleShape(col, A)
     if not A then return end
     tm:assignEvent(col.type, A, { shape = nextShape(A.shape or 'step') })
@@ -937,7 +950,7 @@ function newViewManager(tm, cm)
     local ghost = col.ghosts and col.ghosts[cursorRow]
     local A = ghost and ghost.fromEvt
               or (col.cells and col.cells[cursorRow])
-              or util:seek(col.events, 'before', rowToPPQ_c(col.midiChan, cursorRow + 1))
+              or util:seek(col.events, 'before', rowToPPQ(cursorRow + 1, col.midiChan))
     if A then cycleShape(col, A); tm:flush() end
   end
 
@@ -946,14 +959,14 @@ function newViewManager(tm, cm)
   local function cursorNoteBefore()
     local col = grid.cols[cursorCol]
     if not (col and col.type == 'note') then return end
-    local cursorPPQ = rowToPPQ_c(col.midiChan, cursorRow)
+    local cursorPPQ = rowToPPQ(cursorRow, col.midiChan)
     return col, util:seek(col.events, 'at-or-before', cursorPPQ, isNote)
   end
 
   local function cursorNoteAfter()
     local col = grid.cols[cursorCol]
     if not (col and col.type == 'note') then return end
-    local cursorPPQ = rowToPPQ_c(col.midiChan, cursorRow)
+    local cursorPPQ = rowToPPQ(cursorRow, col.midiChan)
     return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
   end
 
@@ -961,7 +974,7 @@ function newViewManager(tm, cm)
   -- columns, PAs are skipped.
   local function cursorRowEvent(col)
     if not col then return end
-    local lo, hi = rowToPPQ_c(col.midiChan, cursorRow), rowToPPQ_c(col.midiChan, cursorRow + 1)
+    local lo, hi = rowToPPQ(cursorRow, col.midiChan), rowToPPQ(cursorRow + 1, col.midiChan)
     local pred = col.type == 'note' and isNote or nil
     local evt = util:seek(col.events, 'at-or-after', lo, pred)
     if evt and evt.ppq < hi then return evt end
@@ -986,8 +999,8 @@ function newViewManager(tm, cm)
         local col = grid.cols[ci]
         if col and col.type == 'note' then
           local chan = col.midiChan
-          local targetPPQ = rowToPPQ_c(chan, sel.row1)
-          local nextPPQ   = rowToPPQ_c(chan, sel.row1 + 1)
+          local targetPPQ = rowToPPQ(sel.row1, chan)
+          local nextPPQ   = rowToPPQ(sel.row1 + 1, chan)
           local last = util:seek(col.events, 'before', nextPPQ, isNote)
           if last then util:add(hits, { col = col, note = last, targetPPQ = targetPPQ }) end
         end
@@ -1006,8 +1019,8 @@ function newViewManager(tm, cm)
 
     local col = grid.cols[cursorCol]
     if not (col and col.type == 'note' and cursorSelGrp() == 1) then return 'fallthrough' end
-    local cursorPPQ     = rowToPPQ_c(col.midiChan, cursorRow)
-    local nextCursorPPQ = rowToPPQ_c(col.midiChan, cursorRow + 1)
+    local cursorPPQ     = rowToPPQ(cursorRow, col.midiChan)
+    local nextCursorPPQ = rowToPPQ(cursorRow + 1, col.midiChan)
 
     local last = util:seek(col.events, 'before', nextCursorPPQ, isNote)
     if not last then return end
@@ -1017,11 +1030,11 @@ function newViewManager(tm, cm)
 
   local function adjustDurationCore(col, note, rowDelta)
     local chan = col.midiChan
-    local newRow = util:clamp(ppqToRow_c(chan, note.endppq) + rowDelta, 0, grid.numRows)
+    local newRow = util:clamp(ppqToRow(note.endppq, chan) + rowDelta, 0, grid.numRows)
           newRow = math.floor(newRow / rowDelta) * rowDelta
-    local minPPQ = math.min(note.endppq, rowToPPQ_c(chan, math.floor(ppqToRow_c(chan, note.ppq)) + 1))
+    local minPPQ = math.min(note.endppq, rowToPPQ(snapRow(note.ppq, chan) + 1, chan))
     local _, maxPPQ = overlapBounds(col, note.ppq, note, true)
-    local newPPQ = util:clamp(rowToPPQ_c(chan, newRow), minPPQ, maxPPQ)
+    local newPPQ = util:clamp(rowToPPQ(newRow, chan), minPPQ, maxPPQ)
     tm:assignEvent('note', note, { endppq = newPPQ })
   end
 
@@ -1053,11 +1066,11 @@ function newViewManager(tm, cm)
           table.sort(ns, function(a, b) return a.ppq < b.ppq end)
           if rowDelta > 0 then
             local _, maxEnd = overlapBounds(g.col, ns[#ns].ppq, ns[#ns], false)
-            local room = math.floor(ppqToRow_c(chan, maxEnd) - ppqToRow_c(chan, ns[#ns].endppq))
+            local room = math.floor(ppqToRow(maxEnd, chan) - snapRow(ns[#ns].endppq, chan))
             if room < rowDelta then return end
           else
             local minStart = overlapBounds(g.col, ns[1].ppq, ns[1], false)
-            local room = math.ceil(ppqToRow_c(chan, minStart) - ppqToRow_c(chan, ns[1].ppq))
+            local room = math.ceil(ppqToRow(minStart, chan) - snapRow(ns[1].ppq, chan))
             if room > rowDelta then return end
           end
           util:add(runs, { col = g.col, notes = ns })
@@ -1076,8 +1089,8 @@ function newViewManager(tm, cm)
       for i = s, e, step do
         local n = notes[i]
         tm:assignEvent('note', n, {
-          ppq    = rowToPPQ_c(chan, ppqToRow_c(chan, n.ppq)    + rowDelta),
-          endppq = rowToPPQ_c(chan, ppqToRow_c(chan, n.endppq) + rowDelta),
+          ppq    = rowToPPQ(ppqToRow(n.ppq, chan)    + rowDelta, chan),
+          endppq = rowToPPQ(ppqToRow(n.endppq, chan) + rowDelta, chan),
         })
       end
     end
@@ -1099,14 +1112,14 @@ function newViewManager(tm, cm)
     local chan = col.midiChan
 
     local absDelta = math.abs(rowDelta)
-    local rawRow   = ppqToRow_c(chan, note.ppq) + rowDelta
+    local rawRow   = ppqToRow(note.ppq, chan) + rowDelta
     local reqRow   = (rowDelta > 0 and math.ceil(rawRow / absDelta) or math.floor(rawRow / absDelta)) * absDelta
 
-    local curLen    = ppqToRow_c(chan, note.endppq) - ppqToRow_c(chan, note.ppq)
+    local curLen    = snapRow(note.endppq, chan) - snapRow(note.ppq, chan)
     local minLen    = math.min(absDelta, curLen)
     local minPPQ, maxEndPPQ = overlapBounds(col, note.ppq, note, false)
-    local minRow    = ppqToRow_c(chan, minPPQ)
-    local maxEndRow = ppqToRow_c(chan, maxEndPPQ)
+    local minRow    = ppqToRow(minPPQ, chan)
+    local maxEndRow = ppqToRow(maxEndPPQ, chan)
 
     local newEndRow, newRow
     if rowDelta > 0 then
@@ -1116,8 +1129,8 @@ function newViewManager(tm, cm)
       newRow    = math.max(reqRow, minRow)
       newEndRow = math.max(reqRow + curLen, newRow + minLen)
     end
-    local newPPQ = rowToPPQ_c(chan, newRow)
-    local newEndPPQ = rowToPPQ_c(chan, newEndRow)
+    local newPPQ = rowToPPQ(newRow, chan)
+    local newEndPPQ = rowToPPQ(newEndRow, chan)
 
     if newPPQ == note.ppq and newEndPPQ == note.endppq then return end
 
@@ -1137,8 +1150,8 @@ function newViewManager(tm, cm)
 
   local function insertRowCore(col, topRow, numRows)
     local chan = col.midiChan
-    local C = rowToPPQ_c(chan, topRow)
-    local R = rowToPPQ_c(chan, topRow + numRows) - C
+    local C = rowToPPQ(topRow, chan)
+    local R = rowToPPQ(topRow + numRows, chan) - C
 
     local shifted = {}
     for e in between(col.events, C, length) do util:add(shifted, e) end
@@ -1164,8 +1177,8 @@ function newViewManager(tm, cm)
 
   local function deleteRowCore(col, topRow, numRows)
     local chan = col.midiChan
-    local C = rowToPPQ_c(chan, topRow)
-    local D = rowToPPQ_c(chan, topRow + numRows)
+    local C = rowToPPQ(topRow, chan)
+    local D = rowToPPQ(topRow + numRows, chan)
     local R = D - C
 
     if col.type == 'note' then
@@ -1418,16 +1431,16 @@ function newViewManager(tm, cm)
     -- destination columns have different effective swings.
     local function noteEvent(col, evt, endPPQ)
       local chan = col.midiChan
-      local ce = { row = ppqToRow_c(chan, evt.ppq) - r1,
+      local ce = { row = ppqToRow(evt.ppq, chan) - r1,
                    pitch = evt.pitch, vel = evt.vel, loc = evt.loc }
       if isNote(evt) and evt.endppq <= endPPQ then
-        ce.endRow = ppqToRow_c(chan, evt.endppq) - r1
+        ce.endRow = ppqToRow(evt.endppq, chan) - r1
       end
       return ce
     end
 
     local function scalarEvent(col, evt, val)
-      return { row = ppqToRow_c(col.midiChan, evt.ppq) - r1, val = val, loc = evt.loc }
+      return { row = ppqToRow(evt.ppq, col.midiChan) - r1, val = val, loc = evt.loc }
     end
 
     -- Single-column mode
@@ -1553,18 +1566,18 @@ function newViewManager(tm, cm)
     local dstCol = grid.cols[cursorCol]
     if not dstCol then return end
     local chan = dstCol.midiChan
-    local startPPQ = rowToPPQ_c(chan, cursorRow)
-    local endPPQ = rowToPPQ_c(chan, cursorRow + clip.numRows)
+    local startPPQ = rowToPPQ(cursorRow, chan)
+    local endPPQ = rowToPPQ(cursorRow + clip.numRows, chan)
     local selGrp = cursorSelGrp()
 
     -- Resolve clipboard events to target PPQs, truncating past end
     local events = {}
     for _, ce in ipairs(clip.events) do
-      local ppq = rowToPPQ_c(chan, cursorRow + ce.row)
+      local ppq = rowToPPQ(cursorRow + ce.row, chan)
       if ppq >= endPPQ then goto nextCe end
       local e = util:assign({ ppq = ppq }, ce)
       if ce.endRow then
-        e.endppq = math.min(rowToPPQ_c(chan, cursorRow + ce.endRow), endPPQ)
+        e.endppq = math.min(rowToPPQ(cursorRow + ce.endRow, chan), endPPQ)
       end
       util:add(events, e)
       ::nextCe::
@@ -1696,17 +1709,17 @@ function newViewManager(tm, cm)
       local r = resolve(clipCol)
       if not r then goto nextCol end
       local dst = r.col
-      local startPPQ = rowToPPQ_c(r.chan, cursorRow)
-      local endPPQ   = rowToPPQ_c(r.chan, cursorRow + clip.numRows)
+      local startPPQ = rowToPPQ(cursorRow, r.chan)
+      local endPPQ   = rowToPPQ(cursorRow + clip.numRows, r.chan)
 
       -- Materialise clip events to target PPQs, sorted.
       local events = {}
       for _, ce in ipairs(clipCol.events) do
-        local ppq = rowToPPQ_c(r.chan, cursorRow + ce.row)
+        local ppq = rowToPPQ(cursorRow + ce.row, r.chan)
         if ppq < endPPQ then
           local e = util:assign({ ppq = ppq }, ce)
           if ce.endRow then
-            e.endppq = math.min(rowToPPQ_c(r.chan, cursorRow + ce.endRow), endPPQ)
+            e.endppq = math.min(rowToPPQ(cursorRow + ce.endRow, r.chan), endPPQ)
           end
           util:add(events, e)
         end
@@ -1902,10 +1915,8 @@ function newViewManager(tm, cm)
     return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
   end
 
-  function vm:ppqToRow(ppq) return ppqToRow(ppq) end
-  function vm:rowToPPQ(row) return rowToPPQ(row) end
-  function vm:ppqToRow_c(chan, ppq) return ppqToRow_c(chan, ppq) end
-  function vm:rowToPPQ_c(chan, row) return rowToPPQ_c(chan, row) end
+  function vm:ppqToRow(ppq, chan) return ppqToRow(ppq, chan) end
+  function vm:rowToPPQ(row, chan) return rowToPPQ(row, chan) end
 
   function vm:activeTuning()   return activeTuning() end
   function vm:noteProjection(evt) return noteProjection(evt) end
@@ -2062,7 +2073,7 @@ function newViewManager(tm, cm)
     playFromTop    = function() tm:playFrom(0) end,
     playFromCursor = function()
       local col = grid.cols[cursorCol]
-      tm:playFrom(col and rowToPPQ_c(col.midiChan, cursorRow) or rowToPPQ(cursorRow))
+      tm:playFrom(rowToPPQ(cursorRow, col and col.midiChan))
     end,
     stop           = function() tm:stop() end,
     addNoteCol     = function() vm:addExtraCol('note') end,
@@ -2449,7 +2460,7 @@ function newViewManager(tm, cm)
         gridCol.offGrid  = {}
         local chan = gridCol.midiChan
         for _, evt in ipairs(gridCol.events) do
-          local exact = ppqToRow_c(chan, evt.ppq or 0)
+          local exact = ppqToRow(evt.ppq or 0, chan)
           local y     = math.floor(exact + 0.5)
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
@@ -2475,8 +2486,8 @@ function newViewManager(tm, cm)
             local A, B = evts[i], evts[i+1]
             local shape = A.shape
             if shape and shape ~= 'step' then
-              local rA = ppqToRow_c(chan, A.ppq)
-              local rB = ppqToRow_c(chan, B.ppq)
+              local rA = ppqToRow(A.ppq, chan)
+              local rB = ppqToRow(B.ppq, chan)
               local yA, yB = math.floor(rA + 0.5), math.floor(rB + 0.5)
               local span, delta = rB - rA, (B.val or 0) - (A.val or 0)
               for y = yA + 1, yB - 1 do
