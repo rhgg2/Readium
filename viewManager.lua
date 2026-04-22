@@ -44,6 +44,27 @@ local function print(...)
   return util:print(...)
 end
 
+-- Order of column kinds within a channel (presentation).
+local columnKindOrder = { 'pc', 'pb', 'note', 'at', 'cc' }
+
+-- Canonicalise a flat column list: pc → pb → notes (preserving order,
+-- i.e. lane order) → at → cc (by cc number). Operates on grid cols,
+-- which carry a `type` field.
+local function canonicaliseColumns(cols)
+  local buckets = {}
+  for _, t in ipairs(columnKindOrder) do buckets[t] = {} end
+  for _, col in ipairs(cols) do
+    local b = buckets[col.type]
+    if b then util:add(b, col) end
+  end
+  table.sort(buckets.cc, function(a, b) return (a.cc or 0) < (b.cc or 0) end)
+  local out = {}
+  for _, t in ipairs(columnKindOrder) do
+    for _, col in ipairs(buckets[t]) do util:add(out, col) end
+  end
+  return out
+end
+
 --------------------
 -- Factory
 --------------------
@@ -2501,44 +2522,27 @@ function newViewManager(tm, cm)
       chans = { col.midiChan }
     end
 
-    if type == 'note' then
-      -- Note columns are managed via cfg.noteColumns, not the extras list.
-      local nc = cfg('noteColumns', {})
-      for _, chan in ipairs(chans) do
-        nc[chan] = (nc[chan] or 1) + 1
-      end
-      setcfg('take', 'noteColumns', nc)
-      return
-    end
-
     local extras = cfg('extraColumns', {})
-    local changed = false
     for _, chan in ipairs(chans) do
-      local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
-      local exists = false
-      if first and last then
-        for ci = first, last do
-          local c = grid.cols[ci]
-          if c.type == type and (type ~= 'cc' or c.cc == cc) then
-            exists = true; break
-          end
-        end
-      end
-      if not exists then
-        local chanExtras = extras[chan] or {}
-        util:add(chanExtras, { type = type, cc = cc })
-        extras[chan] = chanExtras
-        changed = true
+      local want = extras[chan] or { notes = 0 }
+      extras[chan] = want
+      if type == 'note' then
+        want.notes = want.notes + 1
+      elseif type == 'cc' then
+        want.ccs = want.ccs or {}
+        want.ccs[cc] = true
+      else
+        want[type] = true
       end
     end
-    if changed then setcfg('take', 'extraColumns', extras) end
+    setcfg('take', 'extraColumns', extras)
   end
 
   --- Delete the empty column under the cursor.
   --- For note columns: shift any higher-lane notes (and noteDelay entries)
-  --- down, and decrement cfg.noteColumns[chan]. Refuses if the column has
-  --- events or is the channel's only note column.
-  --- For cc/pb/at/pc extras: remove from the extras list.
+  --- down, and decrement extras.notes. Refuses if the column has events
+  --- or is the channel's only note column.
+  --- For cc/pb/at/pc: clear the entry in cfg.extraColumns.
   function vm:hideExtraCol()
     local col = grid.cols[cursorCol]
     if not col then return end
@@ -2560,6 +2564,10 @@ function newViewManager(tm, cm)
     end
 
     if #col.events > 0 then return end
+
+    local extras = cfg('extraColumns', {})
+    local want   = extras[chan] or { notes = 0 }
+    extras[chan] = want
 
     if col.type == 'note' then
       local noteCols = {}
@@ -2590,29 +2598,22 @@ function newViewManager(tm, cm)
         setcfg('take', 'noteDelay', next(nd) and nd or nil)
       end
 
-      -- Drop the configured count by one.
-      local ncCfg = cfg('noteColumns', {})
-      local newCount = #noteCols - 1
-      ncCfg[chan] = newCount > 1 and newCount or nil
-      setcfg('take', 'noteColumns', next(ncCfg) and ncCfg or nil)
-
-      tm:flush()
-      return
-    end
-
-    local extras = cfg('extraColumns', {})
-    local chanExtras = extras[chan]
-    if not chanExtras then return end
-    for i, extra in ipairs(chanExtras) do
-      if extra.type == col.type
-         and (col.type ~= 'cc' or extra.cc == col.cc) then
-        table.remove(chanExtras, i)
-        extras[chan] = #chanExtras > 0 and chanExtras or nil
-        setcfg('take', 'extraColumns', next(extras) and extras or nil)
-        vm:rebuild()
-        return
+      want.notes = #noteCols - 1
+    elseif col.type == 'cc' then
+      if want.ccs then
+        want.ccs[col.cc] = nil
+        if not next(want.ccs) then want.ccs = nil end
       end
+    else
+      want[col.type] = nil
     end
+
+    if want.notes == 0 and not (want.pc or want.pb or want.at or want.ccs) then
+      extras[chan] = nil
+    end
+    setcfg('take', 'extraColumns', next(extras) and extras or nil)
+
+    if col.type == 'note' then tm:flush() else vm:rebuild() end
   end
 
   --- Show the delay sub-column on one or more note columns (idempotent).
@@ -2726,44 +2727,16 @@ function newViewManager(tm, cm)
         grid.chanLastCol[chan]  = #grid.cols
       end
 
-      local extras = cfg('extraColumns', {})
-
       for chan, channel in tm:channels() do
-        local noteLane = 0
-        for _, column in ipairs(channel.columns) do
-          local key
-          if column.type == 'note' then
-            noteLane = noteLane + 1
-            key = noteLane
-          else
-            key = column.cc  -- nil for singletons
-          end
-          addGridCol(chan, column.type, key, column.events)
-        end
+        local c = channel.columns
+        if c.pc then addGridCol(chan, 'pc', nil,  c.pc.events) end
+        if c.pb then addGridCol(chan, 'pb', nil,  c.pb.events) end
+        for lane, col in ipairs(c.notes) do addGridCol(chan, 'note', lane, col.events) end
+        if c.at then addGridCol(chan, 'at', nil,  c.at.events) end
+        for n,    col in pairs(c.ccs)      do addGridCol(chan, 'cc',   n,    col.events) end
 
-        -- Inject non-note extra columns not already provided by tm.
-        -- (Note columns are managed via cfg.noteColumns and always come
-        -- from tm.)
-        local chanExtras = extras[chan]
-        if chanExtras then
-          for _, extra in ipairs(chanExtras) do
-            if extra.type ~= 'note' then
-              local found = false
-              for _, col in ipairs(channel.columns) do
-                if col.type == extra.type
-                   and (col.type ~= 'cc' or col.cc == extra.cc) then
-                  found = true
-                  break
-                end
-              end
-              if not found then
-                addGridCol(chan, extra.type, extra.cc)
-              end
-            end
-          end
-        end
-
-        -- Canonicalise column order within the channel (matches trackerManager).
+        -- Canonicalise column order within the channel: the cc dict
+        -- isn't ordered.
         local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
         if first and last and last > first then
           local slice = {}

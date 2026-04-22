@@ -27,24 +27,33 @@
 --
 --   Each channel table contains:
 --     chan    : number (1..16)
---     columns : array of column tables
+--     columns : dict keyed by kind —
+--       pc, pb, at : singleton column or nil
+--       notes      : dense array of note columns (index = lane)
+--       ccs        : sparse dict of cc columns keyed by CC number
 --
 --   Each column table contains:
---     type   : string ('note', 'cc', 'pb', 'at', 'pa', 'pc')
 --     events : array of event tables, sorted by ppq
 --     cc     : cc columns only — the CC number.
+--
+--   tm imposes no ordering on columns — that's a presentation concern
+--   owned by vm.
 --
 --   Note columns carry no identity beyond their position among note
 --   columns in the channel. A note's "lane" is that position, persisted
 --   per note under the 'lane' key. Lane counts are stable across
---   rebuilds: cfg.noteColumns[chan] stores a per-channel count, tm grows
---   it when allocation needs more lanes, and lanes only shrink via
---   explicit user action in viewManager.
+--   rebuilds: cfg.extraColumns[chan].notes stores a per-channel
+--   high-water lane count, tm grows it when allocation needs more
+--   lanes, and lanes only shrink via explicit user action in vm.
 --
---   Note column lanes are stable across rebuilds: the cfg key
---   'noteColumns' stores a per-channel count, and tm grows it when
---   allocation needs more lanes. Lanes only shrink via explicit user
---   action in viewManager.
+--   cfg.extraColumns is the single source of "columns the user has
+--   opened per channel", with shape:
+--     { [chan] = { notes = <count>, pc = true, pb = true, at = true,
+--                  ccs = { [ccNum] = true } } }
+--   tm reconciles this with live MIDI during rebuild: any column
+--   present in extras but not backed by events is materialised as
+--   empty, so consumers see a uniform channel.columns irrespective of
+--   whether a column is data-driven or user-opened.
 --
 -- GLOBAL DATA
 --   tm:length()       -- take length in PPQ (delegated to midiManager)
@@ -60,29 +69,6 @@ local function print(...)
   return util:print(...)
 end
 
--- Order of column kinds within a channel.
-columnKindOrder = { 'pc', 'pb', 'note', 'at', 'cc' }
-
--- Canonicalise a column list: pc → pb → notes (preserving creation
--- order, i.e. lane order) → at → cc (by cc number). Returns a new list.
--- Exposed so viewManager can reuse the same rule on its grid-column slice.
-function canonicaliseColumns(cols)
-  local buckets = {}
-  for _, t in ipairs(columnKindOrder) do buckets[t] = {} end
-  for _, col in ipairs(cols) do
-    local b = buckets[col.type]
-    if b then util:add(b, col) end
-  end
-  table.sort(buckets.cc, function(a, b) return (a.cc or 0) < (b.cc or 0) end)
-  local out = {}
-  for _, t in ipairs(columnKindOrder) do
-    for _, col in ipairs(buckets[t]) do util:add(out, col) end
-  end
-  return out
-end
-
---------------------
-
 function newTrackerManager(mm, cm)
 
   ---------- PRIVATE DATA & FUNCTIONS
@@ -91,6 +77,10 @@ function newTrackerManager(mm, cm)
   local fire  -- installed below, once tm exists
   local um    -- update manager; set by tm:rebuild
   local lastMuteSet = {}  -- { [chan] = true }, pushed by vm via tm:setMutedChannels
+
+  local function sortByPPQ(tbl)
+    table.sort(tbl, function(a, b) return a.ppq < b.ppq end)
+  end
 
   local function cfg(key, default)
     if cm then
@@ -192,22 +182,16 @@ function newTrackerManager(mm, cm)
   -- them in one mm:modify call. pb.val is stored as logical cents
   -- throughout; conversion to raw happens at flush time.
   --
-  -- Created once per tm:rebuild. The isRebuilding instance runs Stage 1
-  -- reconciliation and flushes immediately; the ongoing instance handles
-  -- user edits until the next rebuild.
+  -- Re-created once per tm:rebuild so its view of mm matches tm's.
   --------------------
 
-  local function createUpdateManager(isRebuilding)
+  local function createUpdateManager()
     local adds = {}
     local assigns = {}
     local deletes = {}
     local chans = {}
     local notesByLoc = {}
     local ccsByLoc = {}
-
-    local function sortByPPQ(tbl)
-      table.sort(tbl, function(a, b) return a.ppq < b.ppq end)
-    end
 
     ----- Accessors: raw / logical / detune over the local state.
 
@@ -592,35 +576,42 @@ function newTrackerManager(mm, cm)
     function um:flush()
       if #adds == 0 and #assigns == 0 and #deletes == 0 then return end
 
-      for _, e in ipairs(assigns) do
+      -- Snapshot and clear up front: mm:modify fires callbacks that can
+      -- reach back into the same um (e.g. tm:rebuild → setMutedChannels →
+      -- um:flush). Clearing before the modify stops the re-entrant flush
+      -- from re-emitting ops already in flight.
+      local flushAdds, flushAssigns, flushDeletes = adds, assigns, deletes
+      adds, assigns, deletes = {}, {}, {}
+
+      for _, e in ipairs(flushAssigns) do
         if e.type == 'pb' and e.update.val ~= nil then
           e.update.val = centsToRaw(e.update.val)
         end
       end
-      for _, a in ipairs(adds) do
+      for _, a in ipairs(flushAdds) do
         if a.type == 'pb' then
           a.evt.val = centsToRaw(a.evt.val)
         end
       end
-      table.sort(deletes, function(a, b) return a.loc > b.loc end)
+      table.sort(flushDeletes, function(a, b) return a.loc > b.loc end)
 
       mm:modify(function()
-        for _, o in ipairs(assigns) do
+        for _, o in ipairs(flushAssigns) do
           if o.type == 'note' then mm:assignNote(o.loc, o.update)
           else mm:assignCC(o.loc, o.update) end
         end
-        for _, o in ipairs(deletes) do
+        for _, o in ipairs(flushDeletes) do
           if o.type == 'note' then mm:deleteNote(o.loc)
           else mm:deleteCC(o.loc) end
         end
-        for _, o in ipairs(adds) do
+        for _, o in ipairs(flushAdds) do
           if o.type == 'note' then mm:addNote(o.evt)
           else mm:addCC(o.evt) end
         end
       end)
     end
 
-    ----- Init: load state from mm; run Stage 1 if rebuilding.
+    ----- Init: load local cache from mm.
 
     local function init()
       for i = 1, 16 do chans[i] = { notes = {}, pbs = {} } end
@@ -650,15 +641,6 @@ function newTrackerManager(mm, cm)
         end
       end
       for i = 1, 16 do sortByPPQ(chans[i].notes) end
-
-      if isRebuilding then
-        for _, n in pairs(notesByLoc) do
-          if n.detune == nil or n.delay == nil then
-            assignLowlevel('note', n, { detune = n.detune or 0, delay = n.delay or 0 })
-          end
-        end
-        um:flush()
-      end
     end
 
     init()
@@ -667,36 +649,16 @@ function newTrackerManager(mm, cm)
 
   --------------------
   -- Column creation
-  --   note / pb / pc / at : no identifying field.
-  --   cc                  : carries .cc = CC number.
+  --
+  -- Singletons (pc, pb, at) live at channel.columns[kind]; notes form a
+  -- dense array at channel.columns.notes (index = lane); ccs a sparse
+  -- dict at channel.columns.ccs keyed by CC number. All columns carry
+  -- `events`; cc columns additionally carry `cc` (the CC number).
   --------------------
 
-  local function addColumn(channel, type, cc)
-    return util:add(channel.columns, { type = type, cc = cc, events = {} })
-  end
-
-  local function noteColCount(channel)
-    local n = 0
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then n = n + 1 end
-    end
-    return n
-  end
-
-  -- Singleton columns: pb, pc, at. One per channel.
-  local function getOrCreateSingletonColumn(channel, colType)
-    for _, col in ipairs(channel.columns) do
-      if col.type == colType then return col end
-    end
-    return addColumn(channel, colType)
-  end
-
-  -- CC columns are keyed by cc number.
-  local function getOrCreateCCColumn(channel, ccNum)
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'cc' and col.cc == ccNum then return col end
-    end
-    return addColumn(channel, 'cc', ccNum)
+  local function pushNoteCol(channel)
+    local notes = channel.columns.notes
+    return util:add(notes, { events = {} }), #notes
   end
 
   --------------------
@@ -725,39 +687,26 @@ function newTrackerManager(mm, cm)
     return dominated < 2
   end
 
-  local function noteColAt(channel, lane)
-    local n = 0
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then
-        n = n + 1
-        if n == lane then return col end
-      end
-    end
-  end
-
-  -- Returns (col, lane) where lane is the 1-indexed position among the
-  -- channel's note columns.
+  -- Returns (col, lane) where lane is the 1-indexed position in
+  -- channel.columns.notes.
   local function allocateNoteColumn(channel, note)
+    local notes = channel.columns.notes
     if note.lane then
-      local col = noteColAt(channel, note.lane)
+      local col = notes[note.lane]
       if col and noteColumnAccepts(col, note.ppq, note.endppq) then
         return col, note.lane
       end
       if not col then
         -- Preferred lane doesn't exist yet — grow until it does.
-        while noteColCount(channel) < note.lane do addColumn(channel, 'note') end
-        return noteColAt(channel, note.lane), note.lane
+        while #notes < note.lane do pushNoteCol(channel) end
+        return notes[note.lane], note.lane
       end
       -- Exists but won't fit. Fall through to first-fit / spill.
     end
-    local n = 0
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then
-        n = n + 1
-        if noteColumnAccepts(col, note.ppq, note.endppq) then return col, n end
-      end
+    for i, col in ipairs(notes) do
+      if noteColumnAccepts(col, note.ppq, note.endppq) then return col, i end
     end
-    return addColumn(channel, 'note'), n + 1
+    return pushNoteCol(channel)
   end
 
   --------------------
@@ -765,28 +714,18 @@ function newTrackerManager(mm, cm)
   --------------------
 
   local function findNoteColumnForPitch(channel, pitch, ppq_pos)
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then
-        for _, evt in ipairs(col.events) do
-          if evt.endppq and evt.pitch == pitch and evt.ppq <= ppq_pos and evt.endppq > ppq_pos then
-            return col
-          end
+    local notes = channel.columns.notes
+    for _, col in ipairs(notes) do
+      for _, evt in ipairs(col.events) do
+        if evt.endppq and evt.pitch == pitch and evt.ppq <= ppq_pos and evt.endppq > ppq_pos then
+          return col
         end
       end
     end
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then
-        for _, evt in ipairs(col.events) do
-          if evt.pitch == pitch then return col end
-        end
+    for _, col in ipairs(notes) do
+      for _, evt in ipairs(col.events) do
+        if evt.pitch == pitch then return col end
       end
-    end
-    return
-  end
-
-  local function firstNoteCol(channel)
-    for _, col in ipairs(channel.columns) do
-      if col.type == 'note' then return col end
     end
   end
 
@@ -810,12 +749,17 @@ function newTrackerManager(mm, cm)
 
     changed = changed or { take = false, data = true }
 
-    local noteColsCount = cfg('noteColumns', util:dotimes(16,1))
-    
     channels = {}
     for i = 1, 16 do
-      channels[i] = { chan = i, columns = {} }
-      util:dotimes(noteColsCount[i], function() addColumn(channels[i], 'note') end)
+      channels[i] = { chan = i, columns = { notes = {}, ccs = {} } }
+    end
+
+    -- 0) Seed default detune/delay on any note missing them. Metadata-only
+    --    writes bypass the mm:modify lock and don't fire callbacks.
+    for loc, n in mm:notes() do
+      if n.detune == nil or n.delay == nil then
+        mm:assignNote(loc, { detune = n.detune or 0, delay = n.delay or 0 })
+      end
     end
 
     -- 1) Truncate overlapping notes on the same channel and pitch.
@@ -827,7 +771,7 @@ function newTrackerManager(mm, cm)
         util:add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
       end
       for _, group in pairs(groups) do
-        table.sort(group, function(a, b) return a.ppq < b.ppq end)
+        sortByPPQ(group)
         for i = 1, #group - 1 do
           if group[i].endppq > group[i + 1].ppq then
             util:add(work, { loc = group[i].loc, endppq = group[i + 1].ppq })
@@ -852,25 +796,12 @@ function newTrackerManager(mm, cm)
       util:add(col.events, note)
     end
 
-    -- 2b) Persist growth in per-channel note column counts
-    do
-      local grew = false
-      for i = 1, 16 do
-        local n = noteColCount(channels[i])
-        if n > noteColsCount[i] then
-          noteColsCount[i] = n
-          grew = true
-        end
-      end
-      if grew then setcfg('take', 'noteColumns', noteColsCount) end
-    end
-
-    -- 3) Pitchbend; first line does some initial housekeeping
-    createUpdateManager(true)
-
+    -- 3) Pitchbend display column: expose logical (raw - detune) for col-1
+    --    anchors, hiding pure detune-absorbers unless an interp shape pulls
+    --    them back into view.
     for chan = 1, 16 do
       local channel = channels[chan]
-      local col1    = firstNoteCol(channel)
+      local col1    = channel.columns.notes[1]
       local notes   = (col1 and col1.events) or {}
 
       -- Detune prevailing at P: latest-starting note at or before P wins.
@@ -907,8 +838,8 @@ function newTrackerManager(mm, cm)
         end
       end
       if anyVisible then
-        local col = getOrCreateSingletonColumn(channel, 'pb')
-        for _, e in ipairs(events) do util:add(col.events, e) end
+        channel.columns.pb = channel.columns.pb or { events = {} }
+        for _, e in ipairs(events) do util:add(channel.columns.pb.events, e) end
       end
     end
 
@@ -925,41 +856,65 @@ function newTrackerManager(mm, cm)
           })
         end
       elseif cc.msgType == 'cc' then
-        local col = getOrCreateCCColumn(channel, cc.cc)
+        local col = channel.columns.ccs[cc.cc] or { cc = cc.cc, events = {} }
+        channel.columns.ccs[cc.cc] = col
         util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
       elseif cc.msgType == 'at' or cc.msgType == 'pc' then
-        local col = getOrCreateSingletonColumn(channel, cc.msgType)
+        local col = channel.columns[cc.msgType] or { events = {} }
+        channel.columns[cc.msgType] = col
         util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
       end
     end
 
-
-    -- 5) Strip delay from col.events so vm sees intent-frame PPQs.
-    for _, chan in ipairs(channels) do
-      for _, col in ipairs(chan.columns) do
-        for _, evt in ipairs(col.events) do
-          local d = delayToPPQ(evt.delay)
-          if d ~= 0 then
-            evt.ppq = evt.ppq - d
-            if evt.endppq then evt.endppq = evt.endppq - d end
-          end
+    -- 4b) Reconcile with user-intent extras. Grow `extras[chan].notes`
+    --     if live allocation exceeded it (high-water mark), then pad
+    --     empty note lanes and seed singletons/ccs that the user has
+    --     opened but that carry no events yet.
+    do
+      local extras = cfg('extraColumns') or {}
+      local grew   = false
+      for i = 1, 16 do
+        local c    = channels[i].columns
+        local want = extras[i] or { notes = 0 }
+        local n    = #c.notes
+        if n > want.notes then
+          want.notes = n
+          extras[i] = want
+          grew = true
+        end
+        while #c.notes < want.notes do pushNoteCol(channels[i]) end
+        if want.pc then c.pc = c.pc or { events = {} } end
+        if want.pb then c.pb = c.pb or { events = {} } end
+        if want.at then c.at = c.at or { events = {} } end
+        for ccNum in pairs(want.ccs or {}) do
+          c.ccs[ccNum] = c.ccs[ccNum] or { cc = ccNum, events = {} }
         end
       end
+      if grew then setcfg('take', 'extraColumns', extras) end
     end
 
-    -- 6) Sort every column's events by (intent) ppq.
-    for _, chan in ipairs(channels) do
-      for _, col in ipairs(chan.columns) do
-        table.sort(col.events, function(a, b) return a.ppq < b.ppq end)
+    -- 5) Strip delay (so vm sees intent-frame PPQs) and sort each
+    --    column's events by (intent) ppq.
+    local function tidyCol(col)
+      for _, evt in ipairs(col.events) do
+        local d = delayToPPQ(evt.delay)
+        if d ~= 0 then
+          evt.ppq = evt.ppq - d
+          if evt.endppq then evt.endppq = evt.endppq - d end
+        end
       end
+      sortByPPQ(col.events)
     end
-
-    -- 7) Canonicalise column order within each channel.
     for _, chan in ipairs(channels) do
-      chan.columns = canonicaliseColumns(chan.columns)
+      local c = chan.columns
+      if c.pc then tidyCol(c.pc) end
+      if c.pb then tidyCol(c.pb) end
+      for _, col in ipairs(c.notes) do tidyCol(col) end
+      if c.at then tidyCol(c.at) end
+      for _, col in pairs(c.ccs) do tidyCol(col) end
     end
 
-    um = createUpdateManager(false)
+    um = createUpdateManager()
     rebuilding = false
 
     fire(changed, tm)
@@ -1103,12 +1058,10 @@ function newTrackerManager(mm, cm)
     if not um then return end
     for _, ch in ipairs(channels) do
       local want = lastMuteSet[ch.chan] == true
-      for _, col in ipairs(ch.columns) do
-        if col.type == 'note' then
-          for _, n in ipairs(col.events) do
-            if (n.muted == true) ~= want then
-              um:assignEvent('note', n, { muted = want })
-            end
+      for _, col in ipairs(ch.columns.notes) do
+        for _, n in ipairs(col.events) do
+          if (n.muted == true) ~= want then
+            um:assignEvent('note', n, { muted = want })
           end
         end
       end
