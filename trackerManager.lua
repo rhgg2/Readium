@@ -754,18 +754,15 @@ function newTrackerManager(mm, cm)
       channels[i] = { chan = i, columns = { notes = {}, ccs = {} } }
     end
 
-    -- 0) Seed default detune/delay on any note missing them. Metadata-only
-    --    writes bypass the mm:modify lock and don't fire callbacks.
-    for loc, n in mm:notes() do
-      if n.detune == nil or n.delay == nil then
-        mm:assignNote(loc, { detune = n.detune or 0, delay = n.delay or 0 })
-      end
-    end
-
-    -- 1) Truncate overlapping notes on the same channel and pitch.
+    -- 1) Walk notes once: seed default detune/delay on any that lack them
+    --    (metadata-only, bypasses the mm:modify lock) and collect
+    --    (chan,pitch) groups for overlap truncation.
     do
       local groups, work = {}, {}
       for loc, note in mm:notes() do
+        if note.detune == nil or note.delay == nil then
+          mm:assignNote(loc, { detune = note.detune or 0, delay = note.delay or 0 })
+        end
         local key = note.chan .. '|' .. note.pitch
         groups[key] = groups[key] or {}
         util:add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
@@ -796,40 +793,37 @@ function newTrackerManager(mm, cm)
       util:add(col.events, note)
     end
 
-    -- 3) Pitchbend display column: expose logical (raw - detune) for col-1
-    --    anchors, hiding pure detune-absorbers unless an interp shape pulls
-    --    them back into view.
-    for chan = 1, 16 do
-      local channel = channels[chan]
-      local col1    = channel.columns.notes[1]
-      local notes   = (col1 and col1.events) or {}
-
-      -- Detune prevailing at P: latest-starting note at or before P wins.
-      -- `notes` is unsorted at this stage, so an O(n) scan rather than seek.
-      local function detuneAtP(P)
-        local best
-        for _, n in ipairs(notes) do
-          if n.ppq <= P and (not best or n.ppq > best.ppq) then best = n end
-        end
-        return (best and best.detune) or 0
-      end
-
-      local events, anyVisible = {}, false
+    -- 3) Single CC walk: pitchbend display (with detune-absorber bookkeeping)
+    --    plus pa / cc / at / pc column distribution. Pb accumulates per
+    --    channel so column install can be gated on anyVisible.
+    do
+      local pbByChan = {}
       for loc, cc in mm:ccs() do
-        if cc.chan == chan and cc.msgType == 'pb' then
-          -- A col-1 note starting at cc.ppq with fakePb means this pb is
-          -- the detune-boundary absorber for that note: inherit its delay
-          -- so the display event travels with the note into intent frame.
-          -- Hide unless interp shape pulls it back into view as a ramp anchor.
-          local fakeNote
-          for _, n in ipairs(notes) do
-            if n.ppq == cc.ppq and n.fakePb then fakeNote = n; break end
-          end
-          local detune = detuneAtP(cc.ppq)
-          local hidden = fakeNote and (cc.shape == nil or cc.shape == 'step')
-          anyVisible = anyVisible or not hidden
+        local channel = channels[cc.chan]
 
-          util:add(events, {
+        if cc.msgType == 'pb' then
+          -- Col-1 notes provide both detune context and fakePb identity.
+          -- One scan resolves both: latest-starting note at-or-before cc.ppq
+          -- wins detune; a fakePb note exactly at cc.ppq is its host.
+          local col1      = channel.columns.notes[1]
+          local notes     = (col1 and col1.events) or {}
+          local fakeNote, prevailing
+          for _, n in ipairs(notes) do
+            if n.ppq == cc.ppq and n.fakePb then fakeNote = n end
+            if n.ppq <= cc.ppq and (not prevailing or n.ppq > prevailing.ppq) then
+              prevailing = n
+            end
+          end
+          local detune = (prevailing and prevailing.detune) or 0
+          -- Absorbers hide unless an interp shape pulls them into view.
+          -- Fake pbs inherit their host's delay so tidyCol shifts them
+          -- with the note into intent frame.
+          local hidden = fakeNote and (cc.shape == nil or cc.shape == 'step')
+
+          local pb = pbByChan[cc.chan] or { events = {}, anyVisible = false }
+          pbByChan[cc.chan] = pb
+          pb.anyVisible = pb.anyVisible or not hidden
+          util:add(pb.events, {
             loc     = loc,
             ppq     = cc.ppq,
             val     = util:round(rawToCents(cc.val) - detune),
@@ -839,38 +833,35 @@ function newTrackerManager(mm, cm)
             tension = cc.tension,
             delay   = fakeNote and fakeNote.delay or nil,
           })
+
+        elseif cc.msgType == 'pa' then
+          local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
+          if noteCol then
+            util:add(noteCol.events, {
+              ppq = cc.ppq, type = 'pa', pitch = cc.pitch, vel = cc.val, loc = loc
+            })
+          end
+
+        elseif cc.msgType == 'cc' then
+          local col = channel.columns.ccs[cc.cc] or { cc = cc.cc, events = {} }
+          channel.columns.ccs[cc.cc] = col
+          util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
+
+        elseif cc.msgType == 'at' or cc.msgType == 'pc' then
+          local col = channel.columns[cc.msgType] or { events = {} }
+          channel.columns[cc.msgType] = col
+          util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
         end
       end
-      if anyVisible then
-        channel.columns.pb = channel.columns.pb or { events = {} }
-        for _, e in ipairs(events) do util:add(channel.columns.pb.events, e) end
+
+      for chan, pb in pairs(pbByChan) do
+        if pb.anyVisible then
+          channels[chan].columns.pb = { events = pb.events }
+        end
       end
     end
 
-    -- 4) CCs, aftertouch, program change
-    for loc, cc in mm:ccs() do
-      local channel = channels[cc.chan]
-
-      if cc.msgType == 'pa' then
-        -- attach to the note column owning that pitch
-        local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
-        if noteCol then
-          util:add(noteCol.events,{
-            ppq = cc.ppq, type = 'pa', pitch = cc.pitch, vel = cc.val, loc = loc
-          })
-        end
-      elseif cc.msgType == 'cc' then
-        local col = channel.columns.ccs[cc.cc] or { cc = cc.cc, events = {} }
-        channel.columns.ccs[cc.cc] = col
-        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
-      elseif cc.msgType == 'at' or cc.msgType == 'pc' then
-        local col = channel.columns[cc.msgType] or { events = {} }
-        channel.columns[cc.msgType] = col
-        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
-      end
-    end
-
-    -- 4b) Reconcile with user-intent extras. Grow `extras[chan].notes`
+    -- 4) Reconcile with user-intent extras. Grow `extras[chan].notes`
     --     if live allocation exceeded it (high-water mark), then pad
     --     empty note lanes and seed singletons/ccs that the user has
     --     opened but that carry no events yet.
