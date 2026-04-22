@@ -739,7 +739,7 @@ function newRenderManager(vm, cm)
             elseif result == 'swingEditor' then
               if not swingEditor then
                 local name = cfg('swing')
-                local lib  = cfg('swings') or {}
+                local lib  = cfg('swings', {})
                 swingEditor = {
                   name      = name,
                   snapshot  = name and util:deepClone(lib[name]) or nil,
@@ -995,7 +995,7 @@ function newRenderManager(vm, cm)
   -- so Reset always has the on-open state.
 
   local function swingRead()
-    return (cfg('swings') or {})[swingEditor.name]
+    return cfg('swings', {})[swingEditor.name]
   end
 
   local function compositesEqual(a, b)
@@ -1189,7 +1189,7 @@ function newRenderManager(vm, cm)
         local confirm = rv or ImGui.Button(ctx, 'Create new swing')
         if confirm then
           local name = buf and buf:match('^%s*(.-)%s*$')
-          local lib  = cfg('swings') or {}
+          local lib  = cfg('swings', {})
           if not name or name == '' then
             swingEditor.createError = 'Name required.'
           elseif lib[name] then

@@ -126,6 +126,24 @@ function util:oneOf(choices, txt)
   return false
 end
 
+function util:round(n, to)
+  if to then
+    return math.floor(n / to + 0.5) * to
+  else
+    return math.floor(n + 0.5)
+  end
+end
+
+function util:dotimes(n, v)
+  if type(v) == 'function' then
+    for _ = 1, n do v() end
+    return
+  end
+  local rv = {}
+  for i = 1, n do rv[i] = v end
+  return rv
+end
+
 -- Canonical Bézier handle table recovered from REAPER's `bezier` shape.
 -- Indexed by |τ| at 0.1 steps (rows[1] = |τ|=0.0, rows[11] = |τ|=1.0).
 -- Row: { h, θ_large (rad), θ_small (rad) }. See design/curves.md.

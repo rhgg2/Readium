@@ -141,7 +141,7 @@ function newViewManager(tm, cm)
 
   local function effectiveColSwing(chan)
     if frameOverride and frameOverride.chan == chan then return frameOverride.col end
-    return (cfg('colSwing', {}) or {})[chan]
+    return cfg('colSwing', {})[chan]
   end
 
   local function effectiveRPB()
@@ -162,7 +162,7 @@ function newViewManager(tm, cm)
   -- the override's chan is replaced, so other channels fall through.
   local function swingOverrideArg()
     if not frameOverride then return nil end
-    local colMap = util:clone(cfg('colSwing', {}) or {})
+    local colMap = util:clone(cfg('colSwing', {}))
     colMap[frameOverride.chan] = frameOverride.col
     return { swing = frameOverride.swing, colSwing = colMap }
   end
@@ -186,8 +186,8 @@ function newViewManager(tm, cm)
   local effectiveMuted = {}  -- cached for cheap per-cell render queries
 
   local function recomputeEffectiveMute()
-    local m = util:clone(cfg('mutedChannels', {}) or {})
-    local s = cfg('soloedChannels', {}) or {}
+    local m = util:clone(cfg('mutedChannels', {}))
+    local s = cfg('soloedChannels', {})
     if next(s) then
       for c = 1, 16 do
         if s[c] then m[c] = nil
@@ -203,7 +203,7 @@ function newViewManager(tm, cm)
   end
 
   local function toggleChannelFlag(key, chan)
-    local s = util:clone(cfg(key, {}) or {})
+    local s = util:clone(cfg(key, {}))
     s[chan] = (not s[chan]) or nil
     setcfg('take', key, s)
   end
@@ -784,7 +784,7 @@ function newViewManager(tm, cm)
       -- Stops 5,6,7: delay (signed, decimal, milli-QN; 3 digits, ±999)
       elseif stop == 5 or stop == 6 or stop == 7 then
         if not isNote(evt) then return end
-        local old = evt.delay or 0
+        local old = evt.delay
 
         local newDelay
         if char == string.byte('-') then
@@ -1527,11 +1527,11 @@ function newViewManager(tm, cm)
     local tuning = activeTuning()
     local pitch, detune
     if tuning then
-      pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune or 0, delta)
+      pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune, delta)
     else
-      pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune or 0
+      pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune
     end
-    if pitch == note.pitch and detune == (note.detune or 0) then return end
+    if pitch == note.pitch and detune == note.detune then return end
     tm:retuneNote(note, { pitch = pitch, detune = detune })
     if audible then audition(pitch, note.vel, col.midiChan) end
   end
@@ -1543,7 +1543,7 @@ function newViewManager(tm, cm)
 
   local function nudgeDelay(col, note, dir, coarse)
     local minD, maxD = delayRange(col, note)
-    local old = note.delay or 0
+    local old = note.delay
     local new = nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
     if new ~= old then tm:assignEvent('note', note, { delay = new }) end
   end
@@ -1633,7 +1633,7 @@ function newViewManager(tm, cm)
   -- Queue delay resets; zero the `delay` metadata on each selected note.
   local function queueResetDelays(col, locs)
     for _, evt in pairs(locs) do
-      if evt.type ~= 'pa' and (evt.delay or 0) ~= 0 then
+      if evt.type ~= 'pa' and evt.delay ~= 0 then
         tm:assignEvent('note', evt, { delay = 0 })
       end
     end
@@ -2227,8 +2227,8 @@ function newViewManager(tm, cm)
     if first then selectSpan(2, first, 1, 1) end
   end
 
-  function vm:isChannelMuted(chan)            return (cfg('mutedChannels',  {}) or {})[chan] == true end
-  function vm:isChannelSoloed(chan)           return (cfg('soloedChannels', {}) or {})[chan] == true end
+  function vm:isChannelMuted(chan)            return cfg('mutedChannels',  {})[chan] == true end
+  function vm:isChannelSoloed(chan)           return cfg('soloedChannels', {})[chan] == true end
   function vm:isChannelEffectivelyMuted(chan) return effectiveMuted[chan] == true end
   function vm:toggleChannelMute(chan)         toggleChannelFlag('mutedChannels',  chan) end
   function vm:toggleChannelSolo(chan)         toggleChannelFlag('soloedChannels', chan) end
@@ -2409,7 +2409,7 @@ function newViewManager(tm, cm)
         -- Seed the composite into the project library on first use, so
         -- the name resolves. The project library is the sole source of
         -- truth for name → composite; timing.presets is just seed data.
-        local lib = cfg('swings') or {}
+        local lib = cfg('swings', {})
         if not lib[next] then
           local proj = util:clone(cm:getAt('project', 'swings') or {})
           proj[next] = timing.presets[next]
@@ -2591,7 +2591,7 @@ function newViewManager(tm, cm)
       end
 
       -- Drop the configured count by one.
-      local ncCfg = cfg('noteColumns', {}) or {}
+      local ncCfg = cfg('noteColumns', {})
       local newCount = #noteCols - 1
       ncCfg[chan] = newCount > 1 and newCount or nil
       setcfg('take', 'noteColumns', next(ncCfg) and ncCfg or nil)

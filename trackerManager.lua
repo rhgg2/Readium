@@ -100,6 +100,11 @@ function newTrackerManager(mm, cm)
     return default
   end
 
+  local function setcfg(lev, key, val)
+    if cm then cm:set(lev, key, val) end
+  end
+
+
   --------------------
   -- PB <-> cents conversion
   --------------------
@@ -272,7 +277,7 @@ function newTrackerManager(mm, cm)
 
     local function addLowlevel(evtType, evt)
       if evtType == 'note' then
-        local col1 = (evt.lane or 1) == 1
+        local col1 = evt.lane == 1
         if col1 then
           local tbl = chans[evt.chan].notes
           util:add(tbl, evt)
@@ -410,9 +415,9 @@ function newTrackerManager(mm, cm)
     end
 
     local function addNote(n)
-      local D = n.detune or 0
+      local D = n.detune
       if lastMuteSet[n.chan] then n.muted = true end
-      if (n.lane or 1) == 1 then
+      if n.lane == 1 then
         local C = detuneAt(n.chan, n.ppq)
         if D ~= C and forcePb(n.chan, n.ppq) then markFake(n) end
         retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D - C)
@@ -430,7 +435,7 @@ function newTrackerManager(mm, cm)
     end
 
     local function resizeNote(n, P1, P2)
-      local col1  = (n.lane or 1) == 1
+      local col1  = n.lane == 1
       local shift = P1 - n.ppq
       if shift ~= 0 and P2 - n.endppq == shift then
         forEachAttachedPA(n, function(evt)
@@ -493,9 +498,9 @@ function newTrackerManager(mm, cm)
       if update.pitch then
         forEachAttachedPA(n, function(e) assignLowlevel('pa', e, { pitch = update.pitch }) end)
       end
-      if (n.lane or 1) == 1 and update.detune ~= nil and update.detune ~= (n.detune or 0) then
+      if n.lane == 1 and update.detune ~= nil and update.detune ~= n.detune then
         if forcePb(n.chan, n.ppq) then markFake(n) end
-        retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), update.detune - (n.detune or 0))
+        retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), update.detune - n.detune)
         -- Boundary became redundant (detune matches prior, no raw step) — drop it.
         if update.detune == detuneBefore(n.chan, n.ppq)
            and rawAt(n.chan, n.ppq) == rawBefore(n.chan, n.ppq) then
@@ -564,6 +569,9 @@ function newTrackerManager(mm, cm)
 
     function um:addEvent(evtType, evt)
       if evtType == 'note' then
+        evt.detune = evt.detune or 0
+        evt.delay  = evt.delay  or 0
+        evt.lane   = evt.lane   or 1
         local d = delayToPPQ(evt.delay)
         if d ~= 0 then
           evt.ppq = evt.ppq + d
@@ -633,7 +641,7 @@ function newTrackerManager(mm, cm)
       for loc, n in mm:notes() do
         local evt = util:assign(n, { loc = loc })
         notesByLoc[loc] = evt
-        if (n.lane or 1) == 1 then
+        if n.lane == 1 then
           util:add(chans[n.chan].notes, evt)
           if n.fakePb then
             local pb = pbAt(n.chan, n.ppq)
@@ -644,9 +652,9 @@ function newTrackerManager(mm, cm)
       for i = 1, 16 do sortByPPQ(chans[i].notes) end
 
       if isRebuilding then
-        for c = 1, 16 do
-          for _, n in ipairs(chans[c].notes) do
-            if n.detune == nil then assignLowlevel('note', n, { detune = 0 }) end
+        for _, n in pairs(notesByLoc) do
+          if n.detune == nil or n.delay == nil then
+            assignLowlevel('note', n, { detune = n.detune or 0, delay = n.delay or 0 })
           end
         end
         um:flush()
@@ -802,13 +810,12 @@ function newTrackerManager(mm, cm)
 
     changed = changed or { take = false, data = true }
 
-    local noteColsCfg = cfg('noteColumns',{})
+    local noteColsCount = cfg('noteColumns', util:dotimes(16,1))
+    
     channels = {}
     for i = 1, 16 do
       channels[i] = { chan = i, columns = {} }
-      for _ = 1, math.max(noteColsCfg[i] or 1, 1) do
-        addColumn(channels[i], 'note')
-      end
+      util:dotimes(noteColsCount[i], function() addColumn(channels[i], 'note') end)
     end
 
     -- 1) Truncate overlapping notes on the same channel and pitch.
@@ -816,7 +823,7 @@ function newTrackerManager(mm, cm)
       local groups, work = {}, {}
       for loc, note in mm:notes() do
         local key = note.chan .. '|' .. note.pitch
-        if not groups[key] then groups[key] = {} end
+        groups[key] = groups[key] or {}
         util:add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
       end
       for _, group in pairs(groups) do
@@ -834,8 +841,7 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    -- 2) Assign notes to note columns. Rewrite 'lane' on any note whose
-    --    persisted preference didn't match where it landed.
+    -- 2) Assign notes to note columns, moving where necessary.
     for loc, note in mm:notes() do
       local channel = channels[note.chan]
       local col, lane = allocateNoteColumn(channel, note)
@@ -843,75 +849,64 @@ function newTrackerManager(mm, cm)
         mm:assignNote(loc, { lane = lane })
       end
       util:assign(note, { loc = loc, chan = util.REMOVE, lane = util.REMOVE })
-      col.events[#col.events + 1] = note
+      util:add(col.events, note)
     end
 
-    -- 2b) Persist any growth in per-channel note column counts, so a
-    --     later rebuild after notes are deleted doesn't make lanes vanish.
+    -- 2b) Persist growth in per-channel note column counts
     do
       local grew = false
       for i = 1, 16 do
         local n = noteColCount(channels[i])
-        if n > (noteColsCfg[i] or 1) then
-          noteColsCfg[i] = n
+        if n > noteColsCount[i] then
+          noteColsCount[i] = n
           grew = true
         end
       end
-      if grew and cm then
-        cm:set('take', 'noteColumns', noteColsCfg)
-      end
+      if grew then setcfg('take', 'noteColumns', noteColsCount) end
     end
 
-    -- 3) Pitchbend: reconcile against the design invariants, then build
-    --    the logical pb display lane per channel from the reconciled mm
-    --    state. Stage 1 runs three steps (default detunes, reduce, add
-    --    boundary pbs) inside the update manager, then flushes to mm;
-    --    after flush mm reflects the invariant-satisfying state.
+    -- 3) Pitchbend; first line does some initial housekeeping
     createUpdateManager(true)
 
-    local pbRange = cfg('pbRange', 2)
     for chan = 1, 16 do
       local channel = channels[chan]
       local col1    = firstNoteCol(channel)
       local notes   = (col1 and col1.events) or {}
-      -- Detune prevailing at ppq P: latest-starting-note-wins over the
-      -- already-built col-1 notes.
+
+      -- Detune prevailing at P: latest-starting note at or before P wins.
+      -- `notes` is unsorted at this stage, so an O(n) scan rather than seek.
       local function detuneAtP(P)
         local best
         for _, n in ipairs(notes) do
-          if n.ppq <= P then
-            if not best or n.ppq > best.ppq then best = n end
-          end
+          if n.ppq <= P and (not best or n.ppq > best.ppq) then best = n end
         end
         return (best and best.detune) or 0
       end
 
-      local events, anyNonZero = {}, false
+      local events, anyVisible = {}, false
       for loc, cc in mm:ccs() do
         if cc.chan == chan and cc.msgType == 'pb' then
-          local d = detuneAtP(cc.ppq)
-          local currentCents = (cc.val / 8192) * pbRange * 100
-          local logicalCents = math.floor(currentCents - d + 0.5)
           -- A col-1 note starting at cc.ppq with fakePb means this pb is
           -- the detune-boundary absorber for that note. Hide from display
           -- unless interp shape pulls it back into view as a ramp anchor.
           local fake = util:seek(notes, 'at-or-before', cc.ppq,
                                  function(e) return e.ppq == cc.ppq and e.fakePb end) ~= nil
+          local detune = detuneAtP(cc.ppq)
           local hidden = fake and (cc.shape == nil or cc.shape == 'step')
+          anyVisible = anyVisible or not hidden
+
           util:add(events, {
-            loc    = loc,
-            ppq    = cc.ppq,
-            val    = logicalCents,
-            rawVal = cc.val,
-            detune = d,
-            hidden = hidden,
-            shape  = cc.shape,
+            loc     = loc,
+            ppq     = cc.ppq,
+            val     = util:round(rawToCents(cc.val) - detune),
+            detune  = detune,
+            hidden  = hidden,
+            shape   = cc.shape,
             tension = cc.tension,
           })
-          if logicalCents ~= 0 then anyNonZero = true end
         end
       end
-      if anyNonZero then
+      if anyVisible then
         local col = getOrCreateSingletonColumn(channel, 'pb')
         for _, e in ipairs(events) do util:add(col.events, e) end
       end
@@ -922,7 +917,7 @@ function newTrackerManager(mm, cm)
       local channel = channels[cc.chan]
 
       if cc.msgType == 'pa' then
-        -- Poly AT → attach to the note column owning that pitch (drop orphans)
+        -- attach to the note column owning that pitch
         local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
         if noteCol then
           util:add(noteCol.events,{
@@ -931,20 +926,15 @@ function newTrackerManager(mm, cm)
         end
       elseif cc.msgType == 'cc' then
         local col = getOrCreateCCColumn(channel, cc.cc)
-        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc,
-                               shape = cc.shape, tension = cc.tension })
+        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
       elseif cc.msgType == 'at' or cc.msgType == 'pc' then
         local col = getOrCreateSingletonColumn(channel, cc.msgType)
-        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc,
-                               shape = cc.shape, tension = cc.tension })
+        util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
       end
     end
 
 
     -- 5) Strip delay from col.events so vm sees intent-frame PPQs.
-    --    tm's own mutation state (update manager's chans[c].notes/pbs)
-    --    stays in realised frame; only what we expose to vm is shifted.
-    --    Realise-on-write in um:addEvent / um:assignEvent closes the loop.
     for _, chan in ipairs(channels) do
       for _, col in ipairs(chan.columns) do
         for _, evt in ipairs(col.events) do
