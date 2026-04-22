@@ -818,12 +818,15 @@ function newTrackerManager(mm, cm)
       for loc, cc in mm:ccs() do
         if cc.chan == chan and cc.msgType == 'pb' then
           -- A col-1 note starting at cc.ppq with fakePb means this pb is
-          -- the detune-boundary absorber for that note. Hide from display
-          -- unless interp shape pulls it back into view as a ramp anchor.
-          local fake = util:seek(notes, 'at-or-before', cc.ppq,
-                                 function(e) return e.ppq == cc.ppq and e.fakePb end) ~= nil
+          -- the detune-boundary absorber for that note: inherit its delay
+          -- so the display event travels with the note into intent frame.
+          -- Hide unless interp shape pulls it back into view as a ramp anchor.
+          local fakeNote
+          for _, n in ipairs(notes) do
+            if n.ppq == cc.ppq and n.fakePb then fakeNote = n; break end
+          end
           local detune = detuneAtP(cc.ppq)
-          local hidden = fake and (cc.shape == nil or cc.shape == 'step')
+          local hidden = fakeNote and (cc.shape == nil or cc.shape == 'step')
           anyVisible = anyVisible or not hidden
 
           util:add(events, {
@@ -834,6 +837,7 @@ function newTrackerManager(mm, cm)
             hidden  = hidden,
             shape   = cc.shape,
             tension = cc.tension,
+            delay   = fakeNote and fakeNote.delay or nil,
           })
         end
       end
