@@ -81,14 +81,18 @@ function util:seek(items, mode, key, filter, keyFn)
   return hit
 end
 
-function util:clone(src, exclude)
+function util:clone(src, exclude, deep)
   if not src then return end
   local dst = {}
   for k, v in pairs(src) do
-    if not (exclude and exclude[k]) then dst[k] = v end
+    if not (exclude and exclude[k]) then
+      dst[k] = (deep and type(v) == 'table') and util:clone(v, nil, true) or v
+    end
   end
   return dst
 end
+
+function util:deepClone(src) return util:clone(src, nil, true) end
 
 local function escape_string(s)
   return (s:gsub('[\\{},=]', function(c)

@@ -60,10 +60,7 @@ local function print(...)
   return util:print(...)
 end
 
--- Canonical order of column kinds within a channel. The reading is a
--- performance timeline: program change sets up the sound, pitch bend
--- establishes a baseline, notes carry pitch, aftertouch adds expression,
--- cc carries modulation.
+-- Order of column kinds within a channel.
 columnKindOrder = { 'pc', 'pb', 'note', 'at', 'cc' }
 
 -- Canonicalise a column list: pc → pb → notes (preserving creation
@@ -120,15 +117,16 @@ function newTrackerManager(mm, cm)
   --------------------
   -- Swing and delay
   --
-  -- Slot schema is { name, period }, resolved against the swing registry
-  -- (timing.presets + cfg.swings). Identity or missing slot ⇒ nil, which
-  -- applySwing / unapplySwing treat as passthrough.
+  -- A slot stores a name (string) — cfg.swing and cfg.colSwing[c] hold
+  -- the name directly, no wrapper. The name resolves against cfg.swings
+  -- (the project's composite library) to an ordered array of factors,
+  -- each {atom, amount, period}. Missing name / identity composite ⇒
+  -- nil, treated as passthrough by applySwing / unapplySwing.
   --
-  -- Both period and delay are in QN units (quarter notes), matching
-  -- REAPER's native PPQ coordinate. Period is a QN scalar; delay is
-  -- stored in signed milli-QN (1000 = one QN late). QN is preferred
-  -- over "beat" because "beat" is time-sig-denominator-dependent and
-  -- ambiguous in 6/8, 12/8, etc — a jig feel is period = {3,2} (dotted
+  -- Period (per factor) and delay are in QN units. Period is a QN
+  -- scalar or {num, den}; delay is signed milli-QN (1000 = one QN
+  -- late). QN is preferred over "beat" because "beat" is time-sig-
+  -- denominator-dependent — a jig feel is period = {3,2} (dotted
   -- quarter) regardless of the denom.
   --
   -- Delay metadata lives on notes (defaulted to 0 by midiManager on
@@ -147,15 +145,38 @@ function newTrackerManager(mm, cm)
   -- is algebraic rather than approximate.
   local function delayToPPQ(d) return mm and math.floor(mm:resolution() * (d or 0) / 1000 + 0.5) or 0 end
 
-  local function resolveSlot(slot)
-    if not slot then return nil end
-    local shape = timing.findShape(slot.name, cfg('swings'))
-    if not shape or shape == timing.id then return nil end
-    return { shape = shape, period = slot.period }
+  -- Resolve a slot name to an array of realised factors {S, T} in PPQ,
+  -- or nil for identity. S is the atom evaluated at its amount; T is
+  -- the factor's period converted to PPQ against the current resolution.
+  -- `libOverride`, if given, shadows cfg('swings') for named lookups —
+  -- callers pass {[name]=composite} to realise a hypothetical library
+  -- state (used during preset edits, where the authoring and target
+  -- composites for the same name must be resolved side-by-side).
+  local function resolveSlot(name, libOverride)
+    local composite = libOverride and libOverride[name]
+                   or timing.findShape(name, cfg('swings'))
+    if timing.isIdentity(composite) then return nil end
+    local ppqPerQN = mm:resolution()
+    local factors = {}
+    for i, f in ipairs(composite) do
+      local atom = timing.atoms[f.atom]
+      if not atom then error('timing: unknown atom ' .. tostring(f.atom)) end
+      factors[i] = { S = atom(f.amount), T = ppqPerQN * timing.periodQN(f.period) }
+    end
+    return factors
   end
 
-  local function slotPPQ(slot)
-    return mm:resolution() * timing.periodQN(slot.period)
+  local function applyFactors(factors, ppq)
+    for _, f in ipairs(factors) do ppq = timing.tile(f.S, f.T, ppq) end
+    return ppq
+  end
+
+  local function unapplyFactors(factors, ppq)
+    for i = #factors, 1, -1 do
+      local f = factors[i]
+      ppq = timing.tileInverse(f.S, f.T, ppq)
+    end
+    return ppq
   end
 
   --------------------
@@ -781,7 +802,7 @@ function newTrackerManager(mm, cm)
 
     changed = changed or { take = false, data = true }
 
-    local noteColsCfg = cfg('noteColumns', {}) or {}
+    local noteColsCfg = cfg('noteColumns',{})
     channels = {}
     for i = 1, 16 do
       channels[i] = { chan = i, columns = {} }
@@ -1001,54 +1022,51 @@ function newTrackerManager(mm, cm)
   -- inner, global outer (see design/swing.md). Missing slots pass through.
   function tm:applySwing(chan, ppq)
     local c = self:swingColumn(chan)
-    if c then ppq = timing.tile(c.shape, slotPPQ(c), ppq) end
+    if c then ppq = applyFactors(c, ppq) end
     local g = self:swingGlobal()
-    if g then ppq = timing.tile(g.shape, slotPPQ(g), ppq) end
+    if g then ppq = applyFactors(g, ppq) end
     return ppq
   end
 
   -- E_c inverse: realised PPQ → straight PPQ.
   function tm:unapplySwing(chan, ppq)
     local g = self:swingGlobal()
-    if g then ppq = timing.tileInverse(g.shape, slotPPQ(g), ppq) end
+    if g then ppq = unapplyFactors(g, ppq) end
     local c = self:swingColumn(chan)
-    if c then ppq = timing.tileInverse(c.shape, slotPPQ(c), ppq) end
+    if c then ppq = unapplyFactors(c, ppq) end
     return ppq
   end
 
-  -- Snapshot of all slots resolved once, with T_ppq baked in. Use this
-  -- in hot loops (rebuilds, renders) to avoid the per-call cfg reads in
-  -- applySwing/unapplySwing. Always returns a valid pass-through struct
-  -- when there's no context or no slots — callers needn't nil-check.
-  function tm:swingSnapshot()
-    local global, column
+  -- Snapshot of all slots resolved once, with atom PWLs and T_ppq baked
+  -- in. Use this in hot loops (rebuilds, renders) to avoid the per-call
+  -- cfg reads and composite materialisation in applySwing/unapplySwing.
+  -- Always returns a valid pass-through struct when there's no context
+  -- or no slots — callers needn't nil-check.
+  function tm:swingSnapshot(override)
+    local global, column = nil, {}
     if mm then
-      local function withT(s)
-        if s then s.T = slotPPQ(s) end
-        return s
+      local gSrc, cSrc, libO
+      if override then gSrc, cSrc, libO = override.swing, override.colSwing, override.libOverride
+      else             gSrc, cSrc       = cfg('swing'),   cfg('colSwing')
       end
-      global = withT(resolveSlot(cfg('swing')))
-      column = {}
-      local cs = cfg('colSwing')
-      if cs then
-        for chan, slot in pairs(cs) do column[chan] = withT(resolveSlot(slot)) end
+      global = resolveSlot(gSrc, libO)
+      if cSrc then
+        for chan, name in pairs(cSrc) do column[chan] = resolveSlot(name, libO) end
       end
-    else
-      column = {}
     end
     return {
       global = global,
       column = column,
       apply = function(chan, ppq)
         local c = column[chan]
-        if c      then ppq = timing.tile(c.shape,      c.T, ppq) end
-        if global then ppq = timing.tile(global.shape, global.T, ppq) end
+        if c      then ppq = applyFactors(c, ppq) end
+        if global then ppq = applyFactors(global, ppq) end
         return ppq
       end,
       unapply = function(chan, ppq)
-        if global then ppq = timing.tileInverse(global.shape, global.T, ppq) end
+        if global then ppq = unapplyFactors(global, ppq) end
         local c = column[chan]
-        if c      then ppq = timing.tileInverse(c.shape,      c.T, ppq) end
+        if c      then ppq = unapplyFactors(c, ppq) end
         return ppq
       end,
     }

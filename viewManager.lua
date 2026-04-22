@@ -63,6 +63,12 @@ function newViewManager(tm, cm)
   local advanceBy  = 1
   local currentOctave = 2
 
+  -- Active frame override (installed by matchGridToCursor/Ctrl-G). When
+  -- non-nil, display and new-note stamping use these in place of cfg's
+  -- swing/colSwing/rowPerBeat. { swing, col, chan, rpb } — col applies to
+  -- the single chan; other channels' col swings still come from cfg.
+  local frameOverride = nil
+
   local scrollCol   = 1
   local scrollRow   = 0
   local cursorCol   = 1
@@ -124,6 +130,46 @@ function newViewManager(tm, cm)
 
   local function setcfg(lev, key, val)
     if cm then cm:set(lev, key, val) end
+  end
+
+  ----------  FRAME OVERRIDE HELPERS
+
+  local function effectiveSwing()
+    if frameOverride then return frameOverride.swing end
+    return cfg('swing')
+  end
+
+  local function effectiveColSwing(chan)
+    if frameOverride and frameOverride.chan == chan then return frameOverride.col end
+    return (cfg('colSwing', {}) or {})[chan]
+  end
+
+  local function effectiveRPB()
+    return (frameOverride and frameOverride.rpb) or cfg('rowPerBeat', 4)
+  end
+
+  -- Bookmark stamped onto a new note — captures the authoring frame so
+  -- matchGridToCursor can restore it later.
+  local function currentFrame(chan)
+    return {
+      swing    = effectiveSwing(),
+      colSwing = effectiveColSwing(chan),
+      rpb      = effectiveRPB(),
+    }
+  end
+
+  -- Override arg for tm:swingSnapshot. cfg's colSwing is cloned and only
+  -- the override's chan is replaced, so other channels fall through.
+  local function swingOverrideArg()
+    if not frameOverride then return nil end
+    local colMap = util:clone(cfg('colSwing', {}) or {})
+    colMap[frameOverride.chan] = frameOverride.col
+    return { swing = frameOverride.swing, colSwing = colMap }
+  end
+
+  local function addNoteEvent(update)
+    update.frame = currentFrame(update.chan)
+    tm:addEvent('note', update)
   end
 
   ---------- CHANNEL MUTE / SOLO
@@ -619,7 +665,7 @@ function newViewManager(tm, cm)
     update.vel    = last and last.vel or cfg('defaultVelocity', 100)
     update.endppq = next and next.ppq or length
     update.lane   = laneOf(col)
-    tm:addEvent('note', update)
+    addNoteEvent(update)
   end
 
   ----------  PA HELPERS
@@ -1146,11 +1192,156 @@ function newViewManager(tm, cm)
     tm:flush()
   end
 
-  -- Explicit, destructive: snap each event in `groups` to the nearest row
-  -- under the current grid + swing in its own column. Notes preserve their
-  -- straight length in rows (round(endRow − startRow)), then re-round the
-  -- end. Columns that are already on-grid produce no writes.
-  local function reGridScope(groups)
+  -- Every column, every event, as a groups list (for *-all variants).
+  local function allGroups()
+    local groups = {}
+    for _, col in ipairs(grid.cols) do
+      local locs = {}
+      for _, e in ipairs(col.events) do locs[e.loc] = e end
+      util:add(groups, { col = col, locs = locs })
+    end
+    return groups
+  end
+
+  -- sel → scopeFn on selection; no sel → confirm then scopeFn on all.
+  local function scopeOrConfirm(title, scopeFn)
+    if sel then scopeFn((selectedEvents())); return end
+    return 'modal', {
+      title    = title,
+      prompt   = 'No selection — ' .. title .. ' whole take? (y/n)',
+      kind     = 'confirm',
+      callback = function(yes) if yes then scopeFn(allGroups()) end end,
+    }
+  end
+
+  -- First lane-1 (note) grid column for chan, or nil.
+  local function noteLane1Col(chan)
+    local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
+    if not first then return end
+    for ci = first, last do
+      local c = grid.cols[ci]
+      if c.type == 'note' then return c end
+    end
+  end
+
+  -- Frame owner for reswing. Notes own themselves. CC/PB/AT/PC inherit
+  -- from the most recent lane-1 note at-or-before their ppq on the same
+  -- channel; PAs from the note they attach to (pitch match within span).
+  -- Orphans (no lane-1 note / no host) return nil and are skipped.
+  local function frameOwner(col, e)
+    if isNote(e) then return e end
+    local n1 = noteLane1Col(col.midiChan)
+    if not n1 then return end
+    if e.type == 'pa' then
+      for _, n in ipairs(n1.events) do
+        if n.pitch == e.pitch and n.ppq <= e.ppq and e.ppq <= n.endppq then
+          return n
+        end
+      end
+      return
+    end
+    return util:seek(n1.events, 'at-or-before', e.ppq, isNote)
+  end
+
+  -- Reswing core. For each event in `groups` whose frame owner passes
+  -- `opts.include(owner, chan)` (default: any owner), compute a new ppq
+  -- by unapplying the authoring snapshot and re-applying the target
+  -- snapshot. `opts.auth(frame, chan)` yields the authoring snap (nil
+  -- means identity — for legacy notes without a frame). `opts.target
+  -- (frame, chan)` yields the target snap. `opts.restamp(chan)`, if
+  -- given, produces a new frame to stamp onto notes. Two passes (gather
+  -- plans, then mutate) so writes in this batch don't disturb later
+  -- events' reads of their owners' .frame.
+  local function reswingCore(groups, opts)
+    local plans = {}
+    for _, g in ipairs(groups) do
+      local col, chan = g.col, g.col.midiChan
+      for _, e in pairs(g.locs) do
+        local owner = frameOwner(col, e)
+        if owner and (not opts.include or opts.include(owner, chan)) then
+          local auth   = opts.auth(owner.frame, chan)
+          local tgt    = opts.target(owner.frame, chan)
+          local uPPQ   = auth and auth.unapply(chan, e.ppq) or e.ppq
+          local newPPQ = math.floor(tgt.apply(chan, uPPQ) + 0.5)
+          local entry  = { col = col, e = e, newPPQ = newPPQ }
+          if isNote(e) then
+            local uEnd      = auth and auth.unapply(chan, e.endppq) or e.endppq
+            entry.newEndPPQ = math.floor(tgt.apply(chan, uEnd) + 0.5)
+            if opts.restamp then entry.newFrame = opts.restamp(chan) end
+          end
+          util:add(plans, entry)
+        end
+      end
+    end
+    for _, p in ipairs(plans) do
+      local e, u = p.e, {}
+      if p.newPPQ ~= e.ppq then u.ppq = p.newPPQ end
+      if isNote(e) then
+        if p.newEndPPQ ~= e.endppq then u.endppq = p.newEndPPQ end
+        if p.newFrame then u.frame = p.newFrame end
+        if next(u) then tm:assignEvent('note', e, u) end
+      elseif next(u) then
+        tm:assignEvent(p.col.type, e, u)
+      end
+    end
+    tm:flush()
+  end
+
+  -- Reswing selection/scope: unapply authoring frame, apply current,
+  -- restamp notes. Legacy notes with no .frame pass through identity.
+  local function reswingScope(groups)
+    local curSnap = tm:swingSnapshot(swingOverrideArg())
+    local cache   = {}
+    local function auth(frame, chan)
+      if not frame then return nil end
+      local hit = cache[frame]
+      if hit then return hit end
+      hit = tm:swingSnapshot({ swing = frame.swing, colSwing = { [chan] = frame.colSwing } })
+      cache[frame] = hit
+      return hit
+    end
+    reswingCore(groups, {
+      auth    = auth,
+      target  = function() return curSnap end,
+      restamp = function(chan) return currentFrame(chan) end,
+    })
+  end
+
+  -- Reswing for preset edit: for every event whose authoring frame
+  -- references `name` (as global slot or as its channel's colSwing),
+  -- rebase its realised ppq from `oldComp` to `newComp` for that name.
+  -- Both composites are resolved inline via libOverride, so this is
+  -- independent of the library's current state — callers may invoke
+  -- before or after writing the new composite. Frame names are
+  -- unchanged (only the composite behind the name moved), so no
+  -- restamp.
+  local function reswingPresetChange(name, oldComp, newComp)
+    local authCache, tgtCache = {}, {}
+    local function snapWith(frame, chan, comp, cache)
+      local hit = cache[frame]
+      if hit then return hit end
+      hit = tm:swingSnapshot({
+        swing       = frame.swing,
+        colSwing    = { [chan] = frame.colSwing },
+        libOverride = { [name] = comp },
+      })
+      cache[frame] = hit
+      return hit
+    end
+    reswingCore(allGroups(), {
+      include = function(owner, chan)
+        local f = owner.frame
+        return f and (f.swing == name or f.colSwing == name) or false
+      end,
+      auth   = function(frame, chan) return snapWith(frame, chan, oldComp, authCache) end,
+      target = function(frame, chan) return snapWith(frame, chan, newComp, tgtCache)  end,
+    })
+  end
+
+  -- Quantize: snap each event to the nearest row under the current
+  -- frame. Notes preserve straight length in rows (round of eRow−sRow)
+  -- then re-round the end. Delay unchanged.
+  local function quantizeScope(groups)
     for _, g in ipairs(groups) do
       local col, chan = g.col, g.col.midiChan
       for _, e in pairs(g.locs) do
@@ -1172,27 +1363,51 @@ function newViewManager(tm, cm)
     tm:flush()
   end
 
-  local function reGridAll()
-    local groups = {}
-    for _, col in ipairs(grid.cols) do
-      local locs = {}
-      for _, e in ipairs(col.events) do locs[e.loc] = e end
-      util:add(groups, { col = col, locs = locs })
+  -- Quantize keeping realised: for notes, move the start onto the grid
+  -- in intent and push the same shift into delay so realised start is
+  -- preserved. Straight length is preserved (= realised length), so the
+  -- end rides along. If the required delay exceeds delayRange, clamp
+  -- and shift intent only as far as the bound allows — realised still
+  -- preserved, intent remains partially off-grid. Non-notes fall back
+  -- to plain snap (no delay concept). Reports clamp count via popup.
+  local function quantizeKeepRealisedScope(groups)
+    local clamped = 0
+    for _, g in ipairs(groups) do
+      local col, chan = g.col, g.col.midiChan
+      for _, e in pairs(g.locs) do
+        if isNote(e) then
+          local targetPPQ = rowToPPQ(snapRow(e.ppq, chan), chan)
+          if targetPPQ ~= e.ppq then
+            local wantDelay  = e.delay + tm:ppqToDelay(e.ppq - targetPPQ)
+            local dMin, dMax = delayRange(col, e)
+            local newDelay   = util:clamp(wantDelay, dMin, dMax)
+            local newPPQ     = math.floor(e.ppq + tm:delayToPPQ(e.delay - newDelay) + 0.5)
+            if newPPQ ~= e.ppq or newDelay ~= e.delay then
+              if newDelay ~= wantDelay then clamped = clamped + 1 end
+              local newEnd = newPPQ + (e.endppq - e.ppq)
+              tm:assignEvent('note', e, { ppq = newPPQ, endppq = newEnd, delay = newDelay })
+            end
+          end
+        else
+          local newPPQ = rowToPPQ(snapRow(e.ppq, chan), chan)
+          if newPPQ ~= e.ppq then tm:assignEvent(col.type, e, { ppq = newPPQ }) end
+        end
+      end
     end
-    reGridScope(groups)
+    tm:flush()
+    if clamped > 0 then
+      reaper.ShowMessageBox(
+        clamped .. ' note(s) partially quantized — delay clamped at overlap bound.',
+        'quantize keep realised', 0)
+    end
   end
 
-  -- With a selection: snap the selected events. Without: confirm before
-  -- snapping the whole take.
-  local function reGrid()
-    if sel then reGridScope((selectedEvents())); return end
-    return 'modal', {
-      title    = 'reGrid',
-      prompt   = 'No selection — reGrid whole take? (y/n)',
-      kind     = 'confirm',
-      callback = function(yes) if yes then reGridAll() end end,
-    }
-  end
+  local function reswing()              return scopeOrConfirm('reswing', reswingScope) end
+  local function reswingAll()           reswingScope(allGroups()) end
+  local function quantize()             return scopeOrConfirm('quantize', quantizeScope) end
+  local function quantizeAll()          quantizeScope(allGroups()) end
+  local function quantizeKeepRealised() return scopeOrConfirm('quantize keep realised', quantizeKeepRealisedScope) end
+  local function quantizeKeepRealisedAll() quantizeKeepRealisedScope(allGroups()) end
 
   local copySelection  -- forward decl; assigned in CLIPBOARD section, used by deleteRow
 
@@ -1671,7 +1886,7 @@ function newViewManager(tm, cm)
           vi = vi + 1
         end
         truncatePitchInChannel(dstCol.midiChan, ce.pitch, ce.ppq, dstCol)
-        tm:addEvent('note', {
+        addNoteEvent({
           ppq = ce.ppq,
           endppq = ce.endppq or nextNotePPQ,
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
@@ -1812,7 +2027,7 @@ function newViewManager(tm, cm)
       for _, e in ipairs(events) do
         if r.type == 'note' then
           truncatePitchInChannel(r.chan, e.pitch, e.ppq, dst)
-          tm:addEvent('note', {
+          addNoteEvent({
             ppq = e.ppq, endppq = e.endppq or capPPQ,
             chan = r.chan, pitch = e.pitch, vel = e.vel,
             lane = r.lane,
@@ -1908,44 +2123,34 @@ function newViewManager(tm, cm)
     return active
   end
 
+  -- Row of a time-sig's start. Time sigs land on bar boundaries in
+  -- practice, which are swing fixpoints, so the roundtrip is stable.
+  local function tsRow(ts) return math.floor(ppqToRow(ts.ppq)) end
+
+  -- Rows are intent; beat/bar lines are pure row arithmetic relative to
+  -- the active time sig. No swing involved — long-period composites
+  -- move realised ppq but leave the row grid untouched.
   local function rowBeatInfo(row)
-    local ppq         = rowToPPQ(row)
-    local ts          = timeSigAt(ppq)
+    local ts = timeSigAt(rowToPPQ(row))
     if not ts then return false, false end
-    local offset      = ppq - ts.ppq
-
-    local ppqPerBeat  = resolution * 4 / ts.denom
-    local nearestBeat = math.floor(offset / ppqPerBeat + 0.5)
-    local isBeatStart = math.floor(ppqToRow(ts.ppq + nearestBeat * ppqPerBeat)) == row
-
-    local ppqPerBar   = ppqPerBeat * ts.num
-    local nearestBar  = math.floor(offset / ppqPerBar  + 0.5)
-    local isBarStart  = math.floor(ppqToRow(ts.ppq + nearestBar  * ppqPerBar))  == row
-    return isBarStart, isBeatStart
+    local rel = row - tsRow(ts)
+    return rel % (rowPerBeat * ts.num) == 0, rel % rowPerBeat == 0
   end
 
   local function barBeatSub(row)
     local bar = 1
     for i, ts in ipairs(timeSigs) do
-      local ppqPerBeat = resolution * 4 / ts.denom
-      local ppqPerBar  = ppqPerBeat * ts.num
-      local nextPPQ    = timeSigs[i + 1] and timeSigs[i + 1].ppq or math.huge
-      local nextRow    = timeSigs[i + 1] and math.floor(ppqToRow(nextPPQ)) or math.huge
-
+      local rpbar   = rowPerBeat * ts.num
+      local next_   = timeSigs[i + 1]
+      local nextRow = next_ and tsRow(next_) or math.huge
       if row < nextRow then
-        local ppq      = rowToPPQ(row)
-        local offset   = ppq - ts.ppq
-        local inBar    = offset % ppqPerBar
-        local beatNum  = inBar // ppqPerBeat
-        local beatPPQ  = ppq - offset % ppqPerBeat
-        local beatRow  = math.floor(ppqToRow(beatPPQ))
-        return bar + offset // ppqPerBar,
-               beatNum + 1,
-               row - beatRow + 1,
+        local rel = row - tsRow(ts)
+        return bar + rel // rpbar,
+               (rel % rpbar) // rowPerBeat + 1,
+               rel % rowPerBeat + 1,
                ts
-      else
-        bar = bar + (nextPPQ - ts.ppq) // ppqPerBar
       end
+      bar = bar + (nextRow - tsRow(ts)) // rpbar
     end
     return bar, 1, 1, timeSigs[1]
   end
@@ -1978,6 +2183,13 @@ function newViewManager(tm, cm)
   function vm:rowBeatInfo(row) return rowBeatInfo(row) end
 
   function vm:barBeatSub(row) return barBeatSub(row) end
+
+  -- First time sig of the take; used by UI layers that need to map
+  -- musical units (e.g. "1/4 bar") into QN independent of PPQ context.
+  function vm:timeSig()
+    local ts = timeSigs[1] or { num = 4, denom = 4 }
+    return ts.num, ts.denom
+  end
 
   function vm:lastVisibleFrom(startCol) return lastVisibleFrom(startCol) end
 
@@ -2141,6 +2353,27 @@ function newViewManager(tm, cm)
     hideExtraCol   = function() vm:hideExtraCol() end,
     doubleRPB      = function() vm:setRowPerBeat(rowPerBeat * 2) end,
     halveRPB       = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
+    matchGridToCursor = function()
+      local oldRPB = rowPerBeat
+      if frameOverride then
+        frameOverride = nil
+      else
+        local col = grid.cols[cursorCol]
+        local evt = col and col.type == 'note' and col.cells and col.cells[cursorRow]
+        if not (evt and evt.frame) then return end
+        frameOverride = {
+          swing = evt.frame.swing,
+          col   = evt.frame.colSwing,
+          chan  = col.midiChan,
+          rpb   = evt.frame.rpb,
+        }
+      end
+      local newRPB = effectiveRPB()
+      if newRPB ~= oldRPB then
+        cursorRow = math.floor(cursorRow * newRPB / oldRPB)
+      end
+      vm:rebuild({ data = true })
+    end,
     setRPB         = function()
       return 'modal', {
         title    = 'Rows per beat',
@@ -2157,19 +2390,63 @@ function newViewManager(tm, cm)
       for k, v in ipairs(names) do if v == cur then i = k; break end end
       setcfg('track', 'tuning', names[(i + 1) % (#names + 1)])
     end,
-    reGrid         = function() return reGrid() end,
-    reGridAll      = function() reGridAll() end,
+    reswing                  = function() return reswing() end,
+    reswingAll               = function() reswingAll() end,
+    quantize                 = function() return quantize() end,
+    quantizeAll              = function() quantizeAll() end,
+    quantizeKeepRealised     = function() return quantizeKeepRealised() end,
+    quantizeKeepRealisedAll  = function() quantizeKeepRealisedAll() end,
     cycleSwing     = function()
-      -- 'off' is the nil-slot sentinel for cycling; in storage, no key == id.
+      -- 'off' is the nil-slot sentinel for cycling; in storage, absent = id.
       local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
-      local cur = (cfg('swing') or {}).name or 'off'
+      local cur = cfg('swing') or 'off'
       local i = 1
       for k, v in ipairs(stops) do if v == cur then i = k; break end end
       local next = stops[(i % #stops) + 1]
-      if next == 'off' then cm:remove('take', 'swing')
-      else                  setcfg('take', 'swing', { name = next, period = 1 }) end
+      if next == 'off' then
+        cm:remove('take', 'swing')
+      else
+        -- Seed the composite into the project library on first use, so
+        -- the name resolves. The project library is the sole source of
+        -- truth for name → composite; timing.presets is just seed data.
+        local lib = cfg('swings') or {}
+        if not lib[next] then
+          local proj = util:clone(cm:getAt('project', 'swings') or {})
+          proj[next] = timing.presets[next]
+          setcfg('project', 'swings', proj)
+        end
+        setcfg('take', 'swing', next)
+      end
       util:print('swing: ' .. next)
     end,
+    -- Atomic write of a named composite into the project library.
+    -- composite == nil deletes the entry. Pure library mutation — the
+    -- editor pairs this with reswingPreset for live edits, or uses it
+    -- alone for create mode and intra-drag preview.
+    setSwingComposite = function(name, composite)
+      if not name or name == '' then return end
+      local lib = util:clone(cm:getAt('project', 'swings') or {}, nil, true)
+      lib[name] = composite
+      setcfg('project', 'swings', lib)
+    end,
+    -- Reswing all events whose authoring frame references `name`,
+    -- moving their realised ppq from oldComp to newComp. Both composites
+    -- are inlined, so callers needn't coordinate with the library's
+    -- current state.
+    reswingPreset = function(name, oldComp, newComp)
+      if not name or name == '' then return end
+      reswingPresetChange(name, oldComp, newComp)
+    end,
+    -- Point the take's global swing slot at a library entry; pass nil
+    -- or '' to clear the slot (falls back to identity).
+    setSwingSlot = function(name)
+      if name and name ~= '' then setcfg('take', 'swing', name)
+      else cm:remove('take', 'swing') end
+    end,
+    -- Signal to renderManager that the swing editor should open. The
+    -- command itself mutates nothing; the editor reads cfg and writes
+    -- via setSwingComposite.
+    openSwingEditor = function() return 'swingEditor' end,
     quit           = function() return 'quit' end,
   }
 
@@ -2188,7 +2465,9 @@ function newViewManager(tm, cm)
     'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
     'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward',
     'duplicateDown', 'duplicateUp', 'interpolate', 'insertRow', 'deleteRow', 'noteOff',
-    'reGrid', 'reGridAll',
+    'reswing', 'reswingAll',
+    'quantize', 'quantizeAll',
+    'quantizeKeepRealised', 'quantizeKeepRealisedAll',
   }) do
     local orig = vm.commands[name]
     vm.commands[name] = function()
@@ -2224,7 +2503,7 @@ function newViewManager(tm, cm)
 
     if type == 'note' then
       -- Note columns are managed via cfg.noteColumns, not the extras list.
-      local nc = cfg('noteColumns', {}) or {}
+      local nc = cfg('noteColumns', {})
       for _, chan in ipairs(chans) do
         nc[chan] = (nc[chan] or 1) + 1
       end
@@ -2383,7 +2662,7 @@ function newViewManager(tm, cm)
     if changed.take or changed.data then
       advanceBy = cfg('advanceBy', 1)
       currentOctave = cfg('currentOctave', 2)
-      rowPerBeat = cfg('rowPerBeat', 4)
+      rowPerBeat = effectiveRPB()
       -- Grid resolution is pinned to the first time sig's denominator;
       -- mid-item time sig changes affect bar/beat highlighting but not row size.
       local denom = timeSigs[1] and timeSigs[1].denom or 4
@@ -2414,9 +2693,9 @@ function newViewManager(tm, cm)
 
         -- assigns stop positions to selection groups (for marking)
         local selGroups = {
-          note = showDelay and {1,1,2,2,3,3,3} or {1,1,2,2},  -- C-4 30 [040]
-          pb   = {1,1,1,1},        -- 0200
-          cc   = {1,1},            -- 94
+          note = showDelay and {1,1,2,2,3,3,3} or {1,1,2,2},
+          pb   = {1,1,1,1},
+          cc   = {1,1},
           pa   = {1,1},
           at   = {1,1},
           pc   = {1,1},
@@ -2424,7 +2703,7 @@ function newViewManager(tm, cm)
 
         local colLabels = {
           note = 'Note',
-          cc   = 'CC', --tostring(id) or '',
+          cc   = 'CC', 
           pb   = 'PB',  at = 'AT',  pa = 'PA',  pc = 'PC',
         }
 
@@ -2510,7 +2789,7 @@ function newViewManager(tm, cm)
       -- Hoisted into factory scope so _c helpers see it from anywhere
       -- in vm. tm has already stripped delay from col.events, so evt.ppq
       -- is intent; unapply(chan, intentPPQ) → straight-grid PPQ.
-      swing = tm:swingSnapshot()
+      swing = tm:swingSnapshot(swingOverrideArg())
 
       for _, gridCol in ipairs(grid.cols) do
         gridCol.overflow = {}
@@ -2580,8 +2859,11 @@ function newViewManager(tm, cm)
   -- effective set pushed to tm. Skip the full rebuild for those keys.
   local muteKeys = { mutedChannels = true, soloedChannels = true }
 
+  local frameKeys = { rowPerBeat = true, swing = true, colSwing = true }
+
   local configCallback = function(changed, _cm)
     if not changed.config then return end
+    if frameKeys[changed.key] then frameOverride = nil end
     if muteKeys[changed.key] then pushMute()
     else vm:rebuild({ take = false, data = true }) end
   end

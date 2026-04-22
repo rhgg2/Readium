@@ -14,6 +14,7 @@
 --------------------
 
 loadModule('util')
+loadModule('timing')
 
 local function print(...)
   return util:print(...)
@@ -48,6 +49,7 @@ function newRenderManager(vm, cm)
   local dragging    = false
   local dragWinX, dragWinY = 0, 0
   local modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
+  local swingEditor = nil  -- nil = closed, else { name, snapshot, createBuf, createError }
 
   ---------- CONFIG HELPERS
 
@@ -521,8 +523,8 @@ function newRenderManager(vm, cm)
     goBottom       = { ImGui.Key_End,        {ImGui.Key_Period, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
     pageUp         = { ImGui.Key_PageUp },
     pageDown       = { ImGui.Key_PageDown },
-    goLeft         = { {ImGui.Key_A, ImGui.Mod_Super} },
-    goRight        = { {ImGui.Key_E, ImGui.Mod_Super} },
+--    goLeft         = { {ImGui.Key_A, ImGui.Mod_Super} },
+--    goRight        = { {ImGui.Key_E, ImGui.Mod_Super} },
     colLeft        = { {ImGui.Key_B, ImGui.Mod_Ctrl} },
     colRight       = { {ImGui.Key_F, ImGui.Mod_Ctrl} },
     channelLeft    = { {ImGui.Key_Tab, ImGui.Mod_Shift} },
@@ -558,7 +560,8 @@ function newRenderManager(vm, cm)
     addTypedCol    = { {ImGui.Key_T, ImGui.Mod_Ctrl} },
     doubleRPB      = { {ImGui.Key_Equal, ImGui.Mod_Super} },
     halveRPB       = { {ImGui.Key_Minus, ImGui.Mod_Super} },
-    setRPB         = { {ImGui.Key_R, ImGui.Mod_Ctrl} },
+    setRPB         = { {ImGui.Key_Z, ImGui.Mod_Super} },
+    matchGridToCursor = { {ImGui.Key_M, ImGui.Mod_Super} },
     hideExtraCol   = { {ImGui.Key_H, ImGui.Mod_Ctrl} },
     inputOctaveUp   = { {ImGui.Key_8, ImGui.Mod_Shift} },
     inputOctaveDown = { ImGui.Key_Slash },
@@ -569,6 +572,10 @@ function newRenderManager(vm, cm)
     quit           = { ImGui.Key_Enter },
     cycleTuning    = { {ImGui.Key_T, ImGui.Mod_Super} },
     cycleSwing     = { {ImGui.Key_S, ImGui.Mod_Super} },
+    openSwingEditor = { {ImGui.Key_E, ImGui.Mod_Super} },
+    reswing                = { {ImGui.Key_R, ImGui.Mod_Ctrl} },
+    quantize               = { {ImGui.Key_Q, ImGui.Mod_Ctrl} },
+    quantizeKeepRealised   = { {ImGui.Key_Q, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
   }
 
   for i = 0, 9 do
@@ -729,6 +736,17 @@ function newRenderManager(vm, cm)
               modalState.buf = ''
               ImGui.OpenPopup(ctx, state.title)
               return
+            elseif result == 'swingEditor' then
+              if not swingEditor then
+                local name = cfg('swing')
+                local lib  = cfg('swings') or {}
+                swingEditor = {
+                  name      = name,
+                  snapshot  = name and util:deepClone(lib[name]) or nil,
+                  createBuf = '',
+                }
+              end
+              return
             elseif result == 'fallthrough' then
               commandHeld = false
             else
@@ -820,6 +838,400 @@ function newRenderManager(vm, cm)
     end
   end
 
+  ---------- SWING EDITOR
+  --
+  -- Floating, non-modal. Edits a named composite in cfg.swings
+  -- through the single vm primitive setSwingComposite; the tracker grid
+  -- behind it reshapes live on every change. Periods are expressed in
+  -- fractions of a bar at the UI layer and stored in QN (bar-fraction
+  -- interpretation is relative to the take's first time signature).
+
+  local SWING_ATOMS   = { 'id', 'classic', 'pocket', 'shuffle', 'drag', 'lilt' }
+  local SWING_ATOMS_Z = table.concat(SWING_ATOMS, '\0') .. '\0\0'
+
+  local PERIOD_PRESETS = {
+    { label = '1/16', num = 1, den = 16 },
+    { label = '1/8',  num = 1, den = 8  },
+    { label = '1/6',  num = 1, den = 6  },
+    { label = '1/4',  num = 1, den = 4  },
+    { label = '1/3',  num = 1, den = 3  },
+    { label = '1/2',  num = 1, den = 2  },
+    { label = '1',    num = 1, den = 1  },
+    { label = '2',    num = 2, den = 1  },
+  }
+
+  local function gcd(a, b)
+    a, b = math.abs(a), math.abs(b)
+    while b ~= 0 do a, b = b, a % b end
+    return a
+  end
+
+  local function qnPerBar()
+    local num, denom = vm:timeSig()
+    return num * 4 / denom
+  end
+
+  local function barFracToPeriod(pnum, pden)
+    local num, denom = vm:timeSig()
+    local n, d = pnum * num * 4, pden * denom
+    local g = gcd(n, d)
+    n, d = n // g, d // g
+    if d == 1 then return n end
+    return { n, d }
+  end
+
+  local function periodPresetIndex(period)
+    local qn, qpb = timing.periodQN(period), qnPerBar()
+    for i, p in ipairs(PERIOD_PRESETS) do
+      if math.abs(qn - (p.num / p.den) * qpb) < 1e-9 then return i end
+    end
+    return 0
+  end
+
+  local function periodLabel(period)
+    local i = periodPresetIndex(period)
+    if i > 0 then return PERIOD_PRESETS[i].label end
+    local qn = timing.periodQN(period)
+    if math.abs(qn - math.floor(qn + 0.5)) < 1e-9 then return string.format('%d qn', qn) end
+    return string.format('%.3f qn', qn)
+  end
+
+  local SWING_BG    = 0x1a1a1aff
+  local SWING_DIAG  = 0x444444ff
+  local SWING_LINE  = 0xccccccff
+  local SWING_ERR   = 0xff6060ff
+
+  local function tickColour(i)
+    local s = math.min(0xaa, 0x44 + i * 0x12)
+    return (s << 24) | (s << 16) | (s << 8) | 0x90
+  end
+
+  local function drawPWLThumb(S, w, h)
+    local x0, y0 = ImGui.GetCursorScreenPos(ctx)
+    local dl = ImGui.GetWindowDrawList(ctx)
+    ImGui.DrawList_AddRectFilled(dl, x0, y0, x0+w, y0+h, SWING_BG)
+    ImGui.DrawList_AddLine(dl, x0, y0+h, x0+w, y0, SWING_DIAG)
+    for i = 1, #S - 1 do
+      local a, b = S[i], S[i+1]
+      ImGui.DrawList_AddLine(dl,
+        x0 + a[1]*w, y0 + (1 - a[2])*h,
+        x0 + b[1]*w, y0 + (1 - b[2])*h,
+        SWING_LINE, 1.5)
+    end
+    ImGui.Dummy(ctx, w, h)
+  end
+
+  -- Main preview. Each tile is a square of side `tileSize` showing one
+  -- period (= max(T_i)) of the composite in its own local frame. Tiles
+  -- as many as fit the available width. Single-period composites make
+  -- identical tiles; mixed-period composites show visible drift.
+  local TARGET_TILE = 100
+  local function drawCompositeThumb(composite, availW)
+    local x0, y0 = ImGui.GetCursorScreenPos(ctx)
+    local dl = ImGui.GetWindowDrawList(ctx)
+
+    local nTiles   = math.max(1, math.floor(availW / TARGET_TILE))
+    local tileSize = availW / nTiles
+    local h = tileSize
+
+    ImGui.DrawList_AddRectFilled(dl, x0, y0, x0+availW, y0+h, SWING_BG)
+
+    local function drawTileFrame(t)
+      local tx = x0 + t * tileSize
+      if t > 0 then ImGui.DrawList_AddLine(dl, tx, y0, tx, y0+h, SWING_DIAG) end
+      ImGui.DrawList_AddLine(dl, tx, y0+h, tx+tileSize, y0, SWING_DIAG)
+    end
+
+    if timing.isIdentity(composite) then
+      for t = 0, nTiles - 1 do drawTileFrame(t) end
+      ImGui.Dummy(ctx, availW, h)
+      return
+    end
+
+    local factors, T_tile = {}, 0
+    for i, f in ipairs(composite) do
+      local T = timing.periodQN(f.period)
+      factors[i] = { S = timing.atoms[f.atom](f.amount), T = T }
+      if T > T_tile then T_tile = T end
+    end
+
+    for t = 0, nTiles - 1 do
+      local tx, tStart = x0 + t * tileSize, t * T_tile
+      drawTileFrame(t)
+
+      -- Sub-tile ticks for each factor with a period strictly shorter
+      -- than the tile (longer-period factors have no sub-tile structure).
+      for i, f in ipairs(factors) do
+        if f.T < T_tile - 1e-9 then
+          local col = tickColour(i)
+          local p = f.T
+          while p < T_tile - 1e-9 do
+            local sx = tx + (p / T_tile) * tileSize
+            ImGui.DrawList_AddLine(dl, sx, y0, sx, y0+h, col)
+            p = p + f.T
+          end
+        end
+      end
+
+      local N, prevX, prevY = 64, nil, nil
+      for k = 0, N do
+        local offset = (k / N) * T_tile
+        local e = tStart + offset
+        for _, f in ipairs(factors) do e = timing.tile(f.S, f.T, e) end
+        local sx = tx + (offset / T_tile) * tileSize
+        local sy = y0 + (1 - (e - tStart) / T_tile) * h
+        if prevX then
+          ImGui.DrawList_AddLine(dl, prevX, prevY, sx, sy, SWING_LINE, 1.5)
+        end
+        prevX, prevY = sx, sy
+      end
+    end
+
+    ImGui.Dummy(ctx, availW, h)
+  end
+
+  -- Composite edit primitives. Each produces a fresh composite and
+  -- routes through the single vm write; the snapshot remains untouched
+  -- so Reset always has the on-open state.
+
+  local function swingRead()
+    return (cfg('swings') or {})[swingEditor.name]
+  end
+
+  local function compositesEqual(a, b)
+    a, b = a or {}, b or {}
+    if #a ~= #b then return false end
+    for i, fa in ipairs(a) do
+      local fb = b[i]
+      if fa.atom ~= fb.atom or fa.amount ~= fb.amount
+         or math.abs(timing.periodQN(fa.period) - timing.periodQN(fb.period)) > 1e-12 then
+        return false
+      end
+    end
+    return true
+  end
+
+  -- Write without reswing — used mid-drag to give the preview thumbs
+  -- something to redraw against while the user is still pulling the
+  -- slider. The reswing is deferred to the drag's release.
+  local function swingPreview(composite)
+    vm.commands.setSwingComposite(swingEditor.name, composite)
+  end
+
+  -- Commit a composite: write the library, then reswing every event
+  -- whose authoring frame references this preset from the old composite
+  -- to the new. No-op when nothing changed.
+  local function swingWrite(composite)
+    local old = util:deepClone(swingRead()) or {}
+    if compositesEqual(old, composite) then return end
+    vm.commands.setSwingComposite(swingEditor.name, composite)
+    vm.commands.reswingPreset(swingEditor.name, old, composite)
+  end
+
+  local function patchFactor(i, patch)
+    local new = util:deepClone(swingRead()) or {}
+    if not new[i] then return end
+    util:assign(new[i], patch)
+    swingWrite(new)
+  end
+
+  local function addFactor()
+    local new = util:deepClone(swingRead()) or {}
+    new[#new+1] = { atom = 'id', amount = 0, period = 1 }
+    swingWrite(new)
+  end
+
+  local function removeFactor(i)
+    local new = util:deepClone(swingRead()) or {}
+    table.remove(new, i)
+    swingWrite(new)
+  end
+
+  local function moveFactor(i, dir)
+    local src = swingRead() or {}
+    local j = i + dir
+    if j < 1 or j > #src then return end
+    local new = util:deepClone(src)
+    new[i], new[j] = new[j], new[i]
+    swingWrite(new)
+  end
+
+  local function drawFactorRow(i, f)
+    ImGui.PushID(ctx, i)
+
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, string.format('%d.', i))
+    ImGui.SameLine(ctx)
+
+    local atomIdx = 0
+    for k, a in ipairs(SWING_ATOMS) do if a == f.atom then atomIdx = k - 1; break end end
+    ImGui.SetNextItemWidth(ctx, 90)
+    local rv, newIdx = ImGui.Combo(ctx, '##atom', atomIdx, SWING_ATOMS_Z)
+    if rv then
+      local newAtom = SWING_ATOMS[newIdx + 1]
+      local range   = timing.atomRange[newAtom] or 0
+      local amt     = f.amount or 0
+      if math.abs(amt) > range then amt = (amt < 0 and -1 or 1) * range * 0.999 end
+      patchFactor(i, { atom = newAtom, amount = amt })
+    end
+
+    ImGui.SameLine(ctx)
+    local range = timing.atomRange[f.atom] or 0
+    local frozen = range == 0
+    if frozen then ImGui.BeginDisabled(ctx) end
+    ImGui.SetNextItemWidth(ctx, 150)
+    local lo, hi = -range * 0.999, range * 0.999
+    local rvA, newAmt = ImGui.SliderDouble(ctx, '##amt', f.amount or 0, lo, hi, '%.3f')
+    -- Reswing on release only: the slider fires every frame during a
+    -- drag, which would reswing every event under this preset on every
+    -- tick. Stash the pre-drag composite on press, preview-write during
+    -- the drag, commit the reswing (old→now) once on release.
+    if ImGui.IsItemActivated(ctx) then
+      swingEditor.dragOld = util:deepClone(swingRead()) or {}
+    end
+    if rvA then
+      local new = util:deepClone(swingRead()) or {}
+      if new[i] then new[i].amount = newAmt; swingPreview(new) end
+    end
+    if ImGui.IsItemDeactivatedAfterEdit(ctx) and swingEditor.dragOld then
+      local old, cur = swingEditor.dragOld, swingRead() or {}
+      swingEditor.dragOld = nil
+      if not compositesEqual(old, cur) then
+        vm.commands.reswingPreset(swingEditor.name, old, cur)
+      end
+    end
+    if frozen then ImGui.EndDisabled(ctx) end
+
+    ImGui.SameLine(ctx)
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, 'per')
+    ImGui.SameLine(ctx)
+    ImGui.SetNextItemWidth(ctx, 80)
+    local pIdx = periodPresetIndex(f.period)
+    local items = {}
+    for _, p in ipairs(PERIOD_PRESETS) do items[#items+1] = p.label end
+    if pIdx == 0 then items[#items+1] = periodLabel(f.period) end
+    local itemsZ = table.concat(items, '\0') .. '\0\0'
+    local curIdx = pIdx > 0 and (pIdx - 1) or #PERIOD_PRESETS
+    local rvP, newPIdx = ImGui.Combo(ctx, '##per', curIdx, itemsZ)
+    if rvP and newPIdx + 1 <= #PERIOD_PRESETS then
+      local p = PERIOD_PRESETS[newPIdx + 1]
+      patchFactor(i, { period = barFracToPeriod(p.num, p.den) })
+    end
+
+    ImGui.SameLine(ctx)
+    if ImGui.ArrowButton(ctx, '##up', ImGui.Dir_Up)   then moveFactor(i, -1) end
+    ImGui.SameLine(ctx)
+    if ImGui.ArrowButton(ctx, '##dn', ImGui.Dir_Down) then moveFactor(i,  1) end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'x')                         then removeFactor(i)  end
+
+    ImGui.SameLine(ctx)
+    drawPWLThumb(timing.atoms[f.atom](f.amount), 40, 40)
+
+    ImGui.PopID(ctx)
+  end
+
+  -- Height estimate for auto-resize on factor-count change. The
+  -- composite-preview tile follows window width, so we approximate it
+  -- from the last-known width. Intentionally loose — ImGui pads widgets
+  -- differently; a few px off is fine.
+  local function idealSwingHeight(nFactors, winW)
+    local nTiles   = math.max(1, math.floor((winW - 20) / TARGET_TILE))
+    local tileSize = (winW - 20) / nTiles
+    return 80          -- title row + separator + add button + padding
+         + tileSize    -- composite preview
+         + nFactors * 52
+  end
+
+  local function drawSwingEditor()
+    if not swingEditor then return end
+
+    local composite = (swingEditor.name and swingRead()) or {}
+    local n = #composite
+
+    -- First-time default; then max height = viewport so auto-grow
+    -- stays on-screen. Width is user-resizable thereafter.
+    local _, vpH = ImGui.Viewport_GetSize(ImGui.GetMainViewport(ctx))
+    ImGui.SetNextWindowSizeConstraints(ctx, 400, 120, 9999, vpH)
+    ImGui.SetNextWindowSize(ctx, 560, 420, ImGui.Cond_FirstUseEver)
+
+    -- Auto-resize height when the factor stack changes. Width is
+    -- preserved from the last known value (or initial default).
+    if swingEditor.lastCount ~= n then
+      local w = swingEditor.lastW or 560
+      local h = math.min(idealSwingHeight(n, w), vpH)
+      ImGui.SetNextWindowSize(ctx, w, h, ImGui.Cond_Always)
+      swingEditor.lastCount = n
+    end
+
+    local visible, open = ImGui.Begin(ctx, 'Swing', true,
+      ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_NoDocking)
+    if not open then swingEditor = nil end
+
+    if visible then
+      swingEditor.lastW = ImGui.GetWindowWidth(ctx)
+
+      if ImGui.IsWindowFocused(ctx) and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
+        swingEditor = nil
+      end
+
+      if swingEditor and not swingEditor.name then
+        -- CREATE MODE
+        ImGui.Text(ctx, 'No swing slot is set.')
+        ImGui.Text(ctx, 'Name:')
+        ImGui.SameLine(ctx)
+        ImGui.SetNextItemWidth(ctx, 240)
+        local rv, buf = ImGui.InputText(ctx, '##newname', swingEditor.createBuf,
+          ImGui.InputTextFlags_EnterReturnsTrue)
+        swingEditor.createBuf = buf
+        ImGui.SameLine(ctx)
+        local confirm = rv or ImGui.Button(ctx, 'Create new swing')
+        if confirm then
+          local name = buf and buf:match('^%s*(.-)%s*$')
+          local lib  = cfg('swings') or {}
+          if not name or name == '' then
+            swingEditor.createError = 'Name required.'
+          elseif lib[name] then
+            swingEditor.createError = 'Name already in use.'
+          else
+            vm.commands.setSwingComposite(name, {})
+            vm.commands.setSwingSlot(name)
+            swingEditor.name        = name
+            swingEditor.snapshot    = {}
+            swingEditor.createBuf   = ''
+            swingEditor.createError = nil
+          end
+        end
+        if swingEditor and swingEditor.createError then
+          ImGui.TextColored(ctx, SWING_ERR, swingEditor.createError)
+        end
+      elseif swingEditor then
+        -- EDIT MODE
+        ImGui.Text(ctx, 'Editing: ' .. swingEditor.name)
+        ImGui.SameLine(ctx)
+        local dirty = not compositesEqual(composite, swingEditor.snapshot)
+        if not dirty then ImGui.BeginDisabled(ctx) end
+        if ImGui.Button(ctx, 'Reset') then swingWrite(util:deepClone(swingEditor.snapshot) or {}) end
+        if not dirty then ImGui.EndDisabled(ctx) end
+
+        ImGui.Separator(ctx)
+        local availW = ImGui.GetContentRegionAvail(ctx)
+        drawCompositeThumb(composite, availW)
+        ImGui.Separator(ctx)
+
+        for i, f in ipairs(composite) do
+          drawFactorRow(i, f)
+          ImGui.Separator(ctx)
+        end
+
+        if ImGui.Button(ctx, '+ add factor') then addFactor() end
+      end
+
+      ImGui.End(ctx)
+    end
+  end
+
   --------------------
   -- Public interface
   --------------------
@@ -863,6 +1275,8 @@ function newRenderManager(vm, cm)
 
       ImGui.End(ctx)
     end
+
+    drawSwingEditor()
 
     ImGui.PopStyleColor(ctx, styleCount)
     ImGui.PopFont(ctx)

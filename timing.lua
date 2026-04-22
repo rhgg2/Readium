@@ -8,13 +8,13 @@
 -- inversion, and tiled extension along a periodic (PPQ) axis. No
 -- module-level state; all functions take explicit arguments.
 --
--- A swing is a sorted array of control points, starting at {0,0} and
--- ending at {1,1}, with strictly increasing x and y:
+-- A swing shape is a sorted array of control points, starting at
+-- {0,0} and ending at {1,1}, with strictly increasing x and y:
 --
 --   S = { {0,0}, {x1,y1}, ..., {xn,yn}, {1,1} }
 --
 -- Evaluation S(x) and inversion S^-1(y) are O(log n) via binary search
--- on the points. Swings form a group under composition; the identity
+-- on the points. Shapes form a group under composition; the identity
 -- is { {0,0}, {1,1} }.
 --
 -- To act on a time axis, attach a period T. The tiled extension
@@ -22,12 +22,23 @@
 --
 --   tile(S, T, p) = T * (floor(p/T) + S((p/T) mod 1))
 --
--- This fixes every multiple of T. Period is a property of the *slot*
--- where a swing is installed, not of the swing itself, and is given
--- in quarter notes (decimal or {num, den}), matching REAPER's native
--- PPQ coordinate. QN is used in preference to "beat" because a beat
--- is time-sig-denominator-dependent and ambiguous in 6/8, 12/8, etc;
--- QN is always exactly one quarter note regardless of time sig.
+-- This fixes every multiple of T. Period is in quarter notes (decimal
+-- or {num, den}), matching REAPER's native PPQ coordinate. QN is used
+-- in preference to "beat" because a beat is time-sig-denominator-
+-- dependent and ambiguous in 6/8, 12/8, etc; QN is always exactly one
+-- quarter note regardless of time sig.
+--
+-- A user-facing swing is a *composite*: an ordered list of factors,
+-- each a basic shape with its own period. The realised view transform
+-- is the composition of the factors' tiled extensions:
+--
+--   composite = { {atom, amount, period}, ... }
+--
+-- where `atom` names an entry in `timing.atoms`, `amount` is that
+-- atom's shape parameter, and `period` is in QN. An empty array is
+-- the identity composite. The library lives in `cfg.swings` at project
+-- scope; slots reference composites by name only, and the name is
+-- guaranteed to resolve within the project's library.
 ]]--
 
 timing = {}
@@ -36,40 +47,101 @@ local M = timing
 local EPS = 1e-12
 
 --------------------
--- Shapes: constructors and named registry
+-- Atoms: basic shape constructors on [0,1]
+--
+-- Each atom takes a single `amount` parameter and returns a PWL shape.
+-- Ranges noted below keep the result strictly monotonic; going beyond
+-- the open interval collapses a segment and breaks invertibility.
+-- Callers (UI, config load) are responsible for clamping.
 --------------------
 
-M.id = { {0, 0}, {1, 1} }
+M.atoms = {
+  -- identity: amount ignored.
+  id = function()
+    return { {0, 0}, {1, 1} }
+  end,
 
--- classic(amount): single control point at x = 0.5, with y = 0.5 + amount.
--- amount = 0 is identity; amount > 0 pushes the off-beat later (classic
--- two-per-beat swing). Valid range: amount in (-0.5, 0.5).
-function M.classic(amount)
-  if not amount or amount == 0 then return M.id end
-  return { {0, 0}, {0.5, 0.5 + amount}, {1, 1} }
-end
+  -- classic: single kink at the midpoint. a > 0 pushes the off-beat
+  -- later ("swung"); a < 0 earlier. Range: a ∈ (-0.5, 0.5).
+  classic = function(a)
+    if not a or a == 0 then return { {0, 0}, {1, 1} } end
+    return { {0, 0}, {0.5, 0.5 + a}, {1, 1} }
+  end,
 
--- Built-in registry of named shapes. Keys are the names users see in the
--- slot picker; values are Swings. Parallel to microtuning.tunings. The
--- naming convention `classic-NN` reads as "NN% swing" — the second half
--- of the window lands at x = 0.NN (so classic-50 is identity, classic-67
--- is the triplet feel).
-M.presets = {
-  ['id']         = M.id,
-  ['classic-55'] = M.classic(0.05),
-  ['classic-58'] = M.classic(0.08),
-  ['classic-62'] = M.classic(0.12),
-  ['classic-67'] = M.classic(0.17),
+  -- pocket: endpoints fixed, interior pushed back (a > 0) or forward
+  -- (a < 0) uniformly. Range: a ∈ (-0.25, 0.25).
+  pocket = function(a)
+    if not a or a == 0 then return { {0, 0}, {1, 1} } end
+    return { {0, 0}, {0.25, 0.25 + a}, {0.75, 0.75 + a}, {1, 1} }
+  end,
+
+  -- shuffle: triplet feel at the thirds. a = 1/6 gives the classical
+  -- 2:1 ratio. Range: a ∈ (-1/3, 1/3).
+  shuffle = function(a)
+    if not a or a == 0 then return { {0, 0}, {1, 1} } end
+    return { {0, 0}, {1/3, 1/3 - a}, {2/3, 2/3 + a}, {1, 1} }
+  end,
+
+  -- drag: asymmetric — stretches the first half (a > 0) or the second
+  -- (a < 0). Negative amount is "rush". Range: a ∈ (-0.5, 0.5).
+  drag = function(a)
+    if not a or a == 0 then return { {0, 0}, {1, 1} } end
+    return { {0, 0}, {0.5 + a, 0.5}, {1, 1} }
+  end,
+
+  -- lilt: smooth bump and return, midpoint pinned. Approximates a
+  -- gentle sinusoidal lilt. Range: a ∈ (-0.35, 0.35).
+  lilt = function(a)
+    if not a or a == 0 then return { {0, 0}, {1, 1} } end
+    local k = a * 0.7
+    return { {0, 0}, {0.25, 0.25 + k}, {0.5, 0.5}, {0.75, 0.75 - k}, {1, 1} }
+  end,
 }
 
--- Look up a shape by name. Searches a user-supplied registry first
--- (typically cfg.swings), falling back to the built-in presets. Returns
--- nil if no entry matches — caller decides whether that means "use id"
--- or "surface an error".
+-- Maximum |amount| keeping the atom strictly monotonic. The atom itself
+-- does not clamp; UI widgets and config loaders read this to build
+-- range-aware sliders / validators.
+M.atomRange = {
+  id      = 0,
+  classic = 0.5,
+  pocket  = 0.25,
+  shuffle = 1/3,
+  drag    = 0.5,
+  lilt    = 0.35,
+}
+
+--------------------
+-- Composite registry and lookup
+--
+-- Builtin presets are seed data — not consulted at slot-resolution
+-- time. A project's runtime library (`cfg.swings`) is the sole source
+-- of truth for name → composite; presets exist so the UI / cycle
+-- commands can copy entries into the library on demand.
+--
+-- Naming convention `classic-NN` reads as "NN% swing" — the second
+-- half of the window lands at x = 0.NN (classic-50 = identity,
+-- classic-67 = triplet feel).
+--------------------
+
+M.presets = {
+  ['id']         = {},
+  ['classic-55'] = { {atom = 'classic', amount = 0.05, period = 1} },
+  ['classic-58'] = { {atom = 'classic', amount = 0.08, period = 1} },
+  ['classic-62'] = { {atom = 'classic', amount = 0.12, period = 1} },
+  ['classic-67'] = { {atom = 'classic', amount = 0.17, period = 1} },
+}
+
+-- Look up a composite by name in the project library. Missing name or
+-- missing library returns nil; callers treat nil as identity.
 function M.findShape(name, userLib)
-  if not name then return nil end
-  if userLib and userLib[name] then return userLib[name] end
-  return M.presets[name]
+  if not name or not userLib then return nil end
+  return userLib[name]
+end
+
+-- True if the composite is identity (nil or empty). Useful for
+-- early-out in slot resolution.
+function M.isIdentity(composite)
+  return not composite or #composite == 0
 end
 
 --------------------
@@ -158,7 +230,7 @@ end
 -- Tiled extension on a PPQ axis
 --------------------
 
--- Forward: raw PPQ → swung PPQ, given swing S and period T (PPQ).
+-- Forward: raw PPQ → swung PPQ, given shape S and period T (PPQ).
 -- Multiples of T are fixed points. T <= 0 is treated as identity.
 function M.tile(S, T, p)
   if T <= 0 then return p end
