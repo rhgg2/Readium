@@ -82,30 +82,17 @@ function newTrackerManager(mm, cm)
     table.sort(tbl, function(a, b) return a.ppq < b.ppq end)
   end
 
-  local function cfg(key, default)
-    if cm then
-      local val = cm:get(key)
-      if val ~= nil then return val end
-    end
-    return default
-  end
-
-  local function setcfg(lev, key, val)
-    if cm then cm:set(lev, key, val) end
-  end
-
-
   --------------------
   -- PB <-> cents conversion
   --------------------
 
   local function centsToRaw(cents)
-    local lim = cfg('pbRange', 2) * 100
+    local lim = cm:get('pbRange') * 100
     return util:clamp(math.floor(cents * 8192 / lim + 0.5), -8192, 8191)
   end
 
   local function rawToCents(raw)
-    local lim = cfg('pbRange', 2) * 100
+    local lim = cm:get('pbRange') * 100
     return math.floor(raw / 8192 * lim + 0.5)
   end
 
@@ -135,21 +122,18 @@ function newTrackerManager(mm, cm)
   -- add it back before routing writes to mm.
   --------------------
 
-  -- Round at source so the map is an integer bijection: every arithmetic
-  -- use (intent ± delayToPPQ(d)) stays in ℤ, and realise/strip round-trip
-  -- is algebraic rather than approximate.
-  local function delayToPPQ(d) return mm and math.floor(mm:resolution() * (d or 0) / 1000 + 0.5) or 0 end
+  local function delayToPPQ(d) return timing.delayToPPQ(d, mm:resolution()) end
 
   -- Resolve a slot name to an array of realised factors {S, T} in PPQ,
   -- or nil for identity. S is the atom evaluated at its amount; T is
   -- the factor's period converted to PPQ against the current resolution.
-  -- `libOverride`, if given, shadows cfg('swings') for named lookups —
+  -- `libOverride`, if given, shadows cm:get('swings') for named lookups —
   -- callers pass {[name]=composite} to realise a hypothetical library
   -- state (used during preset edits, where the authoring and target
   -- composites for the same name must be resolved side-by-side).
   local function resolveSlot(name, libOverride)
     local composite = libOverride and libOverride[name]
-                   or timing.findShape(name, cfg('swings'))
+                   or timing.findShape(name, cm:get('swings'))
     if timing.isIdentity(composite) then return nil end
     local ppqPerQN = mm:resolution()
     local factors = {}
@@ -159,19 +143,6 @@ function newTrackerManager(mm, cm)
       factors[i] = { S = atom(f.amount), T = ppqPerQN * timing.periodQN(f.period) }
     end
     return factors
-  end
-
-  local function applyFactors(factors, ppq)
-    for _, f in ipairs(factors) do ppq = timing.tile(f.S, f.T, ppq) end
-    return ppq
-  end
-
-  local function unapplyFactors(factors, ppq)
-    for i = #factors, 1, -1 do
-      local f = factors[i]
-      ppq = timing.tileInverse(f.S, f.T, ppq)
-    end
-    return ppq
   end
 
   --------------------
@@ -672,7 +643,7 @@ function newTrackerManager(mm, cm)
   --------------------
 
   local function noteColumnAccepts(col, notePpq, noteEndPpq)
-    local overlapThreshold = cfg('overlapOffset', 1/16) * mm:resolution()
+    local overlapThreshold = cm:get('overlapOffset') * mm:resolution()
     local dominated = 0
     for _, evt in ipairs(col.events) do
       if notePpq == evt.ppq then return false end
@@ -866,7 +837,7 @@ function newTrackerManager(mm, cm)
     --     empty note lanes and seed singletons/ccs that the user has
     --     opened but that carry no events yet.
     do
-      local extras = cfg('extraColumns') or {}
+      local extras = cm:get('extraColumns')
       local grew   = false
       for i = 1, 16 do
         local c    = channels[i].columns
@@ -885,7 +856,7 @@ function newTrackerManager(mm, cm)
           c.ccs[ccNum] = c.ccs[ccNum] or { cc = ccNum, events = {} }
         end
       end
-      if grew then setcfg('take', 'extraColumns', extras) end
+      if grew then cm:set('take', 'extraColumns', extras) end
     end
 
     -- 5) Strip delay (so vm sees intent-frame PPQs) and sort each
@@ -952,42 +923,17 @@ function newTrackerManager(mm, cm)
     return mm and mm:timeSigs() or {}
   end
 
-  function tm:swingGlobal()     return resolveSlot(cfg('swing')) end
-  function tm:swingColumn(chan)
-    local cs = cfg('colSwing')
-    return cs and resolveSlot(cs[chan])
-  end
-
-  -- E_c forward: straight PPQ → realised PPQ on channel chan. Column
-  -- inner, global outer (see design/swing.md). Missing slots pass through.
-  function tm:applySwing(chan, ppq)
-    local c = self:swingColumn(chan)
-    if c then ppq = applyFactors(c, ppq) end
-    local g = self:swingGlobal()
-    if g then ppq = applyFactors(g, ppq) end
-    return ppq
-  end
-
-  -- E_c inverse: realised PPQ → straight PPQ.
-  function tm:unapplySwing(chan, ppq)
-    local g = self:swingGlobal()
-    if g then ppq = unapplyFactors(g, ppq) end
-    local c = self:swingColumn(chan)
-    if c then ppq = unapplyFactors(c, ppq) end
-    return ppq
-  end
-
   -- Snapshot of all slots resolved once, with atom PWLs and T_ppq baked
-  -- in. Use this in hot loops (rebuilds, renders) to avoid the per-call
-  -- cfg reads and composite materialisation in applySwing/unapplySwing.
-  -- Always returns a valid pass-through struct when there's no context
-  -- or no slots — callers needn't nil-check.
+  -- in. Sole public swing entry point — callers apply/unapply through
+  -- the snapshot's closures. Always returns a valid pass-through struct
+  -- when there's no context or no slots, so callers needn't nil-check.
+  -- E_c: column is inner, global is outer (see design/swing.md).
   function tm:swingSnapshot(override)
     local global, column = nil, {}
     if mm then
       local gSrc, cSrc, libO
       if override then gSrc, cSrc, libO = override.swing, override.colSwing, override.libOverride
-      else             gSrc, cSrc       = cfg('swing'),   cfg('colSwing')
+      else             gSrc, cSrc       = cm:get('swing'), cm:get('colSwing')
       end
       global = resolveSlot(gSrc, libO)
       if cSrc then
@@ -999,25 +945,18 @@ function newTrackerManager(mm, cm)
       column = column,
       apply = function(chan, ppq)
         local c = column[chan]
-        if c      then ppq = applyFactors(c, ppq) end
-        if global then ppq = applyFactors(global, ppq) end
+        if c      then ppq = timing.applyFactors(c, ppq) end
+        if global then ppq = timing.applyFactors(global, ppq) end
         return ppq
       end,
       unapply = function(chan, ppq)
-        if global then ppq = unapplyFactors(global, ppq) end
+        if global then ppq = timing.unapplyFactors(global, ppq) end
         local c = column[chan]
-        if c      then ppq = unapplyFactors(c, ppq) end
+        if c      then ppq = timing.unapplyFactors(c, ppq) end
         return ppq
       end,
     }
   end
-
-  -- Delay unit is signed milli-QN; 1000 means one QN late.
-  function tm:delayToPPQ(d)  return delayToPPQ(d) end
-  function tm:ppqToDelay(p)  return mm and 1000 * p / mm:resolution() or 0 end
-
-  function tm:straightPPQ(n)    return n.ppq    - self:delayToPPQ(n.delay) end
-  function tm:straightEndPPQ(n) return n.endppq - self:delayToPPQ(n.delay) end
 
   function tm:playFrom(ppq)
     if not (mm and mm:take()) then return end

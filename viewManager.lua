@@ -39,37 +39,244 @@ loadModule('util')
 loadModule('midiManager')
 loadModule('trackerManager')
 loadModule('microtuning')
+loadModule('commandManager')
 
 local function print(...)
   return util:print(...)
 end
 
--- Order of column kinds within a channel (presentation).
-local columnKindOrder = { 'pc', 'pb', 'note', 'at', 'cc' }
+--------------------
+-- newViewContext
+--
+-- Snapshot of everything the view layer needs to project tracker data
+-- onto display coordinates: row↔ppq, beat/bar metering, tuning lens,
+-- curve-shape ghost sampling. Built once per vm:rebuild from the
+-- resolved swing snapshot (frame override already baked in by tm) plus
+-- the rebuild-time grid geometry.
+--
+-- Pure with respect to its constructor args: every method is a function
+-- of the bound state plus its own arguments. No callbacks, no mutation.
+-- Throw the context away and rebuild a new one — there is no migration.
+--
+-- CONSTRUCTION
+--   local ctx = newViewContext{
+--     swing      = <snapshot from tm:swingSnapshot()>,
+--     rowPPQs    = { [0..numRows-1] = ppq },
+--     length     = <item length in ppq>,
+--     numRows    = <integer>,
+--     rowPerBeat = <integer>,
+--     timeSigs   = { { ppq, num, denom }, ... },  -- non-empty
+--     tuning     = <microtuning object or nil>,
+--   }
+--
+-- METHODS
+--   ctx:ppqToRow(ppq, chan)        fractional row of an intent ppq
+--   ctx:rowToPPQ(row, chan)        integer ppq of a (possibly fractional) row
+--   ctx:snapRow(ppq, chan)         floor(ppqToRow(ppq, chan) + 0.5)
+--   ctx:noteProjection(evt)        (label, gap, halfGap) under bound tuning, or nil
+--   ctx:activeTuning()             bound tuning object or nil
+--   ctx:rowBeatInfo(row)           (isBarStart, isBeatStart)
+--   ctx:barBeatSub(row)            (bar, beat, sub, ts)
+--   ctx:timeSigAt(ppq)             active ts for ppq
+--   ctx:tsRow(ts)                  row of a ts's start
+--   ctx:sampleGhosts(events, chan, occupied)
+--                                  { [y] = { val, fromEvt, toEvt } } for non-step pairs
+--------------------
 
--- Canonicalise a flat column list: pc → pb → notes (preserving order,
--- i.e. lane order) → at → cc (by cc number). Operates on grid cols,
--- which carry a `type` field.
-local function canonicaliseColumns(cols)
-  local buckets = {}
-  for _, t in ipairs(columnKindOrder) do buckets[t] = {} end
-  for _, col in ipairs(cols) do
-    local b = buckets[col.type]
-    if b then util:add(b, col) end
+function newViewContext(args)
+  local swing      = args.swing
+  local rowPPQs    = args.rowPPQs
+  local length     = args.length
+  local numRows    = args.numRows
+  local rowPerBeat = args.rowPerBeat
+  local timeSigs   = args.timeSigs
+  local tuning     = args.tuning
+
+  ---------- REAPER CC CURVE SHAPES
+  --
+  -- Single consumer is sampleGhosts below. Bezier handle table recovered
+  -- from REAPER's `bezier` shape; indexed by |τ| at 0.1 steps. Row format:
+  -- { h, θ_large (rad), θ_small (rad) }. See design/curves.md.
+
+  local BEZIER = {
+    { 0.2794, 0.4636,    0.4636 },
+    { 0.3442, 0.7704,    0.3384 },
+    { 0.4020, 0.9849,    0.2466 },
+    { 0.4642, 1.1455,    0.1812 },
+    { 0.5326, 1.2647,    0.1353 },
+    { 0.6059, 1.3532,    0.1011 },
+    { 0.6820, 1.4199,    0.0738 },
+    { 0.7604, 1.4714,    0.0515 },
+    { 0.8397, 1.5116,    0.0321 },
+    { 0.9198, 1.5441,    0.0154 },
+    { 1.0000, math.pi/2, 0      },
+  }
+
+  local function bezierSample(tau, t)
+    if t <= 0 then return 0 end
+    if t >= 1 then return 1 end
+    local fi = util:clamp(math.abs(tau), 0, 1) * 10
+    local i = math.min(math.floor(fi), 9)
+    local f = fi - i
+    local r0, r1 = BEZIER[i+1], BEZIER[i+2]
+    local h  = r0[1] + (r1[1] - r0[1]) * f
+    local tL = r0[2] + (r1[2] - r0[2]) * f
+    local tS = r0[3] + (r1[3] - r0[3]) * f
+    local t1, t2 = tS, tL
+    if tau < 0 then t1, t2 = tL, tS end
+    local ax, ay = h*math.cos(t1),     h*math.sin(t1)
+    local bx, by = 1 - h*math.cos(t2), 1 - h*math.sin(t2)
+    local lo, hi = 0, 1
+    for _ = 1, 20 do
+      local s = (lo + hi) * 0.5
+      local u = 1 - s
+      local x = 3*u*u*s*ax + 3*u*s*s*bx + s*s*s
+      if x < t then lo = s else hi = s end
+    end
+    local s = (lo + hi) * 0.5
+    local u = 1 - s
+    return 3*u*u*s*ay + 3*u*s*s*by + s*s*s
   end
-  table.sort(buckets.cc, function(a, b) return (a.cc or 0) < (b.cc or 0) end)
-  local out = {}
-  for _, t in ipairs(columnKindOrder) do
-    for _, col in ipairs(buckets[t]) do util:add(out, col) end
+
+  -- y ∈ [0,1] for normalised t ∈ [0,1], given a REAPER CC shape name.
+  -- tension is only used for 'bezier' and expected in [-1, 1].
+  local function curveSample(shape, tension, t)
+    if     shape == 'step'       then return t >= 1 and 1 or 0
+    elseif shape == 'linear'     then return t
+    elseif shape == 'slow'       then return t*t*(3 - 2*t)
+    elseif shape == 'fast-start' then local u = 1 - t; return 1 - u*u*u
+    elseif shape == 'fast-end'   then return t*t*t
+    elseif shape == 'bezier'     then return bezierSample(tension or 0, t)
+    end
   end
-  return out
+
+  local ctx = {}
+
+  ---------- PPQ / ROW
+
+  function ctx:ppqToRow(ppq, chan)
+    ppq = swing.unapply(chan, ppq)
+    if ppq <= 0 then return 0 end
+    if ppq >= length then return numRows end
+    local lo, hi = 0, numRows - 1
+    while lo < hi do
+      local mid = (lo + hi + 1) // 2
+      if rowPPQs[mid] <= ppq then lo = mid else hi = mid - 1 end
+    end
+    local rowStart = rowPPQs[lo]
+    local rowEnd   = rowPPQs[lo + 1] or length
+    return lo + (rowEnd > rowStart and (ppq - rowStart) / (rowEnd - rowStart) or 0)
+  end
+
+  function ctx:rowToPPQ(row, chan)
+    if row <= 0 then return 0 end
+    if row >= numRows then return length end
+    local r        = math.floor(row)
+    local frac     = row - r
+    local rowStart = rowPPQs[r]
+    local rowEnd   = rowPPQs[r + 1] or length
+    return math.floor(swing.apply(chan, rowStart + frac * (rowEnd - rowStart)) + 0.5)
+  end
+
+  function ctx:snapRow(ppq, chan) return math.floor(self:ppqToRow(ppq, chan) + 0.5) end
+
+  ---------- TUNING LENS
+
+  function ctx:activeTuning() return tuning end
+
+  function ctx:noteProjection(evt)
+    if not (tuning and evt and evt.pitch) then return end
+    local detune    = evt.detune or 0
+    local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
+    local label     = microtuning.stepToText(tuning, step, oct)
+    local tm_, td_  = microtuning.stepToMidi(tuning, step, oct)
+    local gap       = (evt.pitch * 100 + detune) - (tm_ * 100 + td_)
+
+    local steps, n, period = tuning.cents, #tuning.cents, tuning.period
+    local left    = step == 1 and steps[n] - period or steps[step - 1]
+    local right   = step == n and steps[1] + period or steps[step + 1]
+    local halfGap = math.min(steps[step] - left, right - steps[step]) / 2
+
+    return label, gap, halfGap
+  end
+
+  ---------- TIME SIGNATURE / METERING
+
+  function ctx:timeSigAt(ppq)
+    local active = timeSigs[1]
+    for i = 2, #timeSigs do
+      if timeSigs[i].ppq <= ppq then active = timeSigs[i]
+      else break end
+    end
+    return active
+  end
+
+  -- Time sigs land on bar boundaries — swing fixpoints — so the round-trip
+  -- through ppqToRow is stable and the floor is exact.
+  function ctx:tsRow(ts) return math.floor(self:ppqToRow(ts.ppq)) end
+
+  function ctx:rowBeatInfo(row)
+    local ts = self:timeSigAt(self:rowToPPQ(row))
+    if not ts then return false, false end
+    local rel = row - self:tsRow(ts)
+    return rel % (rowPerBeat * ts.num) == 0, rel % rowPerBeat == 0
+  end
+
+  function ctx:barBeatSub(row)
+    local bar = 1
+    for i, ts in ipairs(timeSigs) do
+      local rpbar   = rowPerBeat * ts.num
+      local next_   = timeSigs[i + 1]
+      local nextRow = next_ and self:tsRow(next_) or math.huge
+      if row < nextRow then
+        local rel = row - self:tsRow(ts)
+        return bar + rel // rpbar,
+               (rel % rpbar) // rowPerBeat + 1,
+               rel % rowPerBeat + 1,
+               ts
+      end
+      bar = bar + (nextRow - self:tsRow(ts)) // rpbar
+    end
+    return bar, 1, 1, timeSigs[1]
+  end
+
+  ---------- GHOST CELLS
+  --
+  -- Sample intermediate values between consecutive scalar events A, B
+  -- when A.shape is a non-step curve. The shape of A governs the pair
+  -- (A, B). `occupied[y]` truthy means a real event already lives at row
+  -- y — skip it. Returns a table { [y] = { val, fromEvt, toEvt } }.
+
+  function ctx:sampleGhosts(events, chan, occupied)
+    local ghosts = {}
+    for i = 1, #events - 1 do
+      local A, B = events[i], events[i + 1]
+      local shape = A.shape
+      if shape and shape ~= 'step' then
+        local rA = self:ppqToRow(A.ppq, chan)
+        local rB = self:ppqToRow(B.ppq, chan)
+        local yA, yB = math.floor(rA + 0.5), math.floor(rB + 0.5)
+        local span, delta = rB - rA, (B.val or 0) - (A.val or 0)
+        for y = yA + 1, yB - 1 do
+          if y >= 0 and y < numRows and not (occupied and occupied[y]) then
+            local t   = (y - rA) / span
+            local val = (A.val or 0) + curveSample(shape, A.tension, t) * delta
+            ghosts[y] = { val = math.floor(val + 0.5), fromEvt = A, toEvt = B }
+          end
+        end
+      end
+    end
+    return ghosts
+  end
+
+  return ctx
 end
 
 --------------------
--- Factory
+-- newViewManager factory
 --------------------
 
-function newViewManager(tm, cm)
+function newViewManager(tm, cm, cmgr)
 
   ---------- PRIVATE STATE
 
@@ -79,8 +286,7 @@ function newViewManager(tm, cm)
   local rowPPQs    = {}
   local length     = 0
   local timeSigs   = {}
-  local swing      = { apply = function(_, p) return p end,
-                       unapply = function(_, p) return p end }
+  local ctx        = nil  -- viewContext built per rebuild
   local advanceBy  = 1
   local currentOctave = 2
 
@@ -115,6 +321,25 @@ function newViewManager(tm, cm)
   -- ghost-rendered. pa lives inside note columns and is not (yet) supported.
   local ghostable = { cc = true, pb = true, at = true, pc = true }
 
+  -- Per-column-kind constants for grid layout. The `note` kind has two
+  -- shapes — with and without the trailing delay sub-column — keyed
+  -- separately to avoid a per-call branch in addGridCol.
+  local STOPS = {
+    note          = {0,2,4,5},          -- C-4 30
+    noteWithDelay = {0,2,4,5,7,8,9},    -- C-4 30 [040]
+    pb            = {0,1,2,3},
+    cc = {0,1}, pa = {0,1}, at = {0,1}, pc = {0,1},
+  }
+  local SELGROUPS = {
+    note          = {1,1,2,2},
+    noteWithDelay = {1,1,2,2,3,3,3},
+    pb            = {1,1,1,1},
+    cc = {1,1}, pa = {1,1}, at = {1,1}, pc = {1,1},
+  }
+  local LABELS = {
+    note = 'Note', cc = 'CC', pb = 'PB', at = 'AT', pa = 'PA', pc = 'PC',
+  }
+
   -- Interpolation shape cycle. 'step' means no interpolation (no ghosts);
   -- 'bezier' is excluded from the cycle but honoured if already set.
   local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end' }
@@ -125,48 +350,21 @@ function newViewManager(tm, cm)
     return 'linear'
   end
 
-  -- Lane of a note grid column: its 1-indexed position among note
-  -- columns in the same channel. Returns nil for non-note columns.
-  local function laneOf(col)
-    if not (col and col.type == 'note') then return end
-    local lane = 0
-    for ci = grid.chanFirstCol[col.midiChan], grid.chanLastCol[col.midiChan] do
-      local c = grid.cols[ci]
-      if c.type == 'note' then
-        lane = lane + 1
-        if c == col then return lane end
-      end
-    end
-  end
-
-  ----------  CONFIG HELPERS
-
-  local function cfg(key, default)
-    if cm then
-      local val = cm:get(key)
-      if val ~= nil then return val end
-    end
-    return default
-  end
-
-  local function setcfg(lev, key, val)
-    if cm then cm:set(lev, key, val) end
-  end
 
   ----------  FRAME OVERRIDE HELPERS
 
   local function effectiveSwing()
     if frameOverride then return frameOverride.swing end
-    return cfg('swing')
+    return cm:get('swing')
   end
 
   local function effectiveColSwing(chan)
     if frameOverride and frameOverride.chan == chan then return frameOverride.col end
-    return cfg('colSwing', {})[chan]
+    return cm:get('colSwing')[chan]
   end
 
   local function effectiveRPB()
-    return (frameOverride and frameOverride.rpb) or cfg('rowPerBeat', 4)
+    return (frameOverride and frameOverride.rpb) or cm:get('rowPerBeat')
   end
 
   -- Bookmark stamped onto a new note — captures the authoring frame so
@@ -179,18 +377,13 @@ function newViewManager(tm, cm)
     }
   end
 
-  -- Override arg for tm:swingSnapshot. cfg's colSwing is cloned and only
-  -- the override's chan is replaced, so other channels fall through.
+  -- Override arg for tm:swingSnapshot. cm's colSwing read is already a
+  -- fresh copy; we replace only the override's chan so others fall through.
   local function swingOverrideArg()
     if not frameOverride then return nil end
-    local colMap = util:clone(cfg('colSwing', {}))
+    local colMap = cm:get('colSwing')
     colMap[frameOverride.chan] = frameOverride.col
     return { swing = frameOverride.swing, colSwing = colMap }
-  end
-
-  local function addNoteEvent(update)
-    update.frame = currentFrame(update.chan)
-    tm:addEvent('note', update)
   end
 
   ---------- CHANNEL MUTE / SOLO
@@ -207,8 +400,8 @@ function newViewManager(tm, cm)
   local effectiveMuted = {}  -- cached for cheap per-cell render queries
 
   local function recomputeEffectiveMute()
-    local m = util:clone(cfg('mutedChannels', {}))
-    local s = cfg('soloedChannels', {})
+    local m = cm:get('mutedChannels')
+    local s = cm:get('soloedChannels')
     if next(s) then
       for c = 1, 16 do
         if s[c] then m[c] = nil
@@ -224,82 +417,10 @@ function newViewManager(tm, cm)
   end
 
   local function toggleChannelFlag(key, chan)
-    local s = util:clone(cfg(key, {}))
+    local s = cm:get(key)
     s[chan] = (not s[chan]) or nil
-    setcfg('take', key, s)
+    cm:set('take', key, s)
   end
-
-  ---------- MICROTUNING LENS
-
-  local function activeTuning()
-    local name = cfg('tuning', nil)
-    return name and microtuning.findTuning(name) or nil
-  end
-
-  -- Project a note event onto the active tuning. Returns label, gap, halfGap
-  -- (both in cents), or nil if no tuning is active / evt is not a note.
-  --   gap     = note.cents − displayedStepCents   (sharp is positive)
-  --   halfGap = half the distance to the nearest neighbour step, used to
-  --             normalise gap so full deflection = "just about to snap to
-  --             the next step" regardless of step density.
-  local function noteProjection(evt)
-    local tuning = activeTuning()
-    if not (tuning and evt and evt.pitch) then return end
-    local detune    = evt.detune or 0
-    local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
-    local label     = microtuning.stepToText(tuning, step, oct)
-    local tm_, td_  = microtuning.stepToMidi(tuning, step, oct)
-    local gap       = (evt.pitch * 100 + detune) - (tm_ * 100 + td_)
-
-    local steps, n, period = tuning.cents, #tuning.cents, tuning.period
-    local left    = step == 1 and steps[n] - period or steps[step - 1]
-    local right   = step == n and steps[1] + period or steps[step + 1]
-    local halfGap = math.min(steps[step] - left, right - steps[step]) / 2
-
-    return label, gap, halfGap
-  end
-
-  ---------- PPQ / ROW MAPPING
-
-  -- Row ↔ intent-PPQ. rowPPQs is the uniform, pre-swing row grid
-  -- (time-sig-driven); swing composes on top. The optional `chan`
-  -- selects the column's swing slot; omitted means "no column context" —
-  -- column tile drops out and only the global slot (if any) applies.
-  -- If neither slot is installed, these degenerate to the straight map.
-  -- rowToPPQ rounds once at the end, so output is an integer PPQ;
-  -- ppqToRow keeps its fractional result so off-grid detection and
-  -- sub-row interpolation at call sites can choose their own snap.
-  local function ppqToRow(ppq, chan)
-    ppq = swing.unapply(chan, ppq)
-    if ppq <= 0 then return 0 end
-    if ppq >= length then return grid.numRows end
-    local lo, hi = 0, grid.numRows - 1
-    while lo < hi do
-      local mid = (lo + hi + 1) // 2
-      if rowPPQs[mid] <= ppq then lo = mid else hi = mid - 1 end
-    end
-    local rowStart = rowPPQs[lo]
-    local rowEnd = rowPPQs[lo + 1] or length
-    return lo + (rowEnd > rowStart and (ppq - rowStart) / (rowEnd - rowStart) or 0)
-  end
-
-  local function rowToPPQ(row, chan)
-    if row <= 0 then return 0 end
-    if row >= grid.numRows then return length end
-    local r = math.floor(row)
-    local frac = row - r
-    local rowStart = rowPPQs[r]
-    local rowEnd = rowPPQs[r + 1] or length
-    return math.floor(swing.apply(chan, rowStart + frac * (rowEnd - rowStart)) + 0.5)
-  end
-
-  -- The displayed row of an intent PPQ: fractional ppqToRow rounded to
-  -- the nearest integer. Use at identity-repair sites — bounds, lengths,
-  -- equality comparisons — where σ_c float drift could otherwise make an
-  -- on-grid event read as off by one. Shift/move ops should keep the
-  -- fractional ppqToRow directly, so off-grid offsets flow through the
-  -- edit instead of being silently snapped away.
-  local function snapRow(ppq, chan) return math.floor(ppqToRow(ppq, chan) + 0.5) end
 
   ---------- AUDITION
 
@@ -517,20 +638,23 @@ function newViewManager(tm, cm)
     killAudition()
     if #grid.cols == 0 then return end
     if not inBlock() then selClear() end
-    local sgn = n > 0 and 1 or -1
+    local sgn  = n > 0 and 1 or -1
+    local land = sgn > 0 and toLastStop or toFirstStop
 
     if inBlock() then
+      -- Extending (moving away from the anchor): scroll then land on the
+      -- new col's near edge. Shrinking (moving toward the anchor): land on
+      -- the current col's far edge first, then scroll off it.
       for _ = 1, math.abs(n) do
-        if     sgn ==  1 and cursorCol >= selAnchor.col then scrollStopBy(1);  toLastStop()
-        elseif sgn ==  1                                then toLastStop();     scrollStopBy(1)
-        elseif sgn == -1 and cursorCol <= selAnchor.col then scrollStopBy(-1); toFirstStop()
-        else                                                 toFirstStop();    scrollStopBy(-1)
-        end
+        local extending = (sgn > 0 and cursorCol >= selAnchor.col)
+                       or (sgn < 0 and cursorCol <= selAnchor.col)
+        if extending then scrollStopBy(sgn); land()
+        else              land();            scrollStopBy(sgn) end
       end
     else
       for _ = 1, math.abs(n) do
-        if sgn == 1 then toLastStop();  scrollStopBy(1)
-        else             toFirstStop(); scrollStopBy(-1); toFirstStop()
+        if sgn > 0 then toLastStop();  scrollStopBy(1)
+        else            toFirstStop(); scrollStopBy(-1); toFirstStop()
         end
       end
     end
@@ -593,77 +717,12 @@ function newViewManager(tm, cm)
     hexDigit[string.byte('A') + i] = 10 + i
   end
 
-  local function replaceNibble(old, nibble, d)
-    if nibble == 0 then return util:clamp((d << 4) | (old & 0x0F), 0, 127)
-    else return util:clamp((old & 0xF0) | d, 0, 127) end
-  end
-
-  -- Writes digit `d` at place `pos` (0 = ones, 1 = next up, …) in numeric `base`,
-  -- zeroing all lower places and keeping higher ones. `half` adds place/2 to
-  -- support shift-digit half-step entry.
-  local function setDigit(val, d, pos, base, half)
-    local place = base ^ pos // 1
-    local above = val - (val % (place * base))
-    return above + d * place + (half and place // 2 or 0)
-  end
-
-  -- Note input layouts: each has two rows of characters matching the
-  -- physical piano-key positions (Z-row = base octave, Q-row = +1).
-  -- Entries are single-char strings or Unicode codepoints for non-ASCII.
-  local noteLayouts = {
-    qwerty = {
-      { 'z','s','x','d','c','v','g','b','h','n','j','m',',','l','.',';','/' },
-      { 'q','2','w','3','e','r','5','t','6','y','7','u','i','9','o','0','p','[','=',']' },
-    },
-    colemak = {
-      { 'z','r','x','s','c','v','d','b','h','k','n','m',',','i','.','o','/' },
-      { 'q','2','w','3','f','p','5','g','6','j','7','l','u','9','y','0',';','[','=',']' },
-    },
-    dvorak = {
-      { ';','o','q','e','j','k','i','x','d','b','h','m','w','n','v','s','z' },
-      { "'", '2',',','3','.','p','5','y','6','f','7','g','c','9','r','0','l','/',']','=' },
-    },
-    azerty = {
-      { 'w','s','x','d','c','v','g','b','h','n','j',',',';','l',':','m','!' },
-      { 'a',233,'z','"','e','r','(','t','-','y',232,'u','i',231,'o',224,'p','^','=','$' },
-    },
-  }
-
-  local function buildNoteChars(layout)
-    local t = {}
-    for octOff, row in ipairs(layout) do
-      for semi, ch in ipairs(row) do
-        local code = type(ch) == 'number' and ch or string.byte(ch)
-        t[code] = { semi - 1, octOff - 1 }
-      end
-    end
-    return t
-  end
-
-  local noteChars = buildNoteChars(noteLayouts.colemak)
-
-  local function isNote(e) return e and e.endppq end
-
-  -- between: iterate events with ppq in [lo, hi). Assumes ppq-sorted input.
-  local function between(events, lo, hi, filter)
-    filter = filter or function(e) return true end
-    local i = 0
-    return function()
-      while true do
-        i = i + 1
-        local evt = events[i]
-        if not evt or evt.ppq >= hi then return end
-        if evt.ppq >= lo and filter(evt) then return evt end
-      end
-    end
-  end
-
   local function truncatePitchInChannel(chan, pitch, ppq, exclCol, excludeEvt)
     for ci = grid.chanFirstCol[chan], grid.chanLastCol[chan] do
       local gc = grid.cols[ci]
       if gc and gc.type == 'note' and gc ~= exclCol then
         for _, evt in ipairs(gc.events) do
-          if evt ~= excludeEvt and isNote(evt) and evt.pitch == pitch
+          if evt ~= excludeEvt and util.isNote(evt) and evt.pitch == pitch
             and evt.ppq <= ppq and evt.endppq > ppq then
             if evt.ppq == ppq then
               tm:deleteEvent('note', evt)
@@ -677,16 +736,25 @@ function newViewManager(tm, cm)
     end
   end
 
+  -- Add a new note event into `col`. Truncates any same-pitch note in other
+  -- columns of the same channel covering update.ppq — the "add must clear
+  -- cross-col overlaps" invariant lives here so callers don't have to.
+  local function addNoteEvent(col, update)
+    truncatePitchInChannel(update.chan, update.pitch, update.ppq, col)
+    update.frame = currentFrame(update.chan)
+    tm:addEvent('note', update)
+  end
+
   local function placeNewNote(col, update)
-    local last = util:seek(col.events, 'before', update.ppq, isNote)
-    local next = util:seek(col.events, 'after',  update.ppq, isNote)
+    local last = util:seek(col.events, 'before', update.ppq, util.isNote)
+    local next = util:seek(col.events, 'after',  update.ppq, util.isNote)
     if last and last.endppq >= update.ppq then
       tm:assignEvent('note', last, { endppq = update.ppq })
     end
-    update.vel    = last and last.vel or cfg('defaultVelocity', 100)
+    update.vel    = last and last.vel or cm:get('defaultVelocity')
     update.endppq = next and next.ppq or length
-    update.lane   = laneOf(col)
-    addNoteEvent(update)
+    update.lane   = col.lane
+    addNoteEvent(col, update)
   end
 
   ----------  PA HELPERS
@@ -709,14 +777,14 @@ function newViewManager(tm, cm)
   -- is relaxed by overlapOffset on each side; otherwise it is strict.
   -- Returns (minRealStart, maxRealEnd).
   local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
-    local off  = allowOverlap and cfg('overlapOffset', 1/16) * resolution or 0
+    local off  = allowOverlap and cm:get('overlapOffset') * resolution or 0
     local pred = excludeEvt
-      and function(e) return isNote(e) and e ~= excludeEvt end
-      or isNote
+      and function(e) return util.isNote(e) and e ~= excludeEvt end
+      or util.isNote
     local prev = util:seek(col.events, 'before', ppq, pred)
     local next = util:seek(col.events, 'after',  ppq, pred)
-    local minStart = prev and (prev.endppq + tm:delayToPPQ(prev.delay) - off) or 0
-    local maxEnd   = next and (next.ppq    + tm:delayToPPQ(next.delay) + off) or length
+    local minStart = prev and (prev.endppq + timing.delayToPPQ(prev.delay, resolution) - off) or 0
+    local maxEnd   = next and (next.ppq    + timing.delayToPPQ(next.delay, resolution) + off) or length
     return minStart, maxEnd
   end
 
@@ -726,7 +794,7 @@ function newViewManager(tm, cm)
   -- skim within overlapOffset.
   local function delayRange(col, n)
     local minStart, maxEnd = overlapBounds(col, n.ppq, n, true)
-    return tm:ppqToDelay(minStart - n.ppq), tm:ppqToDelay(maxEnd - n.endppq)
+    return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
   end
 
   --- EDIT EVENT
@@ -734,7 +802,7 @@ function newViewManager(tm, cm)
   local function editEvent(col, evt, stop, char, half)
     if not col then return end
     local type = col.type
-    local cursorPPQ = rowToPPQ(cursorRow, col.midiChan)
+    local cursorPPQ = ctx:rowToPPQ(cursorRow, col.midiChan)
 
     local function commit(auditionPitch, auditionVel)
       tm:flush()
@@ -758,22 +826,25 @@ function newViewManager(tm, cm)
 
       -- Stop 1: note name
       if stop == 1 then
-        local nk = noteChars[char]; if not nk then return end
+        local nk = cmgr:noteChars(char); if not nk then return end
         local pitch = util:clamp((currentOctave + 1 + nk[2]) * 12 + nk[1], 0, 127)
         local detune = 0
-        local tuning = activeTuning()
+        local tuning = ctx:activeTuning()
         if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
-        truncatePitchInChannel(col.midiChan, pitch, cursorPPQ, col, evt)
 
-        -- Existing note → repitch, snapping intent time to the cursor row
-        if isNote(evt) then
+        -- Existing note → repitch, snapping intent time to the cursor row.
+        -- retuneNote mutates evt in place, so we must truncate cross-col
+        -- same-pitch overlaps ourselves (excluding evt). The new-note and
+        -- PA-fallthrough paths go through addNoteEvent, which truncates.
+        if util.isNote(evt) then
+          truncatePitchInChannel(col.midiChan, pitch, cursorPPQ, col, evt)
           tm:retuneNote(evt, snap({ pitch = pitch, detune = detune }))
           return commit(pitch, evt.vel)
         end
 
         -- PA cell → wipe host's PA tail, then fall through
         if evt and evt.type == 'pa' then
-          local host = util:seek(col.events, 'before', evt.ppq, isNote)
+          local host = util:seek(col.events, 'before', evt.ppq, util.isNote)
           if host and host.endppq > evt.ppq then
             for _, pa in ipairs(notePAEvents(col, host.pitch, evt.ppq, host.endppq)) do
               tm:deleteEvent('pa', pa)
@@ -789,7 +860,7 @@ function newViewManager(tm, cm)
 
       -- Stop 2: octave (only on real notes)
       elseif stop == 2 then
-        if not isNote(evt) then return end
+        if not util.isNote(evt) then return end
         local oct
         if char == string.byte('-') then oct = -1
         else
@@ -804,7 +875,7 @@ function newViewManager(tm, cm)
 
       -- Stops 5,6,7: delay (signed, decimal, milli-QN; 3 digits, ±999)
       elseif stop == 5 or stop == 6 or stop == 7 then
-        if not isNote(evt) then return end
+        if not util.isNote(evt) then return end
         local old = evt.delay
 
         local newDelay
@@ -815,7 +886,7 @@ function newViewManager(tm, cm)
           local d = char - string.byte('0')
           if d < 0 or d > 9 then return end
           local sign = old < 0 and -1 or 1
-          local mag  = util:clamp(setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
+          local mag  = util:clamp(util:setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
           newDelay = sign * mag
         end
 
@@ -828,7 +899,7 @@ function newViewManager(tm, cm)
       else
         local d = hexDigit[char]; if not d then return end
         local function newVel(old)
-          return util:clamp(setDigit(old, d, 4 - stop, 16, half), 1, 127)
+          return util:clamp(util:setDigit(old, d, 4 - stop, 16, half), 1, 127)
         end
 
         if evt and evt.type == 'pa' then
@@ -841,8 +912,8 @@ function newViewManager(tm, cm)
           return commit()
         end
 
-        if cfg('polyAftertouch', true) then
-          local note = util:seek(col.events, 'before', cursorPPQ, isNote)
+        if cm:get('polyAftertouch') then
+          local note = util:seek(col.events, 'before', cursorPPQ, util.isNote)
           if note and note.endppq > cursorPPQ then
             local val = newVel(0)
             tm:addEvent('pa', {
@@ -860,7 +931,7 @@ function newViewManager(tm, cm)
     local update
     if util:oneOf('cc at pc', type) then
       local d = hexDigit[char]; if not d then return end
-      update = { val = util:clamp(setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
+      update = { val = util:clamp(util:setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
     elseif type == 'pb' then
       local old = evt and evt.val or 0
       if char == string.byte('-') then
@@ -870,7 +941,7 @@ function newViewManager(tm, cm)
         local d = char - string.byte('0')
         if d < 0 or d > 9 then return end
         local sign = old < 0 and -1 or 1
-        update = { val = sign * setDigit(math.abs(old), d, 4 - stop, 10, half) }
+        update = { val = sign * util:setDigit(math.abs(old), d, 4 - stop, 10, half) }
       end
     else
       return
@@ -892,9 +963,9 @@ function newViewManager(tm, cm)
     local P = note.ppq
     tm:deleteEvent('note', note)
 
-    local last = util:seek(col.events, 'before', P, isNote)
+    local last = util:seek(col.events, 'before', P, util.isNote)
     if last and last.endppq >= note.ppq then
-      local after = util:seek(col.events, 'after', P, isNote)
+      local after = util:seek(col.events, 'after', P, util.isNote)
       tm:assignEvent('note', last, { endppq = after and after.ppq or length })
     end
     tm:flush()
@@ -923,15 +994,12 @@ function newViewManager(tm, cm)
     if evt.type == 'pa' then
       if selGrp == 2 then tm:deleteEvent('pa', evt); tm:flush() end
     elseif selGrp == 2 then
-      local prev = util:seek(col.events, 'before', evt.ppq, isNote)
-      tm:assignEvent('note', evt, { vel = (prev and prev.vel) or cfg('defaultVelocity', 100) })
+      local prev = util:seek(col.events, 'before', evt.ppq, util.isNote)
+      tm:assignEvent('note', evt, { vel = (prev and prev.vel) or cm:get('defaultVelocity') })
       tm:flush()
     elseif selGrp == 3 then
-      local chan = col.midiChan
-      local base = rowToPPQ(snapRow(evt.ppq, chan), chan)
-      local minStart = overlapBounds(col, evt.ppq, evt, false)
-      if base ~= evt.ppq and base >= minStart and base < evt.endppq then
-        tm:assignEvent('note', evt, { ppq = base })
+      if evt.delay ~= 0 then
+        tm:assignEvent('note', evt, { delay = 0 })
         tm:flush()
       end
     else
@@ -953,7 +1021,7 @@ function newViewManager(tm, cm)
   -- frame. Rows are the user's mental model; per-column swing means two
   -- columns over the same row range cover different intent-PPQ spans.
   local function selBoundsFor(col, r1, r2)
-    return rowToPPQ(r1, col.midiChan), rowToPPQ(r2 + 1, col.midiChan)
+    return ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
   end
 
   local function selectedEvents()
@@ -971,7 +1039,7 @@ function newViewManager(tm, cm)
 
       local startPPQ, endPPQ = selBoundsFor(col, r1, r2)
       local locs = {}
-      for evt in between(col.events, startPPQ, endPPQ) do
+      for evt in util.between(col.events, startPPQ, endPPQ) do
         locs[evt.loc] = evt
       end
 
@@ -1002,7 +1070,7 @@ function newViewManager(tm, cm)
         if col and ghostable[col.type] then
           local startPPQ, endPPQ = selBoundsFor(col, r1, r2)
           local prev
-          for evt in between(col.events, startPPQ, endPPQ) do
+          for evt in util.between(col.events, startPPQ, endPPQ) do
             if prev then cycleShape(col, prev) end
             prev = evt
           end
@@ -1017,7 +1085,7 @@ function newViewManager(tm, cm)
     local ghost = col.ghosts and col.ghosts[cursorRow]
     local A = ghost and ghost.fromEvt
               or (col.cells and col.cells[cursorRow])
-              or util:seek(col.events, 'before', rowToPPQ(cursorRow + 1, col.midiChan))
+              or util:seek(col.events, 'before', ctx:rowToPPQ(cursorRow + 1, col.midiChan))
     if A then cycleShape(col, A); tm:flush() end
   end
 
@@ -1026,30 +1094,30 @@ function newViewManager(tm, cm)
   local function cursorNoteBefore()
     local col = grid.cols[cursorCol]
     if not (col and col.type == 'note') then return end
-    local cursorPPQ = rowToPPQ(cursorRow, col.midiChan)
-    return col, util:seek(col.events, 'at-or-before', cursorPPQ, isNote)
+    local cursorPPQ = ctx:rowToPPQ(cursorRow, col.midiChan)
+    return col, util:seek(col.events, 'at-or-before', cursorPPQ, util.isNote)
   end
 
   local function cursorNoteAfter()
     local col = grid.cols[cursorCol]
     if not (col and col.type == 'note') then return end
-    local cursorPPQ = rowToPPQ(cursorRow, col.midiChan)
-    return col, util:seek(col.events, 'at-or-after', cursorPPQ, isNote)
+    local cursorPPQ = ctx:rowToPPQ(cursorRow, col.midiChan)
+    return col, util:seek(col.events, 'at-or-after', cursorPPQ, util.isNote)
   end
 
   -- First event in col that starts anywhere in the cursor row. For note
   -- columns, PAs are skipped.
   local function cursorRowEvent(col)
     if not col then return end
-    local lo, hi = rowToPPQ(cursorRow, col.midiChan), rowToPPQ(cursorRow + 1, col.midiChan)
-    local pred = col.type == 'note' and isNote or nil
+    local lo, hi = ctx:rowToPPQ(cursorRow, col.midiChan), ctx:rowToPPQ(cursorRow + 1, col.midiChan)
+    local pred = col.type == 'note' and util.isNote or nil
     local evt = util:seek(col.events, 'at-or-after', lo, pred)
     if evt and evt.ppq < hi then return evt end
   end
 
   local function applyNoteOff(col, last, targetPPQ, undo)
     if undo then
-      local next = util:seek(col.events, 'at-or-after', targetPPQ, isNote)
+      local next = util:seek(col.events, 'at-or-after', targetPPQ, util.isNote)
       tm:assignEvent('note', last, { endppq = next and next.ppq or length })
     elseif last.ppq >= targetPPQ then
       tm:deleteEvent('note', last)
@@ -1066,9 +1134,9 @@ function newViewManager(tm, cm)
         local col = grid.cols[ci]
         if col and col.type == 'note' then
           local chan = col.midiChan
-          local targetPPQ = rowToPPQ(sel.row1, chan)
-          local nextPPQ   = rowToPPQ(sel.row1 + 1, chan)
-          local last = util:seek(col.events, 'before', nextPPQ, isNote)
+          local targetPPQ = ctx:rowToPPQ(sel.row1, chan)
+          local nextPPQ   = ctx:rowToPPQ(sel.row1 + 1, chan)
+          local last = util:seek(col.events, 'before', nextPPQ, util.isNote)
           if last then util:add(hits, { col = col, note = last, targetPPQ = targetPPQ }) end
         end
       end
@@ -1086,10 +1154,10 @@ function newViewManager(tm, cm)
 
     local col = grid.cols[cursorCol]
     if not (col and col.type == 'note' and cursorSelGrp() == 1) then return 'fallthrough' end
-    local cursorPPQ     = rowToPPQ(cursorRow, col.midiChan)
-    local nextCursorPPQ = rowToPPQ(cursorRow + 1, col.midiChan)
+    local cursorPPQ     = ctx:rowToPPQ(cursorRow, col.midiChan)
+    local nextCursorPPQ = ctx:rowToPPQ(cursorRow + 1, col.midiChan)
 
-    local last = util:seek(col.events, 'before', nextCursorPPQ, isNote)
+    local last = util:seek(col.events, 'before', nextCursorPPQ, util.isNote)
     if not last then return end
     applyNoteOff(col, last, cursorPPQ, last.endppq == cursorPPQ)
     tm:flush()
@@ -1097,11 +1165,11 @@ function newViewManager(tm, cm)
 
   local function adjustDurationCore(col, note, rowDelta)
     local chan = col.midiChan
-    local newRow = util:clamp(ppqToRow(note.endppq, chan) + rowDelta, 0, grid.numRows)
+    local newRow = util:clamp(ctx:ppqToRow(note.endppq, chan) + rowDelta, 0, grid.numRows)
           newRow = math.floor(newRow / rowDelta) * rowDelta
-    local minPPQ = math.min(note.endppq, rowToPPQ(snapRow(note.ppq, chan) + 1, chan))
+    local minPPQ = math.min(note.endppq, ctx:rowToPPQ(ctx:snapRow(note.ppq, chan) + 1, chan))
     local _, maxPPQ = overlapBounds(col, note.ppq, note, true)
-    local newPPQ = util:clamp(rowToPPQ(newRow, chan), minPPQ, maxPPQ)
+    local newPPQ = util:clamp(ctx:rowToPPQ(newRow, chan), minPPQ, maxPPQ)
     tm:assignEvent('note', note, { endppq = newPPQ })
   end
 
@@ -1133,11 +1201,11 @@ function newViewManager(tm, cm)
           table.sort(ns, function(a, b) return a.ppq < b.ppq end)
           if rowDelta > 0 then
             local _, maxEnd = overlapBounds(g.col, ns[#ns].ppq, ns[#ns], false)
-            local room = math.floor(ppqToRow(maxEnd, chan) - snapRow(ns[#ns].endppq, chan))
+            local room = math.floor(ctx:ppqToRow(maxEnd, chan) - ctx:snapRow(ns[#ns].endppq, chan))
             if room < rowDelta then return end
           else
             local minStart = overlapBounds(g.col, ns[1].ppq, ns[1], false)
-            local room = math.ceil(ppqToRow(minStart, chan) - snapRow(ns[1].ppq, chan))
+            local room = math.ceil(ctx:ppqToRow(minStart, chan) - ctx:snapRow(ns[1].ppq, chan))
             if room > rowDelta then return end
           end
           util:add(runs, { col = g.col, notes = ns })
@@ -1156,8 +1224,8 @@ function newViewManager(tm, cm)
       for i = s, e, step do
         local n = notes[i]
         tm:assignEvent('note', n, {
-          ppq    = rowToPPQ(ppqToRow(n.ppq, chan)    + rowDelta, chan),
-          endppq = rowToPPQ(ppqToRow(n.endppq, chan) + rowDelta, chan),
+          ppq    = ctx:rowToPPQ(ctx:ppqToRow(n.ppq, chan)    + rowDelta, chan),
+          endppq = ctx:rowToPPQ(ctx:ppqToRow(n.endppq, chan) + rowDelta, chan),
         })
       end
     end
@@ -1179,14 +1247,14 @@ function newViewManager(tm, cm)
     local chan = col.midiChan
 
     local absDelta = math.abs(rowDelta)
-    local rawRow   = ppqToRow(note.ppq, chan) + rowDelta
+    local rawRow   = ctx:ppqToRow(note.ppq, chan) + rowDelta
     local reqRow   = (rowDelta > 0 and math.ceil(rawRow / absDelta) or math.floor(rawRow / absDelta)) * absDelta
 
-    local curLen    = snapRow(note.endppq, chan) - snapRow(note.ppq, chan)
+    local curLen    = ctx:snapRow(note.endppq, chan) - ctx:snapRow(note.ppq, chan)
     local minLen    = math.min(absDelta, curLen)
     local minPPQ, maxEndPPQ = overlapBounds(col, note.ppq, note, false)
-    local minRow    = ppqToRow(minPPQ, chan)
-    local maxEndRow = ppqToRow(maxEndPPQ, chan)
+    local minRow    = ctx:ppqToRow(minPPQ, chan)
+    local maxEndRow = ctx:ppqToRow(maxEndPPQ, chan)
 
     local newEndRow, newRow
     if rowDelta > 0 then
@@ -1196,8 +1264,8 @@ function newViewManager(tm, cm)
       newRow    = math.max(reqRow, minRow)
       newEndRow = math.max(reqRow + curLen, newRow + minLen)
     end
-    local newPPQ = rowToPPQ(newRow, chan)
-    local newEndPPQ = rowToPPQ(newEndRow, chan)
+    local newPPQ = ctx:rowToPPQ(newRow, chan)
+    local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
 
     if newPPQ == note.ppq and newEndPPQ == note.endppq then return end
 
@@ -1235,23 +1303,13 @@ function newViewManager(tm, cm)
     }
   end
 
-  -- First lane-1 (note) grid column for chan, or nil.
-  local function noteLane1Col(chan)
-    local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
-    if not first then return end
-    for ci = first, last do
-      local c = grid.cols[ci]
-      if c.type == 'note' then return c end
-    end
-  end
-
   -- Frame owner for reswing. Notes own themselves. CC/PB/AT/PC inherit
   -- from the most recent lane-1 note at-or-before their ppq on the same
   -- channel; PAs from the note they attach to (pitch match within span).
   -- Orphans (no lane-1 note / no host) return nil and are skipped.
   local function frameOwner(col, e)
-    if isNote(e) then return e end
-    local n1 = noteLane1Col(col.midiChan)
+    if util.isNote(e) then return e end
+    local n1 = grid.lane1Col[col.midiChan]
     if not n1 then return end
     if e.type == 'pa' then
       for _, n in ipairs(n1.events) do
@@ -1261,7 +1319,7 @@ function newViewManager(tm, cm)
       end
       return
     end
-    return util:seek(n1.events, 'at-or-before', e.ppq, isNote)
+    return util:seek(n1.events, 'at-or-before', e.ppq, util.isNote)
   end
 
   -- Reswing core. For each event in `groups` whose frame owner passes
@@ -1285,7 +1343,7 @@ function newViewManager(tm, cm)
           local uPPQ   = auth and auth.unapply(chan, e.ppq) or e.ppq
           local newPPQ = math.floor(tgt.apply(chan, uPPQ) + 0.5)
           local entry  = { col = col, e = e, newPPQ = newPPQ }
-          if isNote(e) then
+          if util.isNote(e) then
             local uEnd      = auth and auth.unapply(chan, e.endppq) or e.endppq
             entry.newEndPPQ = math.floor(tgt.apply(chan, uEnd) + 0.5)
             if opts.restamp then entry.newFrame = opts.restamp(chan) end
@@ -1297,7 +1355,7 @@ function newViewManager(tm, cm)
     for _, p in ipairs(plans) do
       local e, u = p.e, {}
       if p.newPPQ ~= e.ppq then u.ppq = p.newPPQ end
-      if isNote(e) then
+      if util.isNote(e) then
         if p.newEndPPQ ~= e.endppq then u.endppq = p.newEndPPQ end
         if p.newFrame then u.frame = p.newFrame end
         if next(u) then tm:assignEvent('note', e, u) end
@@ -1366,13 +1424,13 @@ function newViewManager(tm, cm)
     for _, g in ipairs(groups) do
       local col, chan = g.col, g.col.midiChan
       for _, e in pairs(g.locs) do
-        local sRow   = ppqToRow(e.ppq, chan)
+        local sRow   = ctx:ppqToRow(e.ppq, chan)
         local newRow = math.floor(sRow + 0.5)
-        local newPPQ = rowToPPQ(newRow, chan)
-        if isNote(e) then
-          local eRow      = ppqToRow(e.endppq, chan)
+        local newPPQ = ctx:rowToPPQ(newRow, chan)
+        if util.isNote(e) then
+          local eRow      = ctx:ppqToRow(e.endppq, chan)
           local newEndRow = newRow + math.floor((eRow - sRow) + 0.5)
-          local newEndPPQ = rowToPPQ(newEndRow, chan)
+          local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
           if newPPQ ~= e.ppq or newEndPPQ ~= e.endppq then
             tm:assignEvent('note', e, { ppq = newPPQ, endppq = newEndPPQ })
           end
@@ -1396,13 +1454,13 @@ function newViewManager(tm, cm)
     for _, g in ipairs(groups) do
       local col, chan = g.col, g.col.midiChan
       for _, e in pairs(g.locs) do
-        if isNote(e) then
-          local targetPPQ = rowToPPQ(snapRow(e.ppq, chan), chan)
+        if util.isNote(e) then
+          local targetPPQ = ctx:rowToPPQ(ctx:snapRow(e.ppq, chan), chan)
           if targetPPQ ~= e.ppq then
-            local wantDelay  = e.delay + tm:ppqToDelay(e.ppq - targetPPQ)
+            local wantDelay  = e.delay + timing.ppqToDelay(e.ppq - targetPPQ, resolution)
             local dMin, dMax = delayRange(col, e)
             local newDelay   = util:clamp(wantDelay, dMin, dMax)
-            local newPPQ     = math.floor(e.ppq + tm:delayToPPQ(e.delay - newDelay) + 0.5)
+            local newPPQ     = math.floor(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution) + 0.5)
             if newPPQ ~= e.ppq or newDelay ~= e.delay then
               if newDelay ~= wantDelay then clamped = clamped + 1 end
               local newEnd = newPPQ + (e.endppq - e.ppq)
@@ -1410,7 +1468,7 @@ function newViewManager(tm, cm)
             end
           end
         else
-          local newPPQ = rowToPPQ(snapRow(e.ppq, chan), chan)
+          local newPPQ = ctx:rowToPPQ(ctx:snapRow(e.ppq, chan), chan)
           if newPPQ ~= e.ppq then tm:assignEvent(col.type, e, { ppq = newPPQ }) end
         end
       end
@@ -1434,17 +1492,17 @@ function newViewManager(tm, cm)
 
   local function insertRowCore(col, topRow, numRows)
     local chan = col.midiChan
-    local C = rowToPPQ(topRow, chan)
-    local R = rowToPPQ(topRow + numRows, chan) - C
+    local C = ctx:rowToPPQ(topRow, chan)
+    local R = ctx:rowToPPQ(topRow + numRows, chan) - C
 
     local shifted = {}
-    for e in between(col.events, C, length) do util:add(shifted, e) end
+    for e in util.between(col.events, C, length) do util:add(shifted, e) end
     for i = #shifted, 1, -1 do
       local e = shifted[i]
       local newPpq = e.ppq + R
       if newPpq >= length then
         tm:deleteEvent(col.type, e)
-      elseif isNote(e) then
+      elseif util.isNote(e) then
         tm:assignEvent('note', e, { ppq = newPpq, endppq = math.min(e.endppq + R, length) })
       else
         tm:assignEvent(col.type, e, { ppq = newPpq })
@@ -1452,7 +1510,7 @@ function newViewManager(tm, cm)
     end
 
     if col.type == 'note' then
-      local spanning = util:seek(col.events, 'before', C, isNote)
+      local spanning = util:seek(col.events, 'before', C, util.isNote)
       if spanning and spanning.endppq > C then
         tm:assignEvent('note', spanning, { endppq = math.min(spanning.endppq + R, length) })
       end
@@ -1461,12 +1519,12 @@ function newViewManager(tm, cm)
 
   local function deleteRowCore(col, topRow, numRows)
     local chan = col.midiChan
-    local C = rowToPPQ(topRow, chan)
-    local D = rowToPPQ(topRow + numRows, chan)
+    local C = ctx:rowToPPQ(topRow, chan)
+    local D = ctx:rowToPPQ(topRow + numRows, chan)
     local R = D - C
 
     if col.type == 'note' then
-      local spanning = util:seek(col.events, 'before', C, isNote)
+      local spanning = util:seek(col.events, 'before', C, util.isNote)
       if spanning and spanning.endppq > C then
         local newEnd = spanning.endppq > D and spanning.endppq - R or C
         tm:assignEvent('note', spanning, { endppq = newEnd })
@@ -1474,11 +1532,11 @@ function newViewManager(tm, cm)
     end
 
     local touched = {}
-    for e in between(col.events, C, length) do util:add(touched, e) end
+    for e in util.between(col.events, C, length) do util:add(touched, e) end
     for _, e in ipairs(touched) do
       if e.ppq < D then
         tm:deleteEvent(col.type, e)
-      elseif isNote(e) then
+      elseif util.isNote(e) then
         tm:assignEvent('note', e, { ppq = e.ppq - R, endppq = e.endppq - R })
       else
         tm:assignEvent(col.type, e, { ppq = e.ppq - R })
@@ -1509,18 +1567,9 @@ function newViewManager(tm, cm)
   -- both cursor (numeric selgrp) and selection (string noteMode).
   local noteKind = { [2] = 'vel', [3] = 'delay', vel = 'vel', delay = 'delay' }
 
-  -- Snap v to the next multiple of interval in the dir direction; values
-  -- already on a boundary move a full interval. Used for value-typed
-  -- coarse nudges. Pitch coarse is additive (octave transposition), not
-  -- a snap.
-  local function snapTo(v, dir, interval)
-    if dir > 0 then return (math.floor(v / interval) + 1) * interval end
-    return (math.ceil(v / interval) - 1) * interval
-  end
-
   local function pitchStep(coarse)
     if not coarse then return 1 end
-    local t = activeTuning()
+    local t = ctx:activeTuning()
     return t and t.octaveStep or 12
   end
 
@@ -1532,20 +1581,13 @@ function newViewManager(tm, cm)
   end
 
   local function valueBounds(col)
-    if col.type == 'pb' then local lim = cfg('pbRange', 2) * 100; return -lim, lim end
+    if col.type == 'pb' then local lim = cm:get('pbRange') * 100; return -lim, lim end
     return 0, 127
-  end
-
-  -- Compute a snapped or fine-nudged target within [lo, hi]; returns the
-  -- new value (possibly unchanged).
-  local function nudgedScalar(v, lo, hi, dir, interval)
-    local target = interval and snapTo(v, dir, interval) or (v + dir)
-    return util:clamp(target, lo, hi)
   end
 
   local function nudgePitch(col, note, dir, coarse, audible)
     local delta  = dir * pitchStep(coarse)
-    local tuning = activeTuning()
+    local tuning = ctx:activeTuning()
     local pitch, detune
     if tuning then
       pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune, delta)
@@ -1558,20 +1600,20 @@ function newViewManager(tm, cm)
   end
 
   local function nudgeVel(note, dir, coarse)
-    local newVel = nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
+    local newVel = util:nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
     if newVel ~= note.vel then tm:assignEvent('note', note, { vel = newVel }) end
   end
 
   local function nudgeDelay(col, note, dir, coarse)
     local minD, maxD = delayRange(col, note)
     local old = note.delay
-    local new = nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
+    local new = util:nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
     if new ~= old then tm:assignEvent('note', note, { delay = new }) end
   end
 
   local function nudgeValue(col, evt, dir, coarse)
     local lo, hi   = valueBounds(col)
-    local newVal   = nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
+    local newVal   = util:nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
     if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
   end
 
@@ -1595,7 +1637,7 @@ function newViewManager(tm, cm)
       for _, g in ipairs(groups) do
         if g.col.type == 'note' then
           for _, e in pairs(g.locs) do
-            if isNote(e) then anyNote = true; break end
+            if util.isNote(e) then anyNote = true; break end
           end
           if anyNote then break end
         end
@@ -1606,7 +1648,7 @@ function newViewManager(tm, cm)
                      or (not anyNote and 'val' or nil)
         if kind then
           for _, e in pairs(g.locs) do
-            if kind == 'val' or isNote(e) then
+            if kind == 'val' or util.isNote(e) then
               applyNudge(g.col, e, kind, dir, coarse, false)
             end
           end
@@ -1662,7 +1704,7 @@ function newViewManager(tm, cm)
 
   -- Queue velocity resets; delete selected PA events, use non-selected PA/note vels for carry-forward.
   local function queueResetVelocities(col, locs)
-    local prevVel = cfg('defaultVelocity', 100)
+    local prevVel = cm:get('defaultVelocity')
     for _, evt in ipairs(col.events) do
       local toMatch = locs[evt.loc]
       if toMatch and toMatch.type == evt.type then
@@ -1721,16 +1763,16 @@ function newViewManager(tm, cm)
     -- destination columns have different effective swings.
     local function noteEvent(col, evt, endPPQ)
       local chan = col.midiChan
-      local ce = { row = ppqToRow(evt.ppq, chan) - r1,
+      local ce = { row = ctx:ppqToRow(evt.ppq, chan) - r1,
                    pitch = evt.pitch, vel = evt.vel, loc = evt.loc }
-      if isNote(evt) and evt.endppq <= endPPQ then
-        ce.endRow = ppqToRow(evt.endppq, chan) - r1
+      if util.isNote(evt) and evt.endppq <= endPPQ then
+        ce.endRow = ctx:ppqToRow(evt.endppq, chan) - r1
       end
       return ce
     end
 
     local function scalarEvent(col, evt, val)
-      return { row = ppqToRow(evt.ppq, col.midiChan) - r1, val = val, loc = evt.loc }
+      return { row = ctx:ppqToRow(evt.ppq, col.midiChan) - r1, val = val, loc = evt.loc }
     end
 
     -- Single-column mode
@@ -1750,7 +1792,7 @@ function newViewManager(tm, cm)
       else
         clipType, emit = '7bit', function(e) return scalarEvent(col, e, e.val) end
       end
-      for evt in between(col.events, startPPQ, endPPQ) do
+      for evt in util.between(col.events, startPPQ, endPPQ) do
         util:add(events, emit(evt))
       end
 
@@ -1785,7 +1827,7 @@ function newViewManager(tm, cm)
       end
 
       local startPPQ, endPPQ = selBoundsFor(col, r1, r2)
-      for evt in between(col.events, startPPQ, endPPQ) do
+      for evt in util.between(col.events, startPPQ, endPPQ) do
         if col.type == 'note' then
           util:add(entry.events, noteEvent(col, evt, endPPQ))
         else
@@ -1814,16 +1856,16 @@ function newViewManager(tm, cm)
 
   local function pasteVelocities(events, dstCol, startPPQ, endPPQ)
     local last = util:seek(dstCol.events, 'before', startPPQ)
-    local currentVel = last and last.vel or cfg('defaultVelocity', 100)
+    local currentVel = last and last.vel or cm:get('defaultVelocity')
 
     -- Delete existing PA events in the paste region
-    for evt in between(dstCol.events, startPPQ, endPPQ) do
+    for evt in util.between(dstCol.events, startPPQ, endPPQ) do
       if evt.type == 'pa' then tm:deleteEvent('pa', evt) end
     end
 
     -- Pass 1: carry-forward velocities onto note-ons
     local ci = 1
-    for evt in between(dstCol.events, startPPQ, endPPQ) do
+    for evt in util.between(dstCol.events, startPPQ, endPPQ) do
       if evt.pitch then
         while ci <= #events and events[ci].ppq <= evt.ppq do
           if events[ci].val > 0 then
@@ -1836,9 +1878,9 @@ function newViewManager(tm, cm)
     end
 
     -- Pass 2: create PA events for clipboard values landing on sustain rows
-    if cfg('polyAftertouch', true) then
+    if cm:get('polyAftertouch') then
       for _, ce in ipairs(events) do
-        local note = util:seek(dstCol.events, 'before', ce.ppq, isNote)
+        local note = util:seek(dstCol.events, 'before', ce.ppq, util.isNote)
         if note and note.endppq > ce.ppq
           and note.ppq ~= ce.ppq then
           tm:addEvent('pa', {
@@ -1856,18 +1898,18 @@ function newViewManager(tm, cm)
     local dstCol = grid.cols[cursorCol]
     if not dstCol then return end
     local chan = dstCol.midiChan
-    local startPPQ = rowToPPQ(cursorRow, chan)
-    local endPPQ = rowToPPQ(cursorRow + clip.numRows, chan)
+    local startPPQ = ctx:rowToPPQ(cursorRow, chan)
+    local endPPQ = ctx:rowToPPQ(cursorRow + clip.numRows, chan)
     local selGrp = cursorSelGrp()
 
     -- Resolve clipboard events to target PPQs, truncating past end
     local events = {}
     for _, ce in ipairs(clip.events) do
-      local ppq = rowToPPQ(cursorRow + ce.row, chan)
+      local ppq = ctx:rowToPPQ(cursorRow + ce.row, chan)
       if ppq >= endPPQ then goto nextCe end
       local e = util:assign({ ppq = ppq }, ce)
       if ce.endRow then
-        e.endppq = math.min(rowToPPQ(cursorRow + ce.endRow, chan), endPPQ)
+        e.endppq = math.min(ctx:rowToPPQ(cursorRow + ce.endRow, chan), endPPQ)
       end
       util:add(events, e)
       ::nextCe::
@@ -1877,18 +1919,18 @@ function newViewManager(tm, cm)
     -- (1) note -> note (pitch selgrp): delete existing, paste with target vels
     if clip.type == 'note' and dstCol.type == 'note' and selGrp == 1 then
       local velList = {}
-      for evt in between(dstCol.events, startPPQ, endPPQ) do
+      for evt in util.between(dstCol.events, startPPQ, endPPQ) do
         if evt.pitch and evt.vel > 0 then
           util:add(velList, { ppq = evt.ppq, val = evt.vel })
         end
       end
       local last = util:seek(dstCol.events, 'before', startPPQ)
-      local currentVel = last and last.vel or cfg('defaultVelocity', 100)
+      local currentVel = last and last.vel or cm:get('defaultVelocity')
 
-      local lastNote = util:seek(dstCol.events, 'before', startPPQ, isNote)
-      local nextNote = util:seek(dstCol.events, 'at-or-after', endPPQ, isNote)
+      local lastNote = util:seek(dstCol.events, 'before', startPPQ, util.isNote)
+      local nextNote = util:seek(dstCol.events, 'at-or-after', endPPQ, util.isNote)
       local nextNotePPQ = nextNote and nextNote.ppq or length
-      local lane = laneOf(dstCol)
+      local lane = dstCol.lane
 
       -- Delete in-region events directly: queueDeleteNotes' survivor-extension
       -- fixup is for leaving a hole, but we're filling it. An extended lastNote
@@ -1896,7 +1938,7 @@ function newViewManager(tm, cm)
       if lastNote and events[1] and lastNote.endppq > events[1].ppq then
         tm:assignEvent('note', lastNote, { endppq = events[1].ppq })
       end
-      for evt in between(dstCol.events, startPPQ, endPPQ) do
+      for evt in util.between(dstCol.events, startPPQ, endPPQ) do
         tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
       end
 
@@ -1906,8 +1948,7 @@ function newViewManager(tm, cm)
           currentVel = util:clamp(velList[vi].val, 1, 127)
           vi = vi + 1
         end
-        truncatePitchInChannel(dstCol.midiChan, ce.pitch, ce.ppq, dstCol)
-        addNoteEvent({
+        addNoteEvent(dstCol, {
           ppq = ce.ppq,
           endppq = ce.endppq or nextNotePPQ,
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
@@ -1927,7 +1968,7 @@ function newViewManager(tm, cm)
     -- (2) pb -> pb, (3) 7bit -> 7bit: wipe and replace
     if (clip.type == 'pb' and dstCol.type == 'pb')
     or (clip.type == '7bit' and dstCol.type ~= 'note' and dstCol.type ~= 'pb') then
-      for evt in between(dstCol.events, startPPQ, endPPQ) do
+      for evt in util.between(dstCol.events, startPPQ, endPPQ) do
         tm:deleteEvent(dstCol.type, evt)
       end
 
@@ -1973,7 +2014,7 @@ function newViewManager(tm, cm)
       return info
     end
 
-    local cursorNotePos = laneOf(cursor) or 0
+    local cursorNotePos = cursor.lane or 0
 
     -- Resolve a clip col to a dst target, or nil if out of 1..16.
     --   note: { type='note', chan, lane, col }  (col may be nil => will create)
@@ -1999,17 +2040,17 @@ function newViewManager(tm, cm)
       local r = resolve(clipCol)
       if not r then goto nextCol end
       local dst = r.col
-      local startPPQ = rowToPPQ(cursorRow, r.chan)
-      local endPPQ   = rowToPPQ(cursorRow + clip.numRows, r.chan)
+      local startPPQ = ctx:rowToPPQ(cursorRow, r.chan)
+      local endPPQ   = ctx:rowToPPQ(cursorRow + clip.numRows, r.chan)
 
       -- Materialise clip events to target PPQs, sorted.
       local events = {}
       for _, ce in ipairs(clipCol.events) do
-        local ppq = rowToPPQ(cursorRow + ce.row, r.chan)
+        local ppq = ctx:rowToPPQ(cursorRow + ce.row, r.chan)
         if ppq < endPPQ then
           local e = util:assign({ ppq = ppq }, ce)
           if ce.endRow then
-            e.endppq = math.min(rowToPPQ(cursorRow + ce.endRow, r.chan), endPPQ)
+            e.endppq = math.min(ctx:rowToPPQ(cursorRow + ce.endRow, r.chan), endPPQ)
           end
           util:add(events, e)
         end
@@ -2023,15 +2064,15 @@ function newViewManager(tm, cm)
       -- Attached PAs cascade-delete with their host note.
       if dst then
         if r.type == 'note' then
-          local last = util:seek(dst.events, 'before', startPPQ, isNote)
+          local last = util:seek(dst.events, 'before', startPPQ, util.isNote)
           if last and events[1] and last.endppq > events[1].ppq then
             tm:assignEvent('note', last, { endppq = events[1].ppq })
           end
-          for evt in between(dst.events, startPPQ, endPPQ, isNote) do
+          for evt in util.between(dst.events, startPPQ, endPPQ, util.isNote) do
             tm:deleteEvent('note', evt)
           end
         else
-          for evt in between(dst.events, startPPQ, endPPQ) do
+          for evt in util.between(dst.events, startPPQ, endPPQ) do
             tm:deleteEvent(r.type, evt)
           end
         end
@@ -2040,15 +2081,14 @@ function newViewManager(tm, cm)
       -- End cap for pasted notes that lack an explicit endppq.
       local capPPQ = endPPQ
       if r.type == 'note' and dst then
-        local nn = util:seek(dst.events, 'at-or-after', endPPQ, isNote)
+        local nn = util:seek(dst.events, 'at-or-after', endPPQ, util.isNote)
         if nn then capPPQ = math.min(capPPQ, nn.ppq) end
       end
 
       -- Write clip events.
       for _, e in ipairs(events) do
         if r.type == 'note' then
-          truncatePitchInChannel(r.chan, e.pitch, e.ppq, dst)
-          addNoteEvent({
+          addNoteEvent(dst, {
             ppq = e.ppq, endppq = e.endppq or capPPQ,
             chan = r.chan, pitch = e.pitch, vel = e.vel,
             lane = r.lane,
@@ -2133,49 +2173,6 @@ function newViewManager(tm, cm)
     end
   end
 
-  ---------- TIME SIGNATURE HELPERS
-
-  local function timeSigAt(ppq)
-    local active = timeSigs[1]
-    for i = 2, #timeSigs do
-      if timeSigs[i].ppq <= ppq then active = timeSigs[i]
-      else break end
-    end
-    return active
-  end
-
-  -- Row of a time-sig's start. Time sigs land on bar boundaries in
-  -- practice, which are swing fixpoints, so the roundtrip is stable.
-  local function tsRow(ts) return math.floor(ppqToRow(ts.ppq)) end
-
-  -- Rows are intent; beat/bar lines are pure row arithmetic relative to
-  -- the active time sig. No swing involved — long-period composites
-  -- move realised ppq but leave the row grid untouched.
-  local function rowBeatInfo(row)
-    local ts = timeSigAt(rowToPPQ(row))
-    if not ts then return false, false end
-    local rel = row - tsRow(ts)
-    return rel % (rowPerBeat * ts.num) == 0, rel % rowPerBeat == 0
-  end
-
-  local function barBeatSub(row)
-    local bar = 1
-    for i, ts in ipairs(timeSigs) do
-      local rpbar   = rowPerBeat * ts.num
-      local next_   = timeSigs[i + 1]
-      local nextRow = next_ and tsRow(next_) or math.huge
-      if row < nextRow then
-        local rel = row - tsRow(ts)
-        return bar + rel // rpbar,
-               (rel % rpbar) // rowPerBeat + 1,
-               rel % rowPerBeat + 1,
-               ts
-      end
-      bar = bar + (nextRow - tsRow(ts)) // rpbar
-    end
-    return bar, 1, 1, timeSigs[1]
-  end
-
   --------------------
   -- Public interface
   --------------------
@@ -2195,15 +2192,15 @@ function newViewManager(tm, cm)
     return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
   end
 
-  function vm:ppqToRow(ppq, chan) return ppqToRow(ppq, chan) end
-  function vm:rowToPPQ(row, chan) return rowToPPQ(row, chan) end
+  function vm:ppqToRow(ppq, chan) return ctx:ppqToRow(ppq, chan) end
+  function vm:rowToPPQ(row, chan) return ctx:rowToPPQ(row, chan) end
 
-  function vm:activeTuning()   return activeTuning() end
-  function vm:noteProjection(evt) return noteProjection(evt) end
+  function vm:activeTuning()   return ctx:activeTuning() end
+  function vm:noteProjection(evt) return ctx:noteProjection(evt) end
 
-  function vm:rowBeatInfo(row) return rowBeatInfo(row) end
+  function vm:rowBeatInfo(row) return ctx:rowBeatInfo(row) end
 
-  function vm:barBeatSub(row) return barBeatSub(row) end
+  function vm:barBeatSub(row) return ctx:barBeatSub(row) end
 
   -- First time sig of the take; used by UI layers that need to map
   -- musical units (e.g. "1/4 bar") into QN independent of PPQ context.
@@ -2227,7 +2224,7 @@ function newViewManager(tm, cm)
     n = util:clamp(n, 1, 32)
     if n == rowPerBeat then return end
     cursorRow = math.floor(cursorRow * n / rowPerBeat)
-    setcfg('track', 'rowPerBeat', n)
+    cm:set('track', 'rowPerBeat', n)
   end
 
   function vm:selStart() selStart() end
@@ -2248,8 +2245,8 @@ function newViewManager(tm, cm)
     if first then selectSpan(2, first, 1, 1) end
   end
 
-  function vm:isChannelMuted(chan)            return cfg('mutedChannels',  {})[chan] == true end
-  function vm:isChannelSoloed(chan)           return cfg('soloedChannels', {})[chan] == true end
+  function vm:isChannelMuted(chan)            return cm:get('mutedChannels')[chan]  == true end
+  function vm:isChannelSoloed(chan)           return cm:get('soloedChannels')[chan] == true end
   function vm:isChannelEffectivelyMuted(chan) return effectiveMuted[chan] == true end
   function vm:toggleChannelMute(chan)         toggleChannelFlag('mutedChannels',  chan) end
   function vm:toggleChannelSolo(chan)         toggleChannelFlag('soloedChannels', chan) end
@@ -2307,8 +2304,8 @@ function newViewManager(tm, cm)
     end
   end
 
-  -- Command table — renderManager maps keys to these
-  vm.commands = {
+  -- Command table — rm binds keys to these names via cmgr.
+  cmgr:registerAll{
     cursorDown     = function() scrollRowBy(1) end,
     cursorUp       = function() scrollRowBy(-1) end,
     pageDown       = function() scrollRowBy(rowPerBar) end,
@@ -2342,8 +2339,8 @@ function newViewManager(tm, cm)
     paste          = function() pasteClipboard() end,
     duplicateDown  = function() duplicate( 1) end,
     duplicateUp    = function() duplicate(-1) end,
-    inputOctaveUp   = function() setcfg('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
-    inputOctaveDown = function() setcfg('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
+    inputOctaveUp   = function() cm:set('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
+    inputOctaveDown = function() cm:set('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
     noteOff        = noteOff,
     growNote       = function() adjustDuration(1) end,
     shrinkNote     = function() adjustDuration(-1) end,
@@ -2360,7 +2357,7 @@ function newViewManager(tm, cm)
     playFromTop    = function() tm:playFrom(0) end,
     playFromCursor = function()
       local col = grid.cols[cursorCol]
-      tm:playFrom(rowToPPQ(cursorRow, col and col.midiChan))
+      tm:playFrom(ctx:rowToPPQ(cursorRow, col and col.midiChan))
     end,
     stop           = function() tm:stop() end,
     addNoteCol     = function() vm:addExtraCol('note') end,
@@ -2407,9 +2404,9 @@ function newViewManager(tm, cm)
     end,
     cycleTuning    = function()
       local names = { '12EDO', '19EDO', '31EDO', '53EDO' }
-      local cur, i = cfg('tuning', nil), 0
+      local cur, i = cm:get('tuning'), 0
       for k, v in ipairs(names) do if v == cur then i = k; break end end
-      setcfg('track', 'tuning', names[(i + 1) % (#names + 1)])
+      cm:set('track', 'tuning', names[(i + 1) % (#names + 1)])
     end,
     reswing                  = function() return reswing() end,
     reswingAll               = function() reswingAll() end,
@@ -2420,7 +2417,7 @@ function newViewManager(tm, cm)
     cycleSwing     = function()
       -- 'off' is the nil-slot sentinel for cycling; in storage, absent = id.
       local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
-      local cur = cfg('swing') or 'off'
+      local cur = cm:get('swing') or 'off'
       local i = 1
       for k, v in ipairs(stops) do if v == cur then i = k; break end end
       local next = stops[(i % #stops) + 1]
@@ -2430,13 +2427,13 @@ function newViewManager(tm, cm)
         -- Seed the composite into the project library on first use, so
         -- the name resolves. The project library is the sole source of
         -- truth for name → composite; timing.presets is just seed data.
-        local lib = cfg('swings', {})
+        local lib = cm:get('swings')
         if not lib[next] then
-          local proj = util:clone(cm:getAt('project', 'swings') or {})
+          local proj = cm:getAt('project', 'swings') or {}
           proj[next] = timing.presets[next]
-          setcfg('project', 'swings', proj)
+          cm:set('project', 'swings', proj)
         end
-        setcfg('take', 'swing', next)
+        cm:set('take', 'swing', next)
       end
       util:print('swing: ' .. next)
     end,
@@ -2446,9 +2443,9 @@ function newViewManager(tm, cm)
     -- alone for create mode and intra-drag preview.
     setSwingComposite = function(name, composite)
       if not name or name == '' then return end
-      local lib = util:clone(cm:getAt('project', 'swings') or {}, nil, true)
+      local lib = cm:getAt('project', 'swings') or {}
       lib[name] = composite
-      setcfg('project', 'swings', lib)
+      cm:set('project', 'swings', lib)
     end,
     -- Reswing all events whose authoring frame references `name`,
     -- moving their realised ppq from oldComp to newComp. Both composites
@@ -2461,7 +2458,7 @@ function newViewManager(tm, cm)
     -- Point the take's global swing slot at a library entry; pass nil
     -- or '' to clear the slot (falls back to identity).
     setSwingSlot = function(name)
-      if name and name ~= '' then setcfg('take', 'swing', name)
+      if name and name ~= '' then cm:set('take', 'swing', name)
       else cm:remove('take', 'swing') end
     end,
     -- Signal to renderManager that the swing editor should open. The
@@ -2473,12 +2470,11 @@ function newViewManager(tm, cm)
 
   -- In mark mode, paste's first press is swallowed as a cancel: it pastes at
   -- cursor (not over selection), so we want an explicit second press.
-  for _, name in ipairs({ 'paste' }) do
-    local orig = vm.commands[name]
-    vm.commands[name] = function()
+  cmgr:wrap('paste', function(orig)
+    return function()
       if inBlock() then selClear() else return orig() end
     end
-  end
+  end)
 
   -- These commands operate on the current selection when sticky, then drop the
   -- sticky flags so the edited region stays visible but doesn't extend on move.
@@ -2490,23 +2486,25 @@ function newViewManager(tm, cm)
     'quantize', 'quantizeAll',
     'quantizeKeepRealised', 'quantizeKeepRealisedAll',
   }) do
-    local orig = vm.commands[name]
-    vm.commands[name] = function()
-      local r, s = orig()
-      unstick()
-      return r, s
-    end
+    cmgr:wrap(name, function(orig)
+      return function()
+        local r, s = orig()
+        unstick()
+        return r, s
+      end
+    end)
   end
 
   -- After these, the affected events are gone; an empty sel rect isn't useful
   -- feedback, so clear the selection entirely.
   for _, name in ipairs({ 'delete', 'deleteSel', 'cut' }) do
-    local orig = vm.commands[name]
-    vm.commands[name] = function()
-      local r, s = orig()
-      selClear()
-      return r, s
-    end
+    cmgr:wrap(name, function(orig)
+      return function()
+        local r, s = orig()
+        selClear()
+        return r, s
+      end
+    end)
   end
 
   function vm:markMode() return inBlock() end
@@ -2522,7 +2520,7 @@ function newViewManager(tm, cm)
       chans = { col.midiChan }
     end
 
-    local extras = cfg('extraColumns', {})
+    local extras = cm:get('extraColumns')
     for _, chan in ipairs(chans) do
       local want = extras[chan] or { notes = 0 }
       extras[chan] = want
@@ -2535,7 +2533,7 @@ function newViewManager(tm, cm)
         want[type] = true
       end
     end
-    setcfg('take', 'extraColumns', extras)
+    cm:set('take', 'extraColumns', extras)
   end
 
   --- Delete the empty column under the cursor.
@@ -2551,13 +2549,13 @@ function newViewManager(tm, cm)
     -- Note col with delay shown: strip the delay first; the column itself
     -- only goes on a subsequent hide.
     if col.type == 'note' then
-      local lane = laneOf(col)
-      local nd = cfg('noteDelay', {})
+      local lane = col.lane
+      local nd = cm:get('noteDelay')
       local chanMap = nd[chan]
       if chanMap and chanMap[lane] then
         chanMap[lane] = nil
         nd[chan] = next(chanMap) and chanMap or nil
-        setcfg('take', 'noteDelay', next(nd) and nd or nil)
+        cm:set('take', 'noteDelay', next(nd) and nd or nil)
         vm:rebuild()
         return
       end
@@ -2565,7 +2563,7 @@ function newViewManager(tm, cm)
 
     if #col.events > 0 then return end
 
-    local extras = cfg('extraColumns', {})
+    local extras = cm:get('extraColumns')
     local want   = extras[chan] or { notes = 0 }
     extras[chan] = want
 
@@ -2576,7 +2574,7 @@ function newViewManager(tm, cm)
         if c.type == 'note' then util:add(noteCols, c) end
       end
       if #noteCols <= 1 then return end
-      local k = laneOf(col)
+      local k = col.lane
 
       -- Queue lane shifts for higher-lane notes.
       for lane = k + 1, #noteCols do
@@ -2586,7 +2584,7 @@ function newViewManager(tm, cm)
       end
 
       -- Shift noteDelay keys in this channel.
-      local nd = cfg('noteDelay', {})
+      local nd = cm:get('noteDelay')
       local chanMap = nd[chan]
       if chanMap then
         local newMap = {}
@@ -2595,7 +2593,7 @@ function newViewManager(tm, cm)
           elseif lane > k then newMap[lane - 1] = v end
         end
         nd[chan] = next(newMap) and newMap or nil
-        setcfg('take', 'noteDelay', next(nd) and nd or nil)
+        cm:set('take', 'noteDelay', next(nd) and nd or nil)
       end
 
       want.notes = #noteCols - 1
@@ -2611,7 +2609,7 @@ function newViewManager(tm, cm)
     if want.notes == 0 and not (want.pc or want.pb or want.at or want.ccs) then
       extras[chan] = nil
     end
-    setcfg('take', 'extraColumns', next(extras) and extras or nil)
+    cm:set('take', 'extraColumns', next(extras) and extras or nil)
 
     if col.type == 'note' then tm:flush() else vm:rebuild() end
   end
@@ -2621,12 +2619,12 @@ function newViewManager(tm, cm)
   --- Non-note columns in the list are skipped.
   function vm:showDelay(cols)
     cols = cols or { cursorCol }
-    local nd = cfg('noteDelay', {})
+    local nd = cm:get('noteDelay')
     local changed = false
     for _, ci in ipairs(cols) do
       local col = grid.cols[ci]
       if col and col.type == 'note' then
-        local lane = laneOf(col)
+        local lane = col.lane
         local chanMap = nd[col.midiChan] or {}
         if not chanMap[lane] then
           chanMap[lane] = true
@@ -2635,11 +2633,11 @@ function newViewManager(tm, cm)
         end
       end
     end
-    if changed then setcfg('take', 'noteDelay', nd) end
+    if changed then cm:set('take', 'noteDelay', nd) end
   end
 
   for i = 0, 9 do
-    vm.commands['advBy' .. i] = function() setcfg('take', 'advanceBy', i) end
+    cmgr:register('advBy' .. i, function() cm:set('take', 'advanceBy', i) end)
   end
 
   ---------- REBUILD
@@ -2661,8 +2659,8 @@ function newViewManager(tm, cm)
     end
 
     if changed.take or changed.data then
-      advanceBy = cfg('advanceBy', 1)
-      currentOctave = cfg('currentOctave', 2)
+      advanceBy = cm:get('advanceBy')
+      currentOctave = cm:get('currentOctave')
       rowPerBeat = effectiveRPB()
       -- Grid resolution is pinned to the first time sig's denominator;
       -- mid-item time sig changes affect bar/beat highlighting but not row size.
@@ -2674,48 +2672,25 @@ function newViewManager(tm, cm)
       grid.cols         = {}
       grid.chanFirstCol = {}
       grid.chanLastCol  = {}
+      grid.lane1Col     = {}
 
-      local noteDelayCfg = cfg('noteDelay', {})
+      local noteDelayCfg = cm:get('noteDelay')
 
       -- `key` is the lane number for note columns, the cc number for cc
       -- columns, and nil for singletons (pb/at/pc).
       local function addGridCol(chan, type, key, events)
         local showDelay = type == 'note' and (noteDelayCfg[chan] or {})[key] or false
-
-        -- cursor stop positions in each column
-        local stopPos = {
-          note = showDelay and {0,2,4,5,7,8,9} or {0,2,4,5},  -- C-4 30 [040]
-          pb   = {0,1,2,3},        -- 0200
-          cc   = {0,1},            -- 94
-          pa   = {0,1},
-          at   = {0,1},
-          pc   = {0,1},
-        }
-
-        -- assigns stop positions to selection groups (for marking)
-        local selGroups = {
-          note = showDelay and {1,1,2,2,3,3,3} or {1,1,2,2},
-          pb   = {1,1,1,1},
-          cc   = {1,1},
-          pa   = {1,1},
-          at   = {1,1},
-          pc   = {1,1},
-        }
-
-        local colLabels = {
-          note = 'Note',
-          cc   = 'CC', 
-          pb   = 'PB',  at = 'AT',  pa = 'PA',  pc = 'PC',
-        }
+        local stopKey   = (type == 'note' and showDelay) and 'noteWithDelay' or type
 
         local gridCol = {
           type      = type,
-          cc        = type == 'cc' and key or nil,
-          label     = colLabels[type] or '',
+          cc        = type == 'cc'   and key or nil,
+          lane      = type == 'note' and key or nil,
+          label     = LABELS[type] or '',
           events    = events or {},
           showDelay = showDelay,
-          stopPos   = stopPos[type] or {0},
-          selGroups = selGroups[type] or {0},
+          stopPos   = STOPS[stopKey] or {0},
+          selGroups = SELGROUPS[stopKey] or {0},
           width     = type == 'note' and (showDelay and 10 or 6)
                    or type == 'pb' and 4
                    or 2,
@@ -2725,6 +2700,7 @@ function newViewManager(tm, cm)
         util:add(grid.cols, gridCol)
         grid.chanFirstCol[chan] = grid.chanFirstCol[chan] or #grid.cols
         grid.chanLastCol[chan]  = #grid.cols
+        if type == 'note' and key == 1 then grid.lane1Col[chan] = gridCol end
       end
 
       for chan, channel in tm:channels() do
@@ -2733,17 +2709,10 @@ function newViewManager(tm, cm)
         if c.pb then addGridCol(chan, 'pb', nil,  c.pb.events) end
         for lane, col in ipairs(c.notes) do addGridCol(chan, 'note', lane, col.events) end
         if c.at then addGridCol(chan, 'at', nil,  c.at.events) end
-        for n,    col in pairs(c.ccs)      do addGridCol(chan, 'cc',   n,    col.events) end
-
-        -- Canonicalise column order within the channel: the cc dict
-        -- isn't ordered.
-        local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
-        if first and last and last > first then
-          local slice = {}
-          for i = first, last do util:add(slice, grid.cols[i]) end
-          slice = canonicaliseColumns(slice)
-          for i, col in ipairs(slice) do grid.cols[first + i - 1] = col end
-        end
+        local ccNums = {}
+        for n in pairs(c.ccs) do util:add(ccNums, n) end
+        table.sort(ccNums)
+        for _, n in ipairs(ccNums) do addGridCol(chan, 'cc', n, c.ccs[n].events) end
       end
 
       rowPPQs = {}
@@ -2759,17 +2728,24 @@ function newViewManager(tm, cm)
       grid.numRows = numRows
 
       -- Swing snapshot for this rebuild — resolved slots, T baked in.
-      -- Hoisted into factory scope so _c helpers see it from anywhere
-      -- in vm. tm has already stripped delay from col.events, so evt.ppq
-      -- is intent; unapply(chan, intentPPQ) → straight-grid PPQ.
-      swing = tm:swingSnapshot(swingOverrideArg())
+      -- tm has already stripped delay from col.events, so evt.ppq is
+      -- intent; unapply(chan, intentPPQ) → straight-grid PPQ.
+      ctx = newViewContext{
+        swing      = tm:swingSnapshot(swingOverrideArg()),
+        rowPPQs    = rowPPQs,
+        length     = length,
+        numRows    = numRows,
+        rowPerBeat = rowPerBeat,
+        timeSigs   = timeSigs,
+        tuning     = microtuning.findTuning(cm:get('tuning')),
+      }
 
       for _, gridCol in ipairs(grid.cols) do
         gridCol.overflow = {}
         gridCol.offGrid  = {}
         local chan = gridCol.midiChan
         for _, evt in ipairs(gridCol.events) do
-          local exact = ppqToRow(evt.ppq or 0, chan)
+          local exact = ctx:ppqToRow(evt.ppq or 0, chan)
           local y     = math.floor(exact + 0.5)
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
@@ -2782,34 +2758,9 @@ function newViewManager(tm, cm)
         end
       end
 
-      -- Ghost cells: sampled intermediate values between consecutive scalar
-      -- events A, B when A.shape is a non-step curve. The shape of A governs
-      -- the pair (A, B). Ghosts are skipped on rows already holding a real
-      -- event.
       for _, gridCol in ipairs(grid.cols) do
         if ghostable[gridCol.type] then
-          gridCol.ghosts = {}
-          local chan = gridCol.midiChan
-          local evts = gridCol.events
-          for i = 1, #evts - 1 do
-            local A, B = evts[i], evts[i+1]
-            local shape = A.shape
-            if shape and shape ~= 'step' then
-              local rA = ppqToRow(A.ppq, chan)
-              local rB = ppqToRow(B.ppq, chan)
-              local yA, yB = math.floor(rA + 0.5), math.floor(rB + 0.5)
-              local span, delta = rB - rA, (B.val or 0) - (A.val or 0)
-              for y = yA + 1, yB - 1 do
-                if y >= 0 and y < numRows and not gridCol.cells[y] then
-                  local t   = (y - rA) / span
-                  local val = (A.val or 0) + util:curveSample(shape, A.tension, t) * delta
-                  gridCol.ghosts[y] = {
-                    val = math.floor(val + 0.5), fromEvt = A, toEvt = B,
-                  }
-                end
-              end
-            end
-          end
+          gridCol.ghosts = ctx:sampleGhosts(gridCol.events, gridCol.midiChan, gridCol.cells)
         end
       end
 

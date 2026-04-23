@@ -247,4 +247,37 @@ function M.tileInverse(S, T, p)
   return T * (n + M.invert(S, t - n))
 end
 
+-- Apply an ordered array of factors {{S, T}, ...} (as produced by
+-- resolving a composite) to a PPQ position. Order matters: earlier
+-- factors are inner, later are outer.
+function M.applyFactors(factors, ppq)
+  for _, f in ipairs(factors) do ppq = M.tile(f.S, f.T, ppq) end
+  return ppq
+end
+
+function M.unapplyFactors(factors, ppq)
+  for i = #factors, 1, -1 do
+    local f = factors[i]
+    ppq = M.tileInverse(f.S, f.T, ppq)
+  end
+  return ppq
+end
+
+--------------------
+-- Delay <-> PPQ
+--
+-- Delay unit is signed milli-QN (1000 ⇒ one QN late). The forward
+-- conversion rounds at source so the map is an integer bijection on ℤ:
+-- every arithmetic use (intent ± delayToPPQ(d)) stays in ℤ, and
+-- realise/strip round-trip is algebraic rather than approximate.
+--------------------
+
+function M.delayToPPQ(d, res)
+  return math.floor(res * (d or 0) / 1000 + 0.5)
+end
+
+function M.ppqToDelay(p, res)
+  return 1000 * p / res
+end
+
 return M

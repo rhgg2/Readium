@@ -6,7 +6,7 @@
 -- commands and edit input back through vm's public interface.
 --
 -- CONSTRUCTION
---   local rm = newRenderManager(vm, cm)
+--   local rm = newRenderManager(vm, cm, cmgr)
 --
 -- LIFECYCLE
 --   rm:init()    -- create ImGui context and font
@@ -30,7 +30,7 @@ local ImGui = require 'imgui' '0.10'
 -- Factory
 --------------------
 
-function newRenderManager(vm, cm)
+function newRenderManager(vm, cm, cmgr)
 
   ---------- PRIVATE STATE
 
@@ -50,16 +50,6 @@ function newRenderManager(vm, cm)
   local dragWinX, dragWinY = 0, 0
   local modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
   local swingEditor = nil  -- nil = closed, else { name, snapshot, createBuf, createError }
-
-  ---------- CONFIG HELPERS
-
-  local function cfg(key, default)
-    if cm then
-      local val = cm:get(key)
-      if val ~= nil then return val end
-    end
-    return default
-  end
 
   ---------- CELL RENDERERS
 
@@ -125,51 +115,21 @@ function newRenderManager(vm, cm)
 
   ---------- COLOUR
 
-  local colourDefaults = {
-    bg           = {218/256, 214/256, 201/256, 1  },
-    text         = { 48/256,  48/256,  33/256, 1  },
-    offGrid      = { 86/256, 138/256,  64/256, 1  },
-    overflow     = {210/256,  90/256,  35/256, 1  },
-    negative     = {218/256,  48/256,  33/256, 1  },
-    textBar      = { 48/256,  48/256,  33/256, 1  },
-    header       = { 48/256,  48/256,  33/256, 1  },
-    inactive     = {138/256, 134/256, 121/256, 1  },
-    cursor       = { 37/256,  41/256,  54/256, 1  },
-    cursorText   = {207/256, 207/256, 222/256, 1  },
-    rowNormal    = {218/256, 214/256, 201/256, 0  },
-    rowBeat      = {181/256, 179/256, 158/256, 0.4},
-    rowBarStart  = {159/256, 147/256, 115/256, 0.4},
-    editCursor   = {1,       1,       0,       1  },
-    selection    = {247/256, 247/256, 244/256, 0.5},
-    scrollHandle = { 48/256,  48/256,  33/256, 1  },
-    scrollBg     = {218/256, 214/256, 201/256, 1  },
-    accent       = {159/256, 147/256, 115/256, 1  },
-    mute         = {218/256,  48/256,  33/256, 1  },
-    solo         = {220/256, 180/256,  50/256, 1  },
-    separator    = {159/256, 147/256, 115/256, 0.3},
-    tail         = {100/256, 130/256, 160/256, 0.15},
---    tailBord     = {100/256, 130/256, 160/256, 0.4},
-    tailBord     = {140/256, 170/256, 200/256, 1},
-    ghost        = {100/256, 130/256, 160/256, 0.9},
-    ghostNegative= {218/256, 130/256, 120/256, 0.9},
-  }
-
   local colourCache = {}
 
   local function colour(name)
     name = name or 'text'
     if not colourCache[name] then
-      local c = cfg('colour.' .. name, colourDefaults[name] or {0, 0, 0, 1})
+      local c = cm:get('colour.' .. name)
       colourCache[name] = ImGui.ColorConvertDouble4ToU32(c[1], c[2], c[3], c[4])
     end
     return colourCache[name]
   end
 
   -- Flush colour cache on config changes
-  local configCallback = function(changed, _cm)
+  cm:addCallback(function(changed)
     if changed.config then colourCache = {} end
-  end
-  if cm then cm:addCallback(configCallback) end
+  end)
 
   ---------- DRAWING
 
@@ -514,73 +474,7 @@ function newRenderManager(vm, cm)
 
   ---------- COMMANDS & KEYBOARD
 
-  local keymap     = {
-    cursorUp       = { ImGui.Key_UpArrow,    {ImGui.Key_P, ImGui.Mod_Super} },
-    cursorDown     = { ImGui.Key_DownArrow,  {ImGui.Key_N, ImGui.Mod_Super} },
-    cursorLeft     = { ImGui.Key_LeftArrow,  {ImGui.Key_B, ImGui.Mod_Super} },
-    cursorRight    = { ImGui.Key_RightArrow, {ImGui.Key_F, ImGui.Mod_Super} },
-    goTop          = { ImGui.Key_Home,       {ImGui.Key_Comma, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
-    goBottom       = { ImGui.Key_End,        {ImGui.Key_Period, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
-    pageUp         = { ImGui.Key_PageUp },
-    pageDown       = { ImGui.Key_PageDown },
---    goLeft         = { {ImGui.Key_A, ImGui.Mod_Super} },
---    goRight        = { {ImGui.Key_E, ImGui.Mod_Super} },
-    colLeft        = { {ImGui.Key_B, ImGui.Mod_Ctrl} },
-    colRight       = { {ImGui.Key_F, ImGui.Mod_Ctrl} },
-    channelLeft    = { {ImGui.Key_Tab, ImGui.Mod_Shift} },
-    channelRight   = { ImGui.Key_Tab },
-    noteOff        = { ImGui.Key_1 },
-    shrinkNote     = { {ImGui.Key_LeftBracket, ImGui.Mod_Shift} },
-    growNote       = { {ImGui.Key_RightBracket, ImGui.Mod_Shift} },
-    nudgeBack      = { ImGui.Key_LeftBracket },
-    nudgeForward   = { ImGui.Key_RightBracket },
-    insertRow      = { {ImGui.Key_DownArrow, ImGui.Mod_Ctrl} },
-    deleteRow      = { {ImGui.Key_UpArrow, ImGui.Mod_Ctrl} },
-    delete         = { ImGui.Key_Period },
-    interpolate    = { {ImGui.Key_I, ImGui.Mod_Ctrl} },
-    selectUp       = { {ImGui.Key_UpArrow, ImGui.Mod_Shift} },
-    selectDown     = { {ImGui.Key_DownArrow, ImGui.Mod_Shift} },
-    selectLeft     = { {ImGui.Key_LeftArrow, ImGui.Mod_Shift} },
-    selectRight    = { {ImGui.Key_RightArrow, ImGui.Mod_Shift} },
-    cycleBlock     = { {ImGui.Key_Space, ImGui.Mod_Super} },
-    cycleVBlock    = { {ImGui.Key_O, ImGui.Mod_Super} },
-    swapBlockEnds  = { {ImGui.Key_GraveAccent, ImGui.Mod_Ctrl} },
-    selectClear    = { {ImGui.Key_G, ImGui.Mod_Super} },
-    cut            = { {ImGui.Key_W, ImGui.Mod_Super}, {ImGui.Key_X, ImGui.Mod_Ctrl} },
-    copy           = { {ImGui.Key_W, ImGui.Mod_Ctrl}, {ImGui.Key_C, ImGui.Mod_Ctrl} },
-    paste          = { {ImGui.Key_Y, ImGui.Mod_Super}, {ImGui.Key_V, ImGui.Mod_Ctrl} },
-    duplicateDown  = { {ImGui.Key_D, ImGui.Mod_Ctrl} },
-    duplicateUp    = { {ImGui.Key_D, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
-    deleteSel      = { ImGui.Key_Delete },
-    nudgeCoarseUp   = { {ImGui.Key_Equal, ImGui.Mod_Ctrl} },
-    nudgeCoarseDown = { {ImGui.Key_Minus, ImGui.Mod_Ctrl} },
-    nudgeFineUp     = { {ImGui.Key_Equal, ImGui.Mod_Shift} },
-    nudgeFineDown   = { {ImGui.Key_Minus, ImGui.Mod_Shift} },
-    addNoteCol     = { {ImGui.Key_N, ImGui.Mod_Ctrl} },
-    addTypedCol    = { {ImGui.Key_T, ImGui.Mod_Ctrl} },
-    doubleRPB      = { {ImGui.Key_Equal, ImGui.Mod_Super} },
-    halveRPB       = { {ImGui.Key_Minus, ImGui.Mod_Super} },
-    setRPB         = { {ImGui.Key_Z, ImGui.Mod_Super} },
-    matchGridToCursor = { {ImGui.Key_M, ImGui.Mod_Super} },
-    hideExtraCol   = { {ImGui.Key_H, ImGui.Mod_Ctrl} },
-    inputOctaveUp   = { {ImGui.Key_8, ImGui.Mod_Shift} },
-    inputOctaveDown = { ImGui.Key_Slash },
-    playPause      = { ImGui.Key_Space },
-    playFromTop    = { ImGui.Key_F6 },
-    playFromCursor = { ImGui.Key_F7 },
-    stop           = { ImGui.Key_F8 },
-    quit           = { ImGui.Key_Enter },
-    cycleTuning    = { {ImGui.Key_T, ImGui.Mod_Super} },
-    cycleSwing     = { {ImGui.Key_S, ImGui.Mod_Super} },
-    openSwingEditor = { {ImGui.Key_E, ImGui.Mod_Super} },
-    reswing                = { {ImGui.Key_R, ImGui.Mod_Ctrl} },
-    quantize               = { {ImGui.Key_Q, ImGui.Mod_Ctrl} },
-    quantizeKeepRealised   = { {ImGui.Key_Q, ImGui.Mod_Ctrl, ImGui.Mod_Shift} },
-  }
-
-  for i = 0, 9 do
-    keymap['advBy' .. i] = { {ImGui.Key_0 + i, ImGui.Mod_Ctrl} }
-  end
+  cmgr:installDefaultKeymap(ImGui)
 
   ---------- INPUT HANDLING
 
@@ -695,14 +589,14 @@ function newRenderManager(vm, cm)
       if wheel ~= 0 then
         local n = math.floor(math.abs(wheel) / 2 + 0.5)
         if n > 0 then
-          local cmd = wheel > 0 and vm.commands.cursorUp or vm.commands.cursorDown
+          local cmd = wheel > 0 and cmgr.commands.cursorUp or cmgr.commands.cursorDown
           for _ = 1, n do cmd() end
         end
       end
       if wheelH ~= 0 then
         local n = math.floor(math.abs(wheelH) + 0.5)
         if n > 0 then
-          local cmd = wheelH > 0 and vm.commands.cursorLeft or vm.commands.cursorRight
+          local cmd = wheelH > 0 and cmgr.commands.cursorLeft or cmgr.commands.cursorRight
           for _ = 1, n do cmd() end
         end
       end
@@ -717,7 +611,7 @@ function newRenderManager(vm, cm)
 
     if ImGui.IsWindowFocused(ctx) then
       local commandHeld = false
-      for command, keys in pairs(keymap) do
+      for command, keys in pairs(cmgr.keymap) do
         for _, key in ipairs(keys) do
           local mods = ImGui.Mod_None
           if type(key) == 'table' then
@@ -728,7 +622,7 @@ function newRenderManager(vm, cm)
           end
           if ImGui.IsKeyDown(ctx, key) and mods == ImGui.Mod_None then commandHeld = true end
           if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then
-            local result, state = vm.commands[command]()
+            local result, state = cmgr.commands[command]()
             if result == 'quit' then
               return true
             elseif result == 'modal' then
@@ -738,11 +632,11 @@ function newRenderManager(vm, cm)
               return
             elseif result == 'swingEditor' then
               if not swingEditor then
-                local name = cfg('swing')
-                local lib  = cfg('swings', {})
+                local name = cm:get('swing')
+                local lib  = cm:get('swings')
                 swingEditor = {
                   name      = name,
-                  snapshot  = name and util:deepClone(lib[name]) or nil,
+                  snapshot  = name and lib[name] or nil,
                   createBuf = '',
                 }
               end
@@ -995,7 +889,7 @@ function newRenderManager(vm, cm)
   -- so Reset always has the on-open state.
 
   local function swingRead()
-    return cfg('swings', {})[swingEditor.name]
+    return cm:get('swings')[swingEditor.name]
   end
 
   local function compositesEqual(a, b)
@@ -1015,7 +909,7 @@ function newRenderManager(vm, cm)
   -- something to redraw against while the user is still pulling the
   -- slider. The reswing is deferred to the drag's release.
   local function swingPreview(composite)
-    vm.commands.setSwingComposite(swingEditor.name, composite)
+    cmgr.commands.setSwingComposite(swingEditor.name, composite)
   end
 
   -- Commit a composite: write the library, then reswing every event
@@ -1024,8 +918,8 @@ function newRenderManager(vm, cm)
   local function swingWrite(composite)
     local old = util:deepClone(swingRead()) or {}
     if compositesEqual(old, composite) then return end
-    vm.commands.setSwingComposite(swingEditor.name, composite)
-    vm.commands.reswingPreset(swingEditor.name, old, composite)
+    cmgr.commands.setSwingComposite(swingEditor.name, composite)
+    cmgr.commands.reswingPreset(swingEditor.name, old, composite)
   end
 
   local function patchFactor(i, patch)
@@ -1097,7 +991,7 @@ function newRenderManager(vm, cm)
       local old, cur = swingEditor.dragOld, swingRead() or {}
       swingEditor.dragOld = nil
       if not compositesEqual(old, cur) then
-        vm.commands.reswingPreset(swingEditor.name, old, cur)
+        cmgr.commands.reswingPreset(swingEditor.name, old, cur)
       end
     end
     if frozen then ImGui.EndDisabled(ctx) end
@@ -1189,14 +1083,14 @@ function newRenderManager(vm, cm)
         local confirm = rv or ImGui.Button(ctx, 'Create new swing')
         if confirm then
           local name = buf and buf:match('^%s*(.-)%s*$')
-          local lib  = cfg('swings', {})
+          local lib  = cm:get('swings')
           if not name or name == '' then
             swingEditor.createError = 'Name required.'
           elseif lib[name] then
             swingEditor.createError = 'Name already in use.'
           else
-            vm.commands.setSwingComposite(name, {})
-            vm.commands.setSwingSlot(name)
+            cmgr.commands.setSwingComposite(name, {})
+            cmgr.commands.setSwingSlot(name)
             swingEditor.name        = name
             swingEditor.snapshot    = {}
             swingEditor.createBuf   = ''
