@@ -9,11 +9,11 @@ function newEditCursor(deps)
   local grid     = deps.grid
   local getRPB   = deps.rowPerBeat
   local getRPBar = deps.rowPerBar
+  local moveHook = deps.moveHook or function () end
 
   local cursorRow, cursorCol, cursorStop = 0, 1, 1
   local sel, selAnchor                   = nil, nil
   local hBlockScope, vBlockScope         = 0, 0
-  local moveHook                         = nil
 
   local function selGrpAt(col, stop)
     local c = grid.cols[col]
@@ -61,7 +61,6 @@ function newEditCursor(deps)
   ----- Selection
 
   local function isSticky() return hBlockScope > 0 or vBlockScope > 0 end
-  local function moved() if moveHook then moveHook() end end
   local function clampPos()
     local maxRow = math.max(0, (grid.numRows or 1) - 1)
     cursorRow = util:clamp(cursorRow, 0, maxRow)
@@ -143,7 +142,7 @@ function newEditCursor(deps)
       selAnchor.col,  cursorCol  = cursorCol,  selAnchor.col
       selAnchor.stop, cursorStop = cursorStop, selAnchor.stop
     end
-    clampPos(); moved()
+    clampPos(); moveHook()
     selUpdate()
   end
 
@@ -152,7 +151,7 @@ function newEditCursor(deps)
       if not sel then selStart() end
     else selClear() end
     cursorRow = cursorRow + n
-    clampPos(); moved()
+    clampPos(); moveHook()
     if selecting or isSticky() then selUpdate() end
   end
 
@@ -180,7 +179,7 @@ function newEditCursor(deps)
         cursorStop = s
       end
     end
-    clampPos(); moved()
+    clampPos(); moveHook()
     if selecting or isSticky() then selUpdate() end
   end
 
@@ -287,13 +286,12 @@ function newEditCursor(deps)
   end
 
   function ec:clampPos()      clampPos() end
-  function ec:setMoveHook(fn)   moveHook = fn end
 
   function ec:setPos(row, col, stop)
     if row  then cursorRow  = row  end
     if col  then cursorCol  = col  end
     if stop then cursorStop = stop end
-    clampPos(); moved()
+    clampPos(); moveHook()
   end
 
   function ec:rescaleRow(oldRPB, newRPB)
@@ -311,7 +309,7 @@ function newEditCursor(deps)
     sel.row2      = util:clamp(sel.row2      + rowDelta, 0, maxRow)
     selAnchor.row = util:clamp(selAnchor.row + rowDelta, 0, maxRow)
     cursorRow     = cursorRow + rowDelta
-    clampPos(); moved()
+    clampPos(); moveHook()
   end
 
   function ec:cursorKind()                return cursorKind() end

@@ -26,57 +26,6 @@ function newViewContext(args)
   -- from REAPER's `bezier` shape; indexed by |τ| at 0.1 steps. Row format:
   -- { h, θ_large (rad), θ_small (rad) }. See design/curves.md.
 
-  local BEZIER = {
-    { 0.2794, 0.4636,    0.4636 },
-    { 0.3442, 0.7704,    0.3384 },
-    { 0.4020, 0.9849,    0.2466 },
-    { 0.4642, 1.1455,    0.1812 },
-    { 0.5326, 1.2647,    0.1353 },
-    { 0.6059, 1.3532,    0.1011 },
-    { 0.6820, 1.4199,    0.0738 },
-    { 0.7604, 1.4714,    0.0515 },
-    { 0.8397, 1.5116,    0.0321 },
-    { 0.9198, 1.5441,    0.0154 },
-    { 1.0000, math.pi/2, 0      },
-  }
-
-  local function bezierSample(tau, t)
-    if t <= 0 then return 0 end
-    if t >= 1 then return 1 end
-    local fi = util:clamp(math.abs(tau), 0, 1) * 10
-    local i = math.min(math.floor(fi), 9)
-    local f = fi - i
-    local r0, r1 = BEZIER[i+1], BEZIER[i+2]
-    local h  = r0[1] + (r1[1] - r0[1]) * f
-    local tL = r0[2] + (r1[2] - r0[2]) * f
-    local tS = r0[3] + (r1[3] - r0[3]) * f
-    local t1, t2 = tS, tL
-    if tau < 0 then t1, t2 = tL, tS end
-    local ax, ay = h*math.cos(t1),     h*math.sin(t1)
-    local bx, by = 1 - h*math.cos(t2), 1 - h*math.sin(t2)
-    local lo, hi = 0, 1
-    for _ = 1, 20 do
-      local s = (lo + hi) * 0.5
-      local u = 1 - s
-      local x = 3*u*u*s*ax + 3*u*s*s*bx + s*s*s
-      if x < t then lo = s else hi = s end
-    end
-    local s = (lo + hi) * 0.5
-    local u = 1 - s
-    return 3*u*u*s*ay + 3*u*s*s*by + s*s*s
-  end
-
-  -- tension ∈ [-1, 1], bezier only.
-  local function curveSample(shape, tension, t)
-    if     shape == 'step'       then return t >= 1 and 1 or 0
-    elseif shape == 'linear'     then return t
-    elseif shape == 'slow'       then return t*t*(3 - 2*t)
-    elseif shape == 'fast-start' then local u = 1 - t; return 1 - u*u*u
-    elseif shape == 'fast-end'   then return t*t*t
-    elseif shape == 'bezier'     then return bezierSample(tension or 0, t)
-    end
-  end
-
   local ctx = {}
 
   ----- Ppq / row
@@ -206,15 +155,9 @@ function newViewManager(tm, cm, cmgr)
   local rowPPQs       = {}
   local length        = 0
   local timeSigs      = {}
-  local ctx           = nil  
   local advanceBy     = 1
   local currentOctave = 2
-
-  -- Active frame override (installed by matchGridToCursor/Ctrl-G). When
-  -- non-nil, display and new-note stamping use these in place of cfg's
-  -- swing/colSwing/rowPerBeat. { swing, col, chan, rpb } — col applies to
-  -- the single chan; other channels' col swings still come from cfg.
-  local frameOverride = nil
+  local frameOverride
 
   local scrollCol   = 1
   local scrollRow   = 0
@@ -228,23 +171,10 @@ function newViewManager(tm, cm, cmgr)
     chanLastCol  = {},
   }
 
-  local ec = newEditCursor{
-    grid       = grid,
-    rowPerBeat = function() return rowPerBeat end,
-    rowPerBar  = function() return rowPerBar end,
-  }
+  local ec, clipboard, ctx
 
   -- Scalar column types whose consecutive events can be interpolated.
   local ghostable = { cc = true, pb = true, at = true, pc = true }
-
-  local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end' }
-  local function nextShape(s)
-    for i, n in ipairs(shapeCycle) do
-      if n == s then return shapeCycle[(i % #shapeCycle) + 1] end
-    end
-    return 'linear'
-  end
-
 
   ----- Frame override
 
@@ -365,8 +295,6 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
-  ec:setMoveHook(followViewport)
-
   local function moveRow(n, selecting)  killAudition(); ec:moveRow(n, selecting)  end
   local function moveStop(n, selecting) killAudition(); ec:moveStop(n, selecting) end
   local function moveCol(n)             killAudition(); ec:moveCol(n)             end
@@ -385,13 +313,6 @@ function newViewManager(tm, cm, cmgr)
     update.frame = currentFrame(update.chan)
     tm:addEvent('note', update)
   end
-
-  local clipboard = newClipboard{
-    ec = ec, grid = grid, tm = tm, cm = cm,
-    addNoteEvent = addNoteEvent,
-    getCtx       = function() return ctx end,
-    getLength    = function() return length end,
-  }
 
   local function placeNewNote(col, update)
     local last = util:seek(col.events, 'before', update.ppq, util.isNote)
@@ -659,36 +580,46 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Interpolation
 
-  local function cycleShape(col, A)
-    if not A then return end
-    tm:assignEvent(col.type, A, { shape = nextShape(A.shape or 'step') })
-  end
-
-  local function interpolate()
-    if ec:hasSelection() then
-      local r1, r2 = ec:region()
-      for col in ec:eachSelectedCol() do
-        if ghostable[col.type] then
-          local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
-          local prev
-          for evt in util.between(col.events, startPPQ, endPPQ) do
-            if prev then cycleShape(col, prev) end
-            prev = evt
-          end
-        end
+  local interpolate do
+    local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end' }
+    local function nextShape(s)
+      for i, n in ipairs(shapeCycle) do
+        if n == s then return shapeCycle[(i % #shapeCycle) + 1] end
       end
-      tm:flush()
-      return
+      return 'linear'
     end
 
-    local col = grid.cols[ec:col()]
-    if not (col and ghostable[col.type]) then return end
-    local r = ec:row()
-    local ghost = col.ghosts and col.ghosts[r]
-    local A = ghost and ghost.fromEvt
-              or (col.cells and col.cells[r])
-              or util:seek(col.events, 'before', ctx:rowToPPQ(r + 1, col.midiChan))
-    if A then cycleShape(col, A); tm:flush() end
+    local function cycleShape(col, A)
+      if not A then return end
+      tm:assignEvent(col.type, A, { shape = nextShape(A.shape or 'step') })
+    end
+
+    function interpolate()
+      if ec:hasSelection() then
+        local r1, r2 = ec:region()
+        for col in ec:eachSelectedCol() do
+          if ghostable[col.type] then
+            local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+            local prev
+            for evt in util.between(col.events, startPPQ, endPPQ) do
+              if prev then cycleShape(col, prev) end
+              prev = evt
+            end
+          end
+        end
+        tm:flush()
+        return
+      end
+
+      local col = grid.cols[ec:col()]
+      if not (col and ghostable[col.type]) then return end
+      local r = ec:row()
+      local ghost = col.ghosts and col.ghosts[r]
+      local A = ghost and ghost.fromEvt
+        or (col.cells and col.cells[r])
+        or util:seek(col.events, 'before', ctx:rowToPPQ(r + 1, col.midiChan))
+      if A then cycleShape(col, A); tm:flush() end
+    end
   end
 
   ----- Duration
@@ -698,24 +629,6 @@ function newViewManager(tm, cm, cmgr)
     if not (col and col.type == 'note') then return end
     local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
     return col, util:seek(col.events, 'at-or-before', cursorPPQ, util.isNote)
-  end
-
-  local function cursorNoteAfter()
-    local col = grid.cols[ec:col()]
-    if not (col and col.type == 'note') then return end
-    local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
-    return col, util:seek(col.events, 'at-or-after', cursorPPQ, util.isNote)
-  end
-
-  -- First event in col that starts anywhere in the cursor row. For note
-  -- columns, PAs are skipped.
-  local function cursorRowEvent(col)
-    if not col then return end
-    local r = ec:row()
-    local lo, hi = ctx:rowToPPQ(r, col.midiChan), ctx:rowToPPQ(r + 1, col.midiChan)
-    local pred = col.type == 'note' and util.isNote or nil
-    local evt = util:seek(col.events, 'at-or-after', lo, pred)
-    if evt and evt.ppq < hi then return evt end
   end
 
   local function applyNoteOff(col, last, targetPPQ, undo)
@@ -1067,130 +980,145 @@ function newViewManager(tm, cm, cmgr)
   local function quantizeKeepRealised() return scopeOrConfirm('quantize keep realised', quantizeKeepRealisedScope) end
   local function quantizeKeepRealisedAll() quantizeKeepRealisedScope(allGroups()) end
 
-  local function insertRowCore(col, topRow, numRows)
-    local chan = col.midiChan
-    local C = ctx:rowToPPQ(topRow, chan)
-    local R = ctx:rowToPPQ(topRow + numRows, chan) - C
+  local insertRow, deleteRow do
+    local function insertRowCore(col, topRow, numRows)
+      local chan = col.midiChan
+      local C = ctx:rowToPPQ(topRow, chan)
+      local R = ctx:rowToPPQ(topRow + numRows, chan) - C
 
-    local shifted = {}
-    for e in util.between(col.events, C, length) do util:add(shifted, e) end
-    for i = #shifted, 1, -1 do
-      local e = shifted[i]
-      local newPpq = e.ppq + R
-      if newPpq >= length then
-        tm:deleteEvent(col.type, e)
-      elseif util.isNote(e) then
-        tm:assignEvent('note', e, { ppq = newPpq, endppq = math.min(e.endppq + R, length) })
+      local shifted = {}
+      for e in util.between(col.events, C, length) do util:add(shifted, e) end
+      for i = #shifted, 1, -1 do
+        local e = shifted[i]
+        local newPpq = e.ppq + R
+        if newPpq >= length then
+          tm:deleteEvent(col.type, e)
+        elseif util.isNote(e) then
+          tm:assignEvent('note', e, { ppq = newPpq, endppq = math.min(e.endppq + R, length) })
+        else
+          tm:assignEvent(col.type, e, { ppq = newPpq })
+        end
+      end
+
+      if col.type == 'note' then
+        local spanning = util:seek(col.events, 'before', C, util.isNote)
+        if spanning and spanning.endppq > C then
+          tm:assignEvent('note', spanning, { endppq = math.min(spanning.endppq + R, length) })
+        end
+      end
+    end
+
+    local function deleteRowCore(col, topRow, numRows)
+      local chan = col.midiChan
+      local C = ctx:rowToPPQ(topRow, chan)
+      local D = ctx:rowToPPQ(topRow + numRows, chan)
+      local R = D - C
+
+      if col.type == 'note' then
+        local spanning = util:seek(col.events, 'before', C, util.isNote)
+        if spanning and spanning.endppq > C then
+          local newEnd = spanning.endppq > D and spanning.endppq - R or C
+          tm:assignEvent('note', spanning, { endppq = newEnd })
+        end
+      end
+
+      local touched = {}
+      for e in util.between(col.events, C, length) do util:add(touched, e) end
+      for _, e in ipairs(touched) do
+        if e.ppq < D then
+          tm:deleteEvent(col.type, e)
+        elseif util.isNote(e) then
+          tm:assignEvent('note', e, { ppq = e.ppq - R, endppq = e.endppq - R })
+        else
+          tm:assignEvent(col.type, e, { ppq = e.ppq - R })
+        end
+      end
+    end
+
+    local function forEachRowOp(core, preSel)
+      local sel = ec:selection()
+      if sel then
+        if preSel then preSel() end
+        local n = sel.row2 - sel.row1 + 1
+        for col in ec:eachSelectedCol() do core(col, sel.row1, n) end
       else
-        tm:assignEvent(col.type, e, { ppq = newPpq })
+        for _, col in ipairs(grid.cols) do core(col, ec:row(), 1) end
       end
+      tm:flush()
     end
 
-    if col.type == 'note' then
-      local spanning = util:seek(col.events, 'before', C, util.isNote)
-      if spanning and spanning.endppq > C then
-        tm:assignEvent('note', spanning, { endppq = math.min(spanning.endppq + R, length) })
-      end
-    end
+    function insertRow() forEachRowOp(insertRowCore) end
+    function deleteRow() forEachRowOp(deleteRowCore, function() clipboard:copy() end) end
   end
 
-  local function deleteRowCore(col, topRow, numRows)
-    local chan = col.midiChan
-    local C = ctx:rowToPPQ(topRow, chan)
-    local D = ctx:rowToPPQ(topRow + numRows, chan)
-    local R = D - C
+  local applyNudge do
+    local function pitchStep(coarse)
+      if not coarse then return 1 end
+      local t = ctx:activeTuning()
+      return t and t.octaveStep or 12
+    end
 
-    if col.type == 'note' then
-      local spanning = util:seek(col.events, 'before', C, util.isNote)
-      if spanning and spanning.endppq > C then
-        local newEnd = spanning.endppq > D and spanning.endppq - R or C
-        tm:assignEvent('note', spanning, { endppq = newEnd })
+    -- Coarse snap interval per column type. nil = no coarse (pc).
+    local function valueInterval(col)
+      if col.type == 'cc' or col.type == 'at' then return 8
+      elseif col.type == 'pb'                 then return 100
       end
     end
 
-    local touched = {}
-    for e in util.between(col.events, C, length) do util:add(touched, e) end
-    for _, e in ipairs(touched) do
-      if e.ppq < D then
-        tm:deleteEvent(col.type, e)
-      elseif util.isNote(e) then
-        tm:assignEvent('note', e, { ppq = e.ppq - R, endppq = e.endppq - R })
+    local function valueBounds(col)
+      if col.type == 'pb' then local lim = cm:get('pbRange') * 100; return -lim, lim end
+      return 0, 127
+    end
+
+    local function nudgePitch(col, note, dir, coarse, audible)
+      local delta  = dir * pitchStep(coarse)
+      local tuning = ctx:activeTuning()
+      local pitch, detune
+      if tuning then
+        pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune, delta)
       else
-        tm:assignEvent(col.type, e, { ppq = e.ppq - R })
+        pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune
       end
+      if pitch == note.pitch and detune == note.detune then return end
+      tm:assignEvent('note', note, { pitch = pitch, detune = detune })
+      if audible then audition(pitch, note.vel, col.midiChan) end
+    end
+
+    local function nudgeVel(note, dir, coarse)
+      local newVel = util:nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
+      if newVel ~= note.vel then tm:assignEvent('note', note, { vel = newVel }) end
+    end
+
+    local function nudgeDelay(col, note, dir, coarse)
+      local minD, maxD = delayRange(col, note)
+      local old = note.delay
+      local new = util:nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
+      if new ~= old then tm:assignEvent('note', note, { delay = new }) end
+    end
+
+    local function nudgeValue(col, evt, dir, coarse)
+      local lo, hi   = valueBounds(col)
+      local newVal   = util:nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
+      if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
+    end
+
+    function applyNudge(col, evt, kind, dir, coarse, audible)
+      if     kind == 'val'   then nudgeValue(col, evt, dir, coarse)
+      elseif kind == 'vel'   then nudgeVel(evt, dir, coarse)
+      elseif kind == 'delay' then nudgeDelay(col, evt, dir, coarse)
+      elseif kind == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
     end
   end
 
-  local function forEachRowOp(core, preSel)
-    local sel = ec:selection()
-    if sel then
-      if preSel then preSel() end
-      local n = sel.row2 - sel.row1 + 1
-      for col in ec:eachSelectedCol() do core(col, sel.row1, n) end
-    else
-      for _, col in ipairs(grid.cols) do core(col, ec:row(), 1) end
-    end
-    tm:flush()
-  end
-
-  local function insertRow() forEachRowOp(insertRowCore) end
-  local function deleteRow() forEachRowOp(deleteRowCore, function() clipboard:copy() end) end
-
-  local function pitchStep(coarse)
-    if not coarse then return 1 end
-    local t = ctx:activeTuning()
-    return t and t.octaveStep or 12
-  end
-
-  -- Coarse snap interval per column type. nil = no coarse (pc).
-  local function valueInterval(col)
-    if col.type == 'cc' or col.type == 'at' then return 8
-    elseif col.type == 'pb'                 then return 100
-    end
-  end
-
-  local function valueBounds(col)
-    if col.type == 'pb' then local lim = cm:get('pbRange') * 100; return -lim, lim end
-    return 0, 127
-  end
-
-  local function nudgePitch(col, note, dir, coarse, audible)
-    local delta  = dir * pitchStep(coarse)
-    local tuning = ctx:activeTuning()
-    local pitch, detune
-    if tuning then
-      pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune, delta)
-    else
-      pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune
-    end
-    if pitch == note.pitch and detune == note.detune then return end
-    tm:assignEvent('note', note, { pitch = pitch, detune = detune })
-    if audible then audition(pitch, note.vel, col.midiChan) end
-  end
-
-  local function nudgeVel(note, dir, coarse)
-    local newVel = util:nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
-    if newVel ~= note.vel then tm:assignEvent('note', note, { vel = newVel }) end
-  end
-
-  local function nudgeDelay(col, note, dir, coarse)
-    local minD, maxD = delayRange(col, note)
-    local old = note.delay
-    local new = util:nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
-    if new ~= old then tm:assignEvent('note', note, { delay = new }) end
-  end
-
-  local function nudgeValue(col, evt, dir, coarse)
-    local lo, hi   = valueBounds(col)
-    local newVal   = util:nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
-    if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
-  end
-
-  local function applyNudge(col, evt, kind, dir, coarse, audible)
-    if     kind == 'val'   then nudgeValue(col, evt, dir, coarse)
-    elseif kind == 'vel'   then nudgeVel(evt, dir, coarse)
-    elseif kind == 'delay' then nudgeDelay(col, evt, dir, coarse)
-    elseif kind == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
+  -- First event in col that starts anywhere in the cursor row. For note
+  -- columns, PAs are skipped.
+  local function cursorRowEvent(col)
+    if not col then return end
+    local r = ec:row()
+    local lo, hi = ctx:rowToPPQ(r, col.midiChan), ctx:rowToPPQ(r + 1, col.midiChan)
+    local pred = col.type == 'note' and util.isNote or nil
+    local evt = util:seek(col.events, 'at-or-after', lo, pred)
+    if evt and evt.ppq < hi then return evt end
   end
 
   -- Column-typed nudge. Selection rule: if any note event is selected,
@@ -1232,76 +1160,78 @@ function newViewManager(tm, cm, cmgr)
     tm:flush()
   end
 
-  -- Queue note deletions with predecessor endppq fixup. PAs are ignored in the
-  -- fixup pass (they have no duration).
-  local function queueDeleteNotes(col, locs)
-    local lastSurvivor, pendingFixup = nil, false
-    for _, evt in ipairs(col.events) do
-      if evt.type ~= 'pa' then
-        if locs[evt.loc] then
-          if not pendingFixup and lastSurvivor and lastSurvivor.endppq == evt.ppq then
-            pendingFixup = true
+  local deleteSelection do
+    -- Queue note deletions with predecessor endppq fixup. PAs are ignored in the
+    -- fixup pass (they have no duration).
+    local function queueDeleteNotes(col, locs)
+      local lastSurvivor, pendingFixup = nil, false
+      for _, evt in ipairs(col.events) do
+        if evt.type ~= 'pa' then
+          if locs[evt.loc] then
+            if not pendingFixup and lastSurvivor and lastSurvivor.endppq == evt.ppq then
+              pendingFixup = true
+            end
+          else
+            if pendingFixup and lastSurvivor then
+              tm:assignEvent('note', lastSurvivor, { endppq = evt.ppq })
+            end
+            pendingFixup = false
+            lastSurvivor = evt
           end
-        else
-          if pendingFixup and lastSurvivor then
-            tm:assignEvent('note', lastSurvivor, { endppq = evt.ppq })
-          end
-          pendingFixup = false
-          lastSurvivor = evt
+        end
+      end
+      if pendingFixup and lastSurvivor then
+        tm:assignEvent('note', lastSurvivor, { endppq = length })
+      end
+      for _, evt in pairs(locs) do
+        tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
+      end
+    end
+
+    -- Queue delay resets; zero the `delay` metadata on each selected note.
+    local function queueResetDelays(col, locs)
+      for _, evt in pairs(locs) do
+        if evt.type ~= 'pa' and evt.delay ~= 0 then
+          tm:assignEvent('note', evt, { delay = 0 })
         end
       end
     end
-    if pendingFixup and lastSurvivor then
-      tm:assignEvent('note', lastSurvivor, { endppq = length })
-    end
-    for _, evt in pairs(locs) do
-      tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
-    end
-  end
 
-  -- Queue delay resets; zero the `delay` metadata on each selected note.
-  local function queueResetDelays(col, locs)
-    for _, evt in pairs(locs) do
-      if evt.type ~= 'pa' and evt.delay ~= 0 then
-        tm:assignEvent('note', evt, { delay = 0 })
-      end
-    end
-  end
-
-  -- Queue velocity resets; delete selected PA events, use non-selected PA/note vels for carry-forward.
-  local function queueResetVelocities(col, locs)
-    local prevVel = cm:get('defaultVelocity')
-    for _, evt in ipairs(col.events) do
-      local toMatch = locs[evt.loc]
-      if toMatch and toMatch.type == evt.type then
-        if evt.type == 'pa' then
-          tm:deleteEvent('pa', evt)
+    -- Queue velocity resets; delete selected PA events, use non-selected PA/note vels for carry-forward.
+    local function queueResetVelocities(col, locs)
+      local prevVel = cm:get('defaultVelocity')
+      for _, evt in ipairs(col.events) do
+        local toMatch = locs[evt.loc]
+        if toMatch and toMatch.type == evt.type then
+          if evt.type == 'pa' then
+            tm:deleteEvent('pa', evt)
+          else
+            tm:assignEvent('note', evt, { vel = prevVel })
+          end
         else
-          tm:assignEvent('note', evt, { vel = prevVel })
+          prevVel = evt.vel
         end
-      else
-        prevVel = evt.vel
       end
     end
-  end
 
-  local function queueDeleteCCs(col, locs)
-    for _, evt in pairs(locs) do tm:deleteEvent(col.type, evt) end
-  end
-
-  local DELETE_BY_KIND = {
-    pitch = queueDeleteNotes,
-    vel   = queueResetVelocities,
-    delay = queueResetDelays,
-    val   = queueDeleteCCs,
-  }
-
-  local function deleteSelection()
-    for _, g in ipairs(eventsByCol()) do
-      DELETE_BY_KIND[g.kind](g.col, g.locs)
+    local function queueDeleteCCs(col, locs)
+      for _, evt in pairs(locs) do tm:deleteEvent(col.type, evt) end
     end
-    tm:flush()
-    ec:selClear()
+
+    local DELETE_BY_KIND = {
+      pitch = queueDeleteNotes,
+      vel   = queueResetVelocities,
+      delay = queueResetDelays,
+      val   = queueDeleteCCs,
+    }
+
+    function deleteSelection()
+      for _, g in ipairs(eventsByCol()) do
+        DELETE_BY_KIND[g.kind](g.col, g.locs)
+      end
+      tm:flush()
+      ec:selClear()
+    end
   end
 
 
@@ -1918,6 +1848,22 @@ function newViewManager(tm, cm, cmgr)
     if tm then tm:removeCallback(callback) end
     if cm then cm:removeCallback(configCallback) end
   end
+
+  ----- Factory load
+
+  ec = newEditCursor {
+    grid       = grid,
+    rowPerBeat = function() return rowPerBeat end,
+    rowPerBar  = function() return rowPerBar end,
+    moveHook   = followViewport,
+  }
+
+  clipboard = newClipboard {
+    ec = ec, grid = grid, tm = tm, cm = cm,
+    addNoteEvent = addNoteEvent,
+    getCtx       = function() return ctx end,
+    getLength    = function() return length end,
+  }
 
   if tm and cm then vm:attach(tm, cm) end
   return vm
