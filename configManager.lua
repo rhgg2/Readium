@@ -1,62 +1,4 @@
---------------------
--- newConfigManager
---
--- Manages configuration at four levels of specificity, from least
--- to most specific:
---
---   1. global   – saved to a Lua file on disk
---   2. project  – saved to REAPER project extension data
---   3. track    – saved to REAPER track extension data
---   4. take     – saved to REAPER take extension data
---
--- When reading a config value, all four levels are merged, with
--- more specific levels overriding less specific ones. When writing,
--- the caller specifies which level to write to.
---
--- SCHEMA
---   The full set of valid config keys and their defaults is declared
---   inline below as `declarations`, an ordered array of
---   { 'key', default } pairs. Keys not in the schema are rejected by
---   get/set/remove/assign (raise). Keys found in persisted data that
---   are not in the schema are silently pruned on load — tolerant of
---   stale project/take ext-state, strict about in-code use.
---
--- OWNERSHIP
---   cm owns its internal state. Every read deep-copies out; every
---   write deep-copies in. Callers never alias cm's tables and never
---   need to clone — mutating a result from cm:get never affects cm.
---
--- CONSTRUCTION
---   local cm = newConfigManager()
---     Creates a config manager with no MIDI context. Global and
---     project config are available immediately. Track and take
---     config become available after cm:setContext(take).
---
--- CONTEXT
---   cm:setContext(take)             -- set or change the active take
---     Derives the track from the take automatically. Refreshes
---     all four cache tiers and fires callbacks. Pass nil to clear
---     the take/track context (global and project remain available).
---
--- READING
---   cm:get(key)                    -- merged value (most specific wins)
---   cm:getAt(level, key)           -- value at a specific level only
---   cm:getAt(level)                -- full table at a specific level
---   cm:getLevel(key)               -- which level currently defines key
---
--- WRITING
---   cm:set(level, key, value)      -- set a value at a specific level
---   cm:remove(level, key)          -- remove a key at a specific level
---   cm:assign(level, updates)      -- update via util:assign at a specific level
---
--- MESSAGING
---   cm:addCallback(fn)             -- fn(changed, cm) called on any change
---   cm:removeCallback(fn)          -- remove a callback
---     changed is of the form { config = true }
---
--- LEVELS (valid strings for the level parameter)
---   'global', 'project', 'track', 'take'
---------------------
+-- See docs/configManager.md for the model and API reference.
 
 loadModule('util')
 
@@ -64,13 +6,8 @@ local function print(...)
   return util:print(...)
 end
 
---------------------
--- Schema. Ordered array of {key, default} pairs. The array form lets
--- nil defaults ('declared but null') coexist with non-nil ones without
--- ambiguity: pair[1] is always a truthy string (presence = declared);
--- pair[2] is the default (absence/nil = no initial value).
---------------------
-
+-- Array-of-pairs lets nil defaults (declared-but-null) coexist with
+-- non-nil ones: pair[1] presence = declared; pair[2] = default.
 local declarations = {
   -- numeric
   { 'pbRange',         2     },
@@ -98,7 +35,7 @@ local declarations = {
   { 'extraColumns',    {}    },
   { 'noteDelay',       {}    },
 
-  -- colours (flat dotted keys — preserves per-colour override semantics)
+  -- colours (flat dotted keys preserve per-colour override across levels)
   { 'colour.bg',           {218/256, 214/256, 201/256, 1  } },
   { 'colour.text',         { 48/256,  48/256,  33/256, 1  } },
   { 'colour.offGrid',      { 86/256, 138/256,  64/256, 1  } },
@@ -137,8 +74,6 @@ local function copy(v)
   return v
 end
 
---------------------
-
 function newConfigManager()
 
   ---------- PRIVATE DATA
@@ -165,9 +100,7 @@ function newConfigManager()
 
   ---------- STORAGE BACKENDS
 
-  -- Prune keys that are not in the schema. Tolerant on load — a user's
-  -- on-disk config may carry stale keys from a rename; silently drop
-  -- them rather than erroring.
+  -- Tolerant on load: stale keys from a rename shouldn't error.
   local function pruneUnknown(tbl)
     for k in pairs(tbl) do
       if not declared[k] then tbl[k] = nil end
@@ -181,8 +114,6 @@ function newConfigManager()
     if ok and type(result) == 'table' then return pruneUnknown(result) end
     return {}
   end
-
-  -- Level 1: global (Lua file on disk)
 
   local function loadGlobal()
     local f = io.open(CONFIG_GLOBAL_PATH, 'r')
@@ -202,8 +133,6 @@ function newConfigManager()
     f:close()
   end
 
-  -- Level 2: project (project extension data)
-
   local function loadProject()
     local ok, val = reaper.GetProjExtState(0, 'rdm', 'config')
     return ok and parse(val)
@@ -212,8 +141,6 @@ function newConfigManager()
   local function saveProject(tbl)
     reaper.SetProjExtState(0, 'rdm', 'config', util:serialise(tbl))
   end
-
-  -- Level 3: track (track extension data)
 
   local function loadTrack()
     if not track then return {} end
@@ -231,8 +158,6 @@ function newConfigManager()
       track, 'P_EXT:' .. CONFIG_PREFIX .. 'config', util:serialise(tbl), true)
   end
 
-  -- Level 4: take (take extension data)
-
   local function loadTake()
     if not take then return {} end
     local ok, val = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', '', false)
@@ -246,8 +171,6 @@ function newConfigManager()
     end
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', util:serialise(tbl), true)
   end
-
-  -- Backend dispatch
 
   local loaders = {
     global  = loadGlobal,
@@ -275,9 +198,6 @@ function newConfigManager()
     if not cache.global then refreshCache() end
   end
 
-  -- Returns a reference to the merged view. Callers MUST copy() any
-  -- value they intend to return outward; the public get*() methods do
-  -- this at the boundary.
   local function mergedTable()
     ensureCache()
     local merged = {}
@@ -307,8 +227,6 @@ function newConfigManager()
   local cm = {}
   fire = util:installHooks(cm)
 
-  -- Context: set the active take (and derived track)
-
   function cm:setContext(newTake)
     take = newTake
     track = nil
@@ -324,7 +242,7 @@ function newConfigManager()
     fire({ config = true }, cm)
   end
 
-  -- Reading
+  ----- Reading
 
   function cm:get(key)
     checkKey(key)
@@ -354,12 +272,7 @@ function newConfigManager()
     return
   end
 
-  -- Writing
-
-  -- Callbacks receive { config = true, key = <name> } for targeted
-  -- writes, letting consumers filter on keys they actually depend on.
-  -- Bulk paths (setContext, assign) fire without a key — consumers that
-  -- care must treat keyless fires as "any key might have changed".
+  ----- Writing
 
   function cm:set(level, key, value)
     checkLevel(level)
@@ -398,8 +311,6 @@ function newConfigManager()
     savers[level](cache[level])
     fire({ config = true }, cm)
   end
-
-  ---------- FACTORY BODY
 
   return cm
 end

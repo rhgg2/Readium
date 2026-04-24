@@ -1,65 +1,4 @@
---------------------
--- newTrackerManager
---
--- Factory that attaches to a midiManager, parses its MIDI data into a
--- tracker-style data structure with channels and typed columns, and
--- rebuilds automatically whenever the underlying MIDI data changes.
---
--- CONSTRUCTION
---   local tm = newTrackerManager(mm)   -- attach to midiManager mm
---   local tm = newTrackerManager(nil)  -- create empty, call tm:attach(mm) later
---
--- LIFECYCLE
---   tm:attach(mm)     -- attach to a midiManager; triggers an immediate rebuild
---   tm:detach()       -- remove callback from the attached midiManager
---   tm:rebuild(changed) -- manually trigger a full rebuild
---
--- MESSAGING
---   tm:addCallback(fn)                -- register a callback
---   tm:removeCallback(fn)             -- unregister a callback
---     On rebuild, registered callbacks are called with the signature
---     fn(changed, tm), where changed is a table of the form
---     { take = bool, data = bool } forwarded from the midiManager.
---
--- CHANNEL DATA
---   tm:getChannel(chan)               -- returns the channel table for chan (1..16)
---   tm:channels()                     -- iterator: for chan, channel in tm:channels()
---
---   Each channel table contains:
---     chan    : number (1..16)
---     columns : dict keyed by kind —
---       pc, pb, at : singleton column or nil
---       notes      : dense array of note columns (index = lane)
---       ccs        : sparse dict of cc columns keyed by CC number
---
---   Each column table contains:
---     events : array of event tables, sorted by ppq
---     cc     : cc columns only — the CC number.
---
---   tm imposes no ordering on columns — that's a presentation concern
---   owned by vm.
---
---   Note columns carry no identity beyond their position among note
---   columns in the channel. A note's "lane" is that position, persisted
---   per note under the 'lane' key. Lane counts are stable across
---   rebuilds: cfg.extraColumns[chan].notes stores a per-channel
---   high-water lane count, tm grows it when allocation needs more
---   lanes, and lanes only shrink via explicit user action in vm.
---
---   cfg.extraColumns is the single source of "columns the user has
---   opened per channel", with shape:
---     { [chan] = { notes = <count>, pc = true, pb = true, at = true,
---                  ccs = { [ccNum] = true } } }
---   tm reconciles this with live MIDI during rebuild: any column
---   present in extras but not backed by events is materialised as
---   empty, so consumers see a uniform channel.columns irrespective of
---   whether a column is data-driven or user-opened.
---
--- GLOBAL DATA
---   tm:length()       -- take length in PPQ (delegated to midiManager)
---   tm:resolution()   -- PPQ per quarter note (delegated to midiManager)
---   tm:editCursor()   -- edit cursor position in PPQ relative to the take start
---------------------
+-- See docs/trackerManager.md for the model and API reference.
 
 loadModule('util')
 loadModule('midiManager')
@@ -71,7 +10,7 @@ end
 
 function newTrackerManager(mm, cm)
 
-  ---------- PRIVATE DATA & FUNCTIONS
+  ---------- PRIVATE
 
   local channels = {}
   local fire  -- installed below, once tm exists
@@ -82,55 +21,20 @@ function newTrackerManager(mm, cm)
     table.sort(tbl, function(a, b) return a.ppq < b.ppq end)
   end
 
-  --------------------
-  -- PB <-> cents conversion
-  --------------------
-
   local function centsToRaw(cents)
     local lim = cm:get('pbRange') * 100
-    return util:clamp(math.floor(cents * 8192 / lim + 0.5), -8192, 8191)
+    return util:clamp(util:round(cents * 8192 / lim), -8192, 8191)
   end
 
   local function rawToCents(raw)
     local lim = cm:get('pbRange') * 100
-    return math.floor(raw / 8192 * lim + 0.5)
+    return util:round(raw / 8192 * lim)
   end
-
-  --------------------
-  -- Swing and delay
-  --
-  -- A slot stores a name (string) — cfg.swing and cfg.colSwing[c] hold
-  -- the name directly, no wrapper. The name resolves against cfg.swings
-  -- (the project's composite library) to an ordered array of factors,
-  -- each {atom, amount, period}. Missing name / identity composite ⇒
-  -- nil, treated as passthrough by applySwing / unapplySwing.
-  --
-  -- Period (per factor) and delay are in QN units. Period is a QN
-  -- scalar or {num, den}; delay is signed milli-QN (1000 = one QN
-  -- late). QN is preferred over "beat" because "beat" is time-sig-
-  -- denominator-dependent — a jig feel is period = {3,2} (dotted
-  -- quarter) regardless of the denom.
-  --
-  -- Delay metadata lives on notes (defaulted to 0 by midiManager on
-  -- load). Intent PPQ is the event's desired position; realised PPQ
-  -- is what midiManager stores. The invariant
-  --
-  --     e.ppq = intentPPQ(e) + delayToPPQ(delay(e))
-  --
-  -- is maintained at the vm boundary: tm:rebuild strips delay from
-  -- col.events before exposing them; um:addEvent / um:assignEvent
-  -- add it back before routing writes to mm.
-  --------------------
 
   local function delayToPPQ(d) return timing.delayToPPQ(d, mm:resolution()) end
 
-  -- Resolve a slot name to an array of realised factors {S, T} in PPQ,
-  -- or nil for identity. S is the atom evaluated at its amount; T is
-  -- the factor's period converted to PPQ against the current resolution.
-  -- `libOverride`, if given, shadows cm:get('swings') for named lookups —
-  -- callers pass {[name]=composite} to realise a hypothetical library
-  -- state (used during preset edits, where the authoring and target
-  -- composites for the same name must be resolved side-by-side).
+  ----- Swing
+
   local function resolveSlot(name, libOverride)
     local composite = libOverride and libOverride[name]
                    or timing.findShape(name, cm:get('swings'))
@@ -145,16 +49,7 @@ function newTrackerManager(mm, cm)
     return factors
   end
 
-  --------------------
-  -- Update manager
-  --
-  -- Working model for col-1 notes and pb events. Public methods apply
-  -- edits to local state and accumulate mm-facing ops; flush() commits
-  -- them in one mm:modify call. pb.val is stored as logical cents
-  -- throughout; conversion to raw happens at flush time.
-  --
-  -- Re-created once per tm:rebuild so its view of mm matches tm's.
-  --------------------
+  ----- Update manager
 
   local function createUpdateManager()
     local adds = {}
@@ -164,7 +59,7 @@ function newTrackerManager(mm, cm)
     local notesByLoc = {}
     local ccsByLoc = {}
 
-    ----- Accessors: raw / logical / detune over the local state.
+    ----- Accessors
 
     local function owner(chan, P)
       return util:seek(chans[chan].notes, 'at-or-before', P, function(n) return n.endppq > P end)
@@ -305,11 +200,6 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    -- Fake-pb housekeeping: a pb at a note boundary is "fake" iff it
-    -- exists solely to absorb the raw step from the owner note's detune.
-    -- forcePb seats a pb if none exists; markFake/unmarkFake keep the pb
-    -- and the owner note's tag in sync.
-
     local function forcePb(chan, P)
       if pbAt(chan, P) then return false end
       addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) })
@@ -364,7 +254,6 @@ function newTrackerManager(mm, cm)
         unmarkFake(chan, P)
         retuneLowlevel(chan, P, nextRealChange(chan, P), delta)
       end
-      -- Pass any remaining fields (e.g. shape/tension) through to mm.
       local rest = util:clone(update, { val = true, ppq = true })
       if next(rest) then assignLowlevel('pb', pb, rest) end
     end
@@ -412,10 +301,9 @@ function newTrackerManager(mm, cm)
         return
       end
 
-      -- col-1 microtuning: withdraw n's detune at the old seat, move the
-      -- note, then apply at the new seat. L is the logical pb the user
-      -- authored at P1 *before* the move — if it differs from prevailing
-      -- logical there we seat a real pb to carry it.
+      -- col-1: withdraw detune at old seat, move, reapply at new. L is the
+      -- logical pb the user authored at P1 *before* the move — if it
+      -- differs from prevailing logical there we seat a real pb to carry it.
       local oldPpq = n.ppq
       local D   = n.detune
       local L   = logicalAt(n.chan, P1)
@@ -425,14 +313,13 @@ function newTrackerManager(mm, cm)
 
       assignLowlevel('note', n, { ppq = P1, endppq = P2 })
 
-      -- Withdraw at old seat.
       if oldPb and oldPb.fake then
         deleteLowlevel('pb', oldPb)
         assignLowlevel('note', n, { fakePb = util.REMOVE })
       end
       retuneLowlevel(n.chan, oldPpq, NP1, C1 - D)
 
-      -- Apply at new seat. Real pb wins over fake; pre-existing pb wins over both.
+      -- New seat: real pb wins over fake; pre-existing pb wins over both.
       local C2 = detuneBefore(n.chan, P1)
       if L ~= logicalBefore(n.chan, P1) then
         forcePb(n.chan, P1)
@@ -469,6 +356,24 @@ function newTrackerManager(mm, cm)
       if next(update) then assignLowlevel('note', n, update) end
     end
 
+    local function clearSameKeyRange(chan, pitch, P, Pend, selfEvt)
+      local clampEnd = Pend
+      local toDelete, toTruncate = {}, {}
+      for _, n in pairs(notesByLoc) do
+        if n ~= selfEvt and n.chan == chan and n.pitch == pitch then
+          if n.ppq <= P and n.endppq > P then
+            if n.ppq == P then util:add(toDelete, n)
+            else util:add(toTruncate, n) end
+          elseif clampEnd and n.ppq > P and n.ppq < clampEnd then
+            clampEnd = n.ppq
+          end
+        end
+      end
+      for _, n in ipairs(toDelete)   do deleteNote(n) end
+      for _, n in ipairs(toTruncate) do assignNote(n, { endppq = P }) end
+      return clampEnd
+    end
+
     ----- Public interface
 
     local um = {}
@@ -487,9 +392,8 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    -- vm speaks intent; tm internals (and mm) speak realised. Realise
-    -- note ppq/endppq at the boundary. A delay change with no ppq update
-    -- pins intent and shifts realised by the delay delta.
+    -- A delay change with no ppq update pins intent and shifts realised
+    -- by the delay delta.
     local function realiseNoteUpdate(evt, update)
       local dOld = delayToPPQ(evt.delay)
       local dNew = delayToPPQ(update.delay ~= nil and update.delay or evt.delay)
@@ -513,6 +417,13 @@ function newTrackerManager(mm, cm)
       if evtType == 'note' then
         if evt then
           realiseNoteUpdate(evt, update)
+          if update.pitch ~= nil or update.ppq ~= nil or update.endppq ~= nil then
+            local P     = update.ppq    or evt.ppq
+            local Pend  = update.endppq or evt.endppq
+            local pitch = update.pitch  or evt.pitch
+            local clamped = clearSameKeyRange(evt.chan, pitch, P, Pend, evt)
+            if clamped ~= Pend then update.endppq = clamped end
+          end
           assignNote(evt, update)
         end
       elseif evtType == 'pb' then
@@ -532,6 +443,7 @@ function newTrackerManager(mm, cm)
           evt.ppq = evt.ppq + d
           if evt.endppq then evt.endppq = evt.endppq + d end
         end
+        evt.endppq = clearSameKeyRange(evt.chan, evt.pitch, evt.ppq, evt.endppq, evt)
         addNote(evt)
       elseif evtType == 'pb' then
         addPb(evt)
@@ -547,10 +459,8 @@ function newTrackerManager(mm, cm)
     function um:flush()
       if #adds == 0 and #assigns == 0 and #deletes == 0 then return end
 
-      -- Snapshot and clear up front: mm:modify fires callbacks that can
-      -- reach back into the same um (e.g. tm:rebuild → setMutedChannels →
-      -- um:flush). Clearing before the modify stops the re-entrant flush
-      -- from re-emitting ops already in flight.
+      -- Snapshot+clear before mm:modify: its callbacks can re-enter this
+      -- um (rebuild → setMutedChannels → flush) and we mustn't re-emit.
       local flushAdds, flushAssigns, flushDeletes = adds, assigns, deletes
       adds, assigns, deletes = {}, {}, {}
 
@@ -618,29 +528,12 @@ function newTrackerManager(mm, cm)
     return um
   end
 
-  --------------------
-  -- Column creation
-  --
-  -- Singletons (pc, pb, at) live at channel.columns[kind]; notes form a
-  -- dense array at channel.columns.notes (index = lane); ccs a sparse
-  -- dict at channel.columns.ccs keyed by CC number. All columns carry
-  -- `events`; cc columns additionally carry `cc` (the CC number).
-  --------------------
+  ----- Column allocation
 
   local function pushNoteCol(channel)
     local notes = channel.columns.notes
     return util:add(notes, { events = {} }), #notes
   end
-
-  --------------------
-  -- Note-column allocation
-  --
-  -- Each note column can hold overlapping notes, but if a new note
-  -- overlaps more than overlapThreshold ticks with two or more
-  -- existing notes in that column, it spills to a new one.
-  -- A second note at the same starting tick as an existing one
-  -- will always be spilled.
-  --------------------
 
   local function noteColumnAccepts(col, notePpq, noteEndPpq)
     local overlapThreshold = cm:get('overlapOffset') * mm:resolution()
@@ -658,8 +551,6 @@ function newTrackerManager(mm, cm)
     return dominated < 2
   end
 
-  -- Returns (col, lane) where lane is the 1-indexed position in
-  -- channel.columns.notes.
   local function allocateNoteColumn(channel, note)
     local notes = channel.columns.notes
     if note.lane then
@@ -672,17 +563,13 @@ function newTrackerManager(mm, cm)
         while #notes < note.lane do pushNoteCol(channel) end
         return notes[note.lane], note.lane
       end
-      -- Exists but won't fit. Fall through to first-fit / spill.
+      -- Exists but won't fit; fall through to first-fit / spill.
     end
     for i, col in ipairs(notes) do
       if noteColumnAccepts(col, note.ppq, note.endppq) then return col, i end
     end
     return pushNoteCol(channel)
   end
-
-  --------------------
-  -- Poly aftertouch: find the note column containing the target pitch
-  --------------------
 
   local function findNoteColumnForPitch(channel, pitch, ppq_pos)
     local notes = channel.columns.notes
@@ -700,20 +587,15 @@ function newTrackerManager(mm, cm)
     end
   end
 
-  --------------------
-  -- PUBLIC FUNCTIONS
-  --------------------
+  ---------- PUBLIC
 
   local tm = {}
   fire = util:installHooks(tm)
 
-  --------------------
-  -- Core rebuild
-  --------------------
+  ----- Rebuild
 
   local rebuilding = false
 
-  -- argument tracks whether take and/or underlying data have changed
   function tm:rebuild(changed)
     if rebuilding then return end
     rebuilding = true
@@ -725,9 +607,8 @@ function newTrackerManager(mm, cm)
       channels[i] = { chan = i, columns = { notes = {}, ccs = {} } }
     end
 
-    -- 1) Walk notes once: seed default detune/delay on any that lack them
-    --    (metadata-only, bypasses the mm:modify lock) and collect
-    --    (chan,pitch) groups for overlap truncation.
+    -- 1) Seed detune/delay defaults (metadata-only write bypasses the lock)
+    --    and truncate same-key overlaps so later passes see clean intervals.
     do
       local groups, work = {}, {}
       for loc, note in mm:notes() do
@@ -753,7 +634,7 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    -- 2) Assign notes to note columns, moving where necessary.
+    -- 2) Allocate note columns.
     for loc, note in mm:notes() do
       local channel = channels[note.chan]
       local col, lane = allocateNoteColumn(channel, note)
@@ -764,18 +645,16 @@ function newTrackerManager(mm, cm)
       util:add(col.events, note)
     end
 
-    -- 3) Single CC walk: pitchbend display (with detune-absorber bookkeeping)
-    --    plus pa / cc / at / pc column distribution. Pb accumulates per
-    --    channel so column install can be gated on anyVisible.
+    -- 3) Single CC walk: pb, pa, cc, at, pc distribution. Pb accumulates
+    --    per channel so column install can be gated on anyVisible.
     do
       local pbByChan = {}
       for loc, cc in mm:ccs() do
         local channel = channels[cc.chan]
 
         if cc.msgType == 'pb' then
-          -- Col-1 notes provide both detune context and fakePb identity.
-          -- One scan resolves both: latest-starting note at-or-before cc.ppq
-          -- wins detune; a fakePb note exactly at cc.ppq is its host.
+          -- One scan over col-1 resolves both detune context (latest note
+          -- at-or-before cc.ppq) and fakePb host (note exactly at cc.ppq).
           local col1      = channel.columns.notes[1]
           local notes     = (col1 and col1.events) or {}
           local fakeNote, prevailing
@@ -786,9 +665,6 @@ function newTrackerManager(mm, cm)
             end
           end
           local detune = (prevailing and prevailing.detune) or 0
-          -- Absorbers hide unless an interp shape pulls them into view.
-          -- Fake pbs inherit their host's delay so tidyCol shifts them
-          -- with the note into intent frame.
           local hidden = fakeNote and (cc.shape == nil or cc.shape == 'step')
 
           local pb = pbByChan[cc.chan] or { events = {}, anyVisible = false }
@@ -802,6 +678,7 @@ function newTrackerManager(mm, cm)
             hidden  = hidden,
             shape   = cc.shape,
             tension = cc.tension,
+            -- fake pbs inherit host delay so tidyCol shifts both into intent together
             delay   = fakeNote and fakeNote.delay or nil,
           })
 
@@ -832,16 +709,14 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    -- 4) Reconcile with user-intent extras. Grow `extras[chan].notes`
-    --     if live allocation exceeded it (high-water mark), then pad
-    --     empty note lanes and seed singletons/ccs that the user has
-    --     opened but that carry no events yet.
+    -- 4) Reconcile with user-opened extras (high-water lane count, padding,
+    --    empty materialisation).
     do
       local extras = cm:get('extraColumns')
       local grew   = false
       for i = 1, 16 do
         local c    = channels[i].columns
-        local want = extras[i] or { notes = 0 }
+        local want = extras[i] or { notes = 1 }
         local n    = #c.notes
         if n > want.notes then
           want.notes = n
@@ -859,8 +734,7 @@ function newTrackerManager(mm, cm)
       if grew then cm:set('take', 'extraColumns', extras) end
     end
 
-    -- 5) Strip delay (so vm sees intent-frame PPQs) and sort each
-    --    column's events by (intent) ppq.
+    -- 5) Shift into intent frame and sort by intent ppq.
     local function tidyCol(col)
       for _, evt in ipairs(col.events) do
         local d = delayToPPQ(evt.delay)
@@ -886,7 +760,7 @@ function newTrackerManager(mm, cm)
     fire(changed, tm)
   end
 
-  --- ACCESSORS
+  ----- Accessors
 
   function tm:getChannel(chan)
     return channels and channels[chan]
@@ -902,8 +776,6 @@ function newTrackerManager(mm, cm)
       end
     end
   end
-
-  -- GLOBAL DATA ACCESSORS
 
   function tm:editCursor()
     if not (mm and mm:take()) then return end
@@ -923,10 +795,6 @@ function newTrackerManager(mm, cm)
     return mm and mm:timeSigs() or {}
   end
 
-  -- Snapshot of all slots resolved once, with atom PWLs and T_ppq baked
-  -- in. Sole public swing entry point — callers apply/unapply through
-  -- the snapshot's closures. Always returns a valid pass-through struct
-  -- when there's no context or no slots, so callers needn't nil-check.
   -- E_c: column is inner, global is outer (see design/swing.md).
   function tm:swingSnapshot(override)
     local global, column = nil, {}
@@ -958,35 +826,27 @@ function newTrackerManager(mm, cm)
     }
   end
 
+  ----- Transport
+
   function tm:playFrom(ppq)
     if not (mm and mm:take()) then return end
     reaper.SetEditCurPos(reaper.MIDI_GetProjTimeFromPPQPos(mm:take(), ppq), false, false)
-    reaper.Main_OnCommand(1007, 0)  -- Transport: Play
-  end
-
-  function tm:play()
     reaper.Main_OnCommand(1007, 0)
   end
 
-  function tm:stop()
-    reaper.Main_OnCommand(1016, 0)
-  end
+  function tm:play() reaper.Main_OnCommand(1007, 0) end
+  function tm:stop() reaper.Main_OnCommand(1016, 0) end
+  function tm:playPause() reaper.Main_OnCommand(40073, 0) end
 
-  function tm:playPause()
-    reaper.Main_OnCommand(40073, 0)
-  end
+  ----- Mutation
 
-  -- MUTATION INTERFACE
-
-  function tm:deleteEvent(type, evt)         um:deleteEvent(type, evt)         end
-  function tm:addEvent(type, evt)            um:addEvent(type, evt)            end
+  function tm:deleteEvent(type, evt) um:deleteEvent(type, evt) end
+  function tm:addEvent(type, evt) um:addEvent(type, evt) end
   function tm:assignEvent(type, evt, update) um:assignEvent(type, evt, update) end
-  function tm:flush()                        um:flush()                        end
+  function tm:flush() um:flush() end
 
-  -- Channel mute: vm is the sole source of truth. It pushes the effective
-  -- set (persistent mute ∪ solo-implied mute). tm idempotently syncs the
-  -- REAPER-native muted flag on every note to match, and tags any
-  -- subsequently-added notes via lastMuteSet in the update manager.
+  ----- Mute
+
   function tm:setMutedChannels(set)
     lastMuteSet = util:clone(set or {})
     if not um then return end
@@ -1003,20 +863,7 @@ function newTrackerManager(mm, cm)
     um:flush()
   end
 
-  --------------------
-  -- Microtuning realisation
-  --
-  -- tm owns the demix between note intent (pitch + detune) and note
-  -- realisation (raw pb events on the wire). The view layer speaks
-  -- intent; tm keeps realisation in sync inside the update manager —
-  -- no caller participates in the invariant.
-  --------------------
-
-  function tm:retuneNote(note, update)
-    um:assignEvent('note', note, update)
-  end
-
-  -- LIFECYCLE
+  ----- Lifecycle
 
   local callback = function(changed, _mm)
     if changed.data or changed.take then
@@ -1024,8 +871,6 @@ function newTrackerManager(mm, cm)
     end
   end
 
-  -- Keys owned purely by vm (render-time state) — tm has no structural
-  -- dependency on them, so skip the full rebuild when one of these fires.
   local vmOnlyKeys = { mutedChannels = true, soloedChannels = true }
 
   local configCallback = function(changed, _cm)
@@ -1049,8 +894,6 @@ function newTrackerManager(mm, cm)
     if mm then mm:removeCallback(callback) end
     if cm then cm:removeCallback(configCallback) end
   end
-
-  -- FACTORY BODY
 
   if mm and cm then tm:attach(mm, cm) end
   return tm

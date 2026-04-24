@@ -4,13 +4,14 @@ local t = require('support')
 
 return {
   {
-    name = 'empty take has 16 channels with no columns',
+    name = 'empty take has 16 channels each with one empty lane',
     run = function(harness)
       local h = harness.mk()
       for chan = 1, 16 do
         local ch = h.tm:getChannel(chan)
         t.truthy(ch, 'channel exists')
-        t.eq(#ch.columns.notes, 0, 'no note columns')
+        t.eq(#ch.columns.notes, 1, 'one note lane by default')
+        t.eq(#ch.columns.notes[1].events, 0, 'lane is empty')
       end
       t.eq(h.tm:resolution(), 240)
       t.eq(h.tm:length(), 3840)

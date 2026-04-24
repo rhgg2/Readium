@@ -24,8 +24,8 @@ end
 
 -- Selection with both ends at the current cursor → 1×1 region at cursor.
 local function degenerateSel(h)
-  h.vm:selStart()
-  h.vm:selUpdate()
+  h.ec:selStart()
+  h.ec:selUpdate()
 end
 
 return {
@@ -44,7 +44,7 @@ return {
       local mk = function()
         local h = mkNoteHarness(harness, { delay = 500 },
                                 { noteDelay = { [1] = { [1] = true } } })
-        h.vm:setCursor(2, 1, 5)
+        h.ec:setPos(2, 1, 5)
         return h
       end
 
@@ -77,7 +77,7 @@ return {
       local mk = function()
         local h = mkNoteHarness(harness, { vel = 77 })
         -- Cursor on intent row 4, stop 3 (first vel stop, selGrp 2).
-        h.vm:setCursor(4, 1, 3)
+        h.ec:setPos(4, 1, 3)
         return h
       end
 
@@ -110,9 +110,9 @@ return {
     name = 'copy/paste round-trip with no selection copies cursor-row note',
     run = function(harness)
       local h = mkNoteHarness(harness, { endppq = 300 })
-      h.vm:setCursor(4, 1, 1)  -- pitch stop, on note
+      h.ec:setPos(4, 1, 1)  -- pitch stop, on note
       h.cmgr.commands.copy()
-      h.vm:setCursor(8, 1, 1)  -- ppq 480, empty
+      h.ec:setPos(8, 1, 1)  -- ppq 480, empty
       h.cmgr.commands.paste()
 
       local notes = h.fm:dump().notes
@@ -141,9 +141,9 @@ return {
       -- Note spans ppq 240..360 (2 rows). 1-row copy at row 4 captures
       -- only its start; endRow is dropped.
       local h = mkNoteHarness(harness)
-      h.vm:setCursor(4, 1, 1)
+      h.ec:setPos(4, 1, 1)
       h.cmgr.commands.copy()
-      h.vm:setCursor(8, 1, 1)
+      h.ec:setPos(8, 1, 1)
       h.cmgr.commands.paste()
 
       local pasted
@@ -164,13 +164,13 @@ return {
     run = function(harness)
       local h = mkNoteHarness(harness)
       -- First, copy the note at row 4.
-      h.vm:setCursor(4, 1, 1)
+      h.ec:setPos(4, 1, 1)
       h.cmgr.commands.copy()
       -- Now move to an empty row and copy — should be a no-op.
-      h.vm:setCursor(12, 1, 1)
+      h.ec:setPos(12, 1, 1)
       h.cmgr.commands.copy()
       -- Paste somewhere else. Should paste the row-4 note, not nothing.
-      h.vm:setCursor(16, 1, 1)  -- ppq 960
+      h.ec:setPos(16, 1, 1)  -- ppq 960
       h.cmgr.commands.paste()
 
       local notes = h.fm:dump().notes
@@ -211,7 +211,7 @@ return {
 
       -- No-sel: cursor on row 0 col 1. insertRow shifts every col.
       local h1 = mkScenario()
-      h1.vm:setCursor(0, 1, 1)
+      h1.ec:setPos(0, 1, 1)
       h1.cmgr.commands.insertRow()
       local d1 = h1.fm:dump()
       t.eq(noteAtChan(d1, 1).ppq, 300, 'no-sel insertRow shifts chan-1 note')
@@ -219,7 +219,7 @@ return {
 
       -- 1×1 sel on chan-1 col only: chan-2 note untouched.
       local h2 = mkScenario()
-      h2.vm:setCursor(0, 1, 1)
+      h2.ec:setPos(0, 1, 1)
       degenerateSel(h2)
       h2.cmgr.commands.insertRow()
       local d2 = h2.fm:dump()
@@ -235,7 +235,7 @@ return {
     name = 'duplicateDown with no sel clones cursor-row note to next row',
     run = function(harness)
       local h = mkNoteHarness(harness)
-      h.vm:setCursor(4, 1, 1)  -- pitch stop
+      h.ec:setPos(4, 1, 1)  -- pitch stop
       h.cmgr.commands.duplicateDown()
 
       local notes = h.fm:dump().notes
@@ -259,7 +259,7 @@ return {
     name = 'nudgeForward with no sel advances cursor-row note by 1 row',
     run = function(harness)
       local h = mkNoteHarness(harness)  -- note at ppq 240
-      h.vm:setCursor(4, 1, 1)
+      h.ec:setPos(4, 1, 1)
       h.cmgr.commands.nudgeForward()
 
       local n = h.fm:dump().notes[1]
@@ -275,7 +275,7 @@ return {
     name = 'nudgeFineUp with no sel on pitch stop raises pitch by 1',
     run = function(harness)
       local h = mkNoteHarness(harness)  -- pitch = 60
-      h.vm:setCursor(4, 1, 1)
+      h.ec:setPos(4, 1, 1)
       h.cmgr.commands.nudgeFineUp()
 
       local n = h.fm:dump().notes[1]
@@ -290,7 +290,7 @@ return {
     name = 'noteOff with no sel truncates the active note to cursor ppq',
     run = function(harness)
       local h = mkNoteHarness(harness)  -- note ppq 240..360
-      h.vm:setCursor(5, 1, 1)  -- inside note span, pitch stop
+      h.ec:setPos(5, 1, 1)  -- inside note span, pitch stop
       h.cmgr.commands.noteOff()
 
       local n = h.fm:dump().notes[1]

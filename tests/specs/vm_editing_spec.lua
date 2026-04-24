@@ -24,7 +24,7 @@ return {
       h.vm:setGridSize(80, 40)
       -- Col 1 is chan-1 lane-1 note col with delay enabled (7 stops,
       -- selGroups = {1,1,2,2,3,3,3}). Stop 5 → selGrp 3.
-      h.vm:setCursor(1, 1, 5)
+      h.ec:setPos(1, 1, 5)
       h.cmgr.commands.delete()
 
       local note = h.fm:dump().notes[1]
@@ -67,7 +67,7 @@ return {
 
       -- Row 8 = ppq 480 (resolution 240, 4 rpb). Stop 1 = note name.
       -- 'z' in colemak = C; currentOctave=4 + octOff=0 → pitch 60.
-      h.vm:setCursor(8, 2, 1)
+      h.ec:setPos(8, 2, 1)
       h.vm:editEvent(col2, nil, 1, string.byte('z'), false)
 
       local notes = h.fm:dump().notes
@@ -79,6 +79,50 @@ return {
       t.truthy(A,           'original ppq=0 pitch-60 note survives')
       t.eq(A.endppq, 480,   'A truncated to new note ppq (was 600)')
       t.truthy(newN,        'new C-4 note placed at ppq=480')
+    end,
+  },
+
+  -- Write-boundary clamp: if a same-(chan, pitch) note starts inside the
+  -- new note's body on another column, the new note's endppq must be
+  -- clamped to that start at the moment of addition — not merely repaired
+  -- post-hoc by rebuild. tm:addEvent owns the invariant.
+  {
+    name = 'placing a new note clamps its endppq to a same-pitch successor in another col',
+    run = function(harness)
+      -- Two-lane setup on chan 1:
+      --   A  pitch=60, covers [0, 120)        → col 1
+      --   Y  pitch=64, covers [0, 600)        → col 2 (forces a 2nd lane)
+      --   B  pitch=60, covers [360, 600)      → col 1 (after A, same col)
+      -- Typing C at row 1 (ppq=60) in col 2 places a new pitch-60 note.
+      -- placeNewNote's same-col seek finds the next pitch-60 note AFTER
+      -- ppq=60 in col 2 — there is none, so without cross-col awareness
+      -- the new note would run to the take end. B starts at ppq=360 on
+      -- col 1, same (chan, pitch): the write-time clamp must shorten
+      -- the new note to endppq=360.
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0,   endppq = 120, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+            { ppq = 0,   endppq = 600, chan = 1, pitch = 64, vel = 80,  detune = 0, delay = 0 },
+            { ppq = 360, endppq = 600, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+          },
+        },
+        config = { take = { currentOctave = 4 } },
+      }
+      h.vm:setGridSize(80, 40)
+
+      local col2 = h.vm.grid.cols[2]
+      t.eq(col2.lane, 2)
+
+      h.ec:setPos(1, 2, 1)
+      h.vm:editEvent(col2, nil, 1, string.byte('z'), false)
+
+      local newN
+      for _, n in ipairs(h.fm:dump().notes) do
+        if n.ppq == 60 and n.pitch == 60 then newN = n end
+      end
+      t.truthy(newN,        'new C-4 note placed at ppq=60')
+      t.eq(newN.endppq, 360, 'new note endppq clamped to B.ppq (cross-col same-key successor)')
     end,
   },
 
@@ -97,7 +141,7 @@ return {
         config = { take = { noteDelay = { [1] = { [1] = true } } } },
       }
       h.vm:setGridSize(80, 40)
-      h.vm:setCursor(1, 1, 5)
+      h.ec:setPos(1, 1, 5)
       h.cmgr.commands.delete()
 
       local note = h.fm:dump().notes[1]

@@ -1,17 +1,4 @@
---------------------
--- newRenderManager
---
--- Handles all ImGui rendering and input for a viewManager.
--- Reads grid, cursor, and selection state from vm; dispatches
--- commands and edit input back through vm's public interface.
---
--- CONSTRUCTION
---   local rm = newRenderManager(vm, cm, cmgr)
---
--- LIFECYCLE
---   rm:init()    -- create ImGui context and font
---   rm:loop()    -- per-frame draw; returns false when the window is closed
---------------------
+-- See docs/renderManager.md for the model and API reference.
 
 loadModule('util')
 loadModule('timing')
@@ -26,16 +13,12 @@ end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua'
 local ImGui = require 'imgui' '0.10'
 
---------------------
--- Factory
---------------------
-
 function newRenderManager(vm, cm, cmgr)
 
-  ---------- PRIVATE STATE
+  ---------- PRIVATE
 
-  local GUTTER      = 4    -- row-number width in grid chars
-  local HEADER      = 3    -- header rows above grid data
+  local GUTTER      = 4    -- in grid chars
+  local HEADER      = 3    -- in grid rows
 
   local gridX       = nil
   local gridY       = nil
@@ -51,7 +34,7 @@ function newRenderManager(vm, cm, cmgr)
   local modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
   local swingEditor = nil  -- nil = closed, else { name, snapshot, createBuf, createError }
 
-  ---------- CELL RENDERERS
+  ----- Cell renderers
 
   local function renderNote(evt, col, row)
     local function noteName(pitch)
@@ -113,7 +96,7 @@ function newRenderManager(vm, cm, cmgr)
     if fn then return fn(evt, col, row) end
   end
 
-  ---------- COLOUR
+  ----- Colour
 
   local colourCache = {}
 
@@ -126,12 +109,11 @@ function newRenderManager(vm, cm, cmgr)
     return colourCache[name]
   end
 
-  -- Flush colour cache on config changes
   cm:addCallback(function(changed)
     if changed.config then colourCache = {} end
   end)
 
-  ---------- DRAWING
+  ----- Drawing
 
   local function pushStyles()
     local count = 0
@@ -210,14 +192,14 @@ function newRenderManager(vm, cm, cmgr)
     local changed, n = ImGui.InputInt(ctx, '##rpb', rowPerBeat, 1, 4)
     if changed then vm:setRowPerBeat(util:clamp(n, 1, 32)) end
 
---    ImGui.NewLine(ctx)
     ImGui.Separator(ctx)
   end
 
   local function drawTracker()
     local grid = vm.grid
-    local cursorRow, cursorCol, cursorStop, scrollRow, scrollCol = vm:cursor()
-    local sel = vm:selection()
+    local ec = vm:ec()
+    local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
+    local scrollRow, scrollCol = vm:scroll()
 
     if not gridX then
       local charW, charH = ImGui.CalcTextSize(ctx, 'W')
@@ -257,8 +239,7 @@ function newRenderManager(vm, cm, cmgr)
     local totalWidth = math.max(0, cx - 1)
     local draw = printer(ctx, gridX, gridY, gridOriginX, gridOriginY)
 
-    -- Header row 1: channel labels. Colour signals mute/solo state:
-    -- solo (amber) wins over mute (red), matching the audibility semantic.
+    -- Solo (amber) wins over mute (red): audibility semantic.
     draw:text(-GUTTER, -HEADER, 'Row', 'accent')
     for chan = 1, 16 do
       if chanX[chan] then
@@ -270,8 +251,7 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    -- Header rows 2 & 3: column labels and sub-labels. Track per-channel
-    -- note-lane counters so note columns can display their lane number.
+    -- laneByChan: per-channel counter so note columns show their lane number.
     local laneByChan = {}
     for _, col in ipairs(grid.cols) do
       local sub
@@ -291,24 +271,20 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    -- Separator below headers (1/3 up from the sub-label row)
+    -- Header separator sits 1/3 up from the sub-label row.
     draw:hLine(-GUTTER, totalWidth - 1, 0, 'header', -1/3)
 
-    -- Vertical dividers between channels, sitting in the inter-column gap
     for i = 1, #chanOrder - 1 do
       local chan = chanOrder[i]
       draw:vLine(chanX[chan] + chanW[chan], -HEADER, gridHeight - 1, 'separator')
     end
 
-    -- Rows
     for y = 0, gridHeight - 1 do
       local row = scrollRow + y
       if row >= numRows then break end
 
       local isBarStart, isBeatStart = vm:rowBeatInfo(row)
-      local isCursor    = (row == cursorRow)
 
-      -- Row background
       if isBarStart or isBeatStart then
         local style = isBarStart and 'rowBarStart' or 'rowBeat'
         for chan = 1, 16 do
@@ -318,16 +294,12 @@ function newRenderManager(vm, cm, cmgr)
         end
       end
 
-      -- Row number
       local rowNumCol = (isBeatStart and 'textBar') or 'inactive'
       draw:text(-GUTTER, y, string.format('%03d', row), rowNumCol)
     end
 
-    -- Sustain tails: one continuous bar per note
     local drawList = ImGui.GetWindowDrawList(ctx)
-    local tailCol  = colour('tail')
     local tailBord = colour('tailBord')
-    local barW     = gridX*3
     local viewTop  = scrollRow
     local viewBot  = scrollRow + gridHeight
     for _, col in ipairs(grid.cols) do
@@ -340,13 +312,10 @@ function newRenderManager(vm, cm, cmgr)
             if endFrac > viewTop and startFrac < viewBot then
               local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
               local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
-              local x1 = colPx - 4 -- (slot + 1) * (barW + 1)
-              --                        ImGui.DrawList_AddRectFilled(drawList, x1-6, y1, x1 + 5, y1+2, tailBord)
-              --            ImGui.DrawList_AddTriangleFilled(drawList, x1 - 0.5*gridX, y1, x1+2.5*gridX, y1, x1 + gridX, y1+6, tailCol)
+              local x1 = colPx - 4
               ImGui.DrawList_AddRectFilled(drawList, x1-1, y1-1, x1 + 4, y1+1, tailBord)
               ImGui.DrawList_AddRectFilled(drawList, x1-2, y1, x1, y2, tailBord)
               ImGui.DrawList_AddRectFilled(drawList, x1-1, y2-1, x1 + 4, y2+1, tailBord)
-              --            ImGui.DrawList_AddRect(drawList, x1-2, y1, x1 + 1, y2+1, tailBord,2)
             end
           end
         end
@@ -416,28 +385,20 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    -- Selection highlight
-    if sel and sel.col2 >= scrollCol and sel.col1 <= vm:lastVisibleFrom(scrollCol) then
-      local yFrom = math.max(sel.row1 - scrollRow, 0)
-      local yTo   = math.min(sel.row2 - scrollRow, gridHeight - 1)
-      local c1, c2 = grid.cols[sel.col1], grid.cols[sel.col2]
-      local x1, x2
-      if c1.x then
-        x1 = c1.x
-        for s, g in ipairs(c1.selGroups) do
-          if g >= sel.selgrp1 then x1 = c1.x + c1.stopPos[s]; break end
-        end
-      else x1 = 0 end
-      if c2.x then
-        x2 = c2.x + c2.stopPos[#c2.stopPos]
-        for s = #c2.selGroups, 1, -1 do
-          if c2.selGroups[s] <= sel.selgrp2 then x2 = c2.x + c2.stopPos[s]; break end
-        end
-      else x2 = totalWidth end
-      draw:box(x1, x2, yFrom, yTo, 'selection')
+    if ec:hasSelection() then
+      local r1, r2, c1i, c2i = ec:region()
+      if c2i >= scrollCol and c1i <= vm:lastVisibleFrom(scrollCol) then
+        local yFrom = math.max(r1 - scrollRow, 0)
+        local yTo   = math.min(r2 - scrollRow, gridHeight - 1)
+        local c1, c2 = grid.cols[c1i], grid.cols[c2i]
+        local s1   = ec:selectionStopSpan(c1i)
+        local _,s2 = ec:selectionStopSpan(c2i)
+        local x1 = c1.x and c1.x + c1.stopPos[s1]  or 0
+        local x2 = c2.x and c2.x + c2.stopPos[s2]  or totalWidth
+        draw:box(x1, x2, yFrom, yTo, 'selection')
+      end
     end
 
-    -- Cursor
     local col = grid.cols[cursorCol]
     if col and col.x then
       local stopOffset = (col.stopPos and col.stopPos[cursorStop]) or 0
@@ -455,7 +416,8 @@ function newRenderManager(vm, cm, cmgr)
   end
 
   local function drawStatusBar()
-    local cursorRow, cursorCol = vm:cursor()
+    local ec = vm:ec()
+    local cursorRow, cursorCol = ec:row(), ec:col()
     local rowPerBeat, _, _, currentOctave, advanceBy = vm:displayParams()
     local col      = vm.grid.cols[cursorCol]
     local ppq      = vm:rowToPPQ(cursorRow, col and col.midiChan)
@@ -472,11 +434,9 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.PopStyleColor(ctx)
   end
 
-  ---------- COMMANDS & KEYBOARD
+  ----- Input
 
   cmgr:installDefaultKeymap(ImGui)
-
-  ---------- INPUT HANDLING
 
   local function nearestStop(mouseX, mouseY)
     local grid = vm.grid
@@ -497,13 +457,14 @@ function newRenderManager(vm, cm, cmgr)
 
   local function handleMouse()
     local grid = vm.grid
-    local cursorRow, cursorCol, cursorStop, scrollRow, scrollCol = vm:cursor()
+    local ec = vm:ec()
+    local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
+    local scrollRow, scrollCol = vm:scroll()
 
     local clicked      = ImGui.IsMouseClicked(ctx, 0)
     local rightClicked = ImGui.IsMouseClicked(ctx, 1)
     local held         = ImGui.IsMouseDown(ctx, 0)
 
-    -- Right-click on the channel-header row toggles that channel's mute.
     if rightClicked and ImGui.IsWindowHovered(ctx) then
       local mouseX, mouseY = ImGui.GetMousePos(ctx)
       local charY = math.floor((mouseY - gridOriginY) / gridY)
@@ -528,20 +489,20 @@ function newRenderManager(vm, cm, cmgr)
       if fracX >= last.x + last.width + 1 then return end
 
       if charY < 0 then
-        if charY == -HEADER then vm:selectChannel(last.midiChan)
-        else vm:selectColumn(col) end
+        if charY == -HEADER then ec:selectChannel(last.midiChan)
+        else ec:selectColumn(col) end
         return
       end
 
       local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
 
       if shift then
-        if not vm:selection() then vm:selStart() end
-        vm:setCursor(scrollRow + charY, col, stop)
-        vm:selUpdate()
+        if not ec:hasSelection() then ec:selStart() end
+        ec:setPos(scrollRow + charY, col, stop)
+        ec:selUpdate()
       else
-        vm:selClear()
-        vm:setCursor(scrollRow + charY, col, stop)
+        ec:selClear()
+        ec:setPos(scrollRow + charY, col, stop)
         dragging = true
         dragWinX, dragWinY = ImGui.GetWindowPos(ctx)
       end
@@ -574,27 +535,26 @@ function newRenderManager(vm, cm, cmgr)
 
       -- Only start selection once cursor moves to a different position
       if row ~= cursorRow or col ~= cursorCol or stop ~= cursorStop then
-        if not vm:selection() then vm:selStart() end
-        vm:setCursor(row, col, stop)
-        vm:selUpdate()
+        if not ec:hasSelection() then ec:selStart() end
+        ec:setPos(row, col, stop)
+        ec:selUpdate()
       end
 
     elseif dragging and not held then
       dragging = false
     end
 
-    -- Mouse wheel scroll
     if ImGui.IsWindowHovered(ctx) then
       local wheel,wheelH  = ImGui.GetMouseWheel(ctx)
       if wheel ~= 0 then
-        local n = math.floor(math.abs(wheel) / 2 + 0.5)
+        local n = util:round(math.abs(wheel) / 2)
         if n > 0 then
           local cmd = wheel > 0 and cmgr.commands.cursorUp or cmgr.commands.cursorDown
           for _ = 1, n do cmd() end
         end
       end
       if wheelH ~= 0 then
-        local n = math.floor(math.abs(wheelH) + 0.5)
+        local n = util:round(math.abs(wheelH))
         if n > 0 then
           local cmd = wheelH > 0 and cmgr.commands.cursorLeft or cmgr.commands.cursorRight
           for _ = 1, n do cmd() end
@@ -607,7 +567,8 @@ function newRenderManager(vm, cm, cmgr)
     if modalState then return end -- popup owns input
 
     local grid = vm.grid
-    local cursorRow, cursorCol, cursorStop = vm:cursor()
+    local ec = vm:ec()
+    local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
 
     if ImGui.IsWindowFocused(ctx) then
       local commandHeld = false
@@ -650,18 +611,15 @@ function newRenderManager(vm, cm, cmgr)
         end
       end
 
-      -- Edit keys: unmodified alphanumeric input
-      -- Skip if a command key is held — auto-repeat timing mismatches
-      -- between IsKeyPressed and the character queue can leak input
+      -- Gate the char queue on commandHeld: IsKeyPressed and the char queue
+      -- don't share auto-repeat timing, so a held command key would leak.
       if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_None then
         local col = grid.cols[cursorCol]
         if col then
-          -- Character queue: hex/decimal edits, octave changes
-          -- Only process one event
           local rv, char = ImGui.GetInputQueueCharacter(ctx, 0)
           if rv then
-            if vm:markMode() then
-              vm:clearMark()
+            if ec:isSticky() then
+              ec:selClear()
             else
               local evt = col.cells and col.cells[cursorRow]
               vm:editEvent(col, evt, cursorStop, char)
@@ -672,7 +630,7 @@ function newRenderManager(vm, cm, cmgr)
 
       -- Shift-digit: half-step entry at MSB stops (vel, delay, cc/at/pc).
       -- Overwrites the value with digit in MSB, half-value (8 hex / 5 dec) in LSB.
-      if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_Shift and not vm:markMode() then
+      if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_Shift and not ec:isSticky() then
         local col = grid.cols[cursorCol]
         if col then
           for d = 0, 9 do
@@ -732,13 +690,7 @@ function newRenderManager(vm, cm, cmgr)
     end
   end
 
-  ---------- SWING EDITOR
-  --
-  -- Floating, non-modal. Edits a named composite in cfg.swings
-  -- through the single vm primitive setSwingComposite; the tracker grid
-  -- behind it reshapes live on every change. Periods are expressed in
-  -- fractions of a bar at the UI layer and stored in QN (bar-fraction
-  -- interpretation is relative to the take's first time signature).
+  ----- Swing editor
 
   local SWING_ATOMS   = { 'id', 'classic', 'pocket', 'shuffle', 'drag', 'lilt' }
   local SWING_ATOMS_Z = table.concat(SWING_ATOMS, '\0') .. '\0\0'
@@ -786,7 +738,7 @@ function newRenderManager(vm, cm, cmgr)
     local i = periodPresetIndex(period)
     if i > 0 then return PERIOD_PRESETS[i].label end
     local qn = timing.periodQN(period)
-    if math.abs(qn - math.floor(qn + 0.5)) < 1e-9 then return string.format('%d qn', qn) end
+    if math.abs(qn - util:round(qn)) < 1e-9 then return string.format('%d qn', qn) end
     return string.format('%.3f qn', qn)
   end
 
@@ -815,10 +767,9 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.Dummy(ctx, w, h)
   end
 
-  -- Main preview. Each tile is a square of side `tileSize` showing one
-  -- period (= max(T_i)) of the composite in its own local frame. Tiles
-  -- as many as fit the available width. Single-period composites make
-  -- identical tiles; mixed-period composites show visible drift.
+  -- Each tile is one period (= max(T_i)) of the composite in its own
+  -- local frame. Single-period composites make identical tiles;
+  -- mixed-period composites show visible drift.
   local TARGET_TILE = 100
   local function drawCompositeThumb(composite, availW)
     local x0, y0 = ImGui.GetCursorScreenPos(ctx)
@@ -884,9 +835,9 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.Dummy(ctx, availW, h)
   end
 
-  -- Composite edit primitives. Each produces a fresh composite and
-  -- routes through the single vm write; the snapshot remains untouched
-  -- so Reset always has the on-open state.
+  -- Each primitive produces a fresh composite and routes through the
+  -- single vm write; the snapshot remains untouched so Reset always
+  -- has the on-open state.
 
   local function swingRead()
     return cm:get('swings')[swingEditor.name]
@@ -905,16 +856,12 @@ function newRenderManager(vm, cm, cmgr)
     return true
   end
 
-  -- Write without reswing — used mid-drag to give the preview thumbs
-  -- something to redraw against while the user is still pulling the
-  -- slider. The reswing is deferred to the drag's release.
+  -- Mid-drag write: composite changes but no reswing. The reswing is
+  -- committed once on slider release.
   local function swingPreview(composite)
     cmgr.commands.setSwingComposite(swingEditor.name, composite)
   end
 
-  -- Commit a composite: write the library, then reswing every event
-  -- whose authoring frame references this preset from the old composite
-  -- to the new. No-op when nothing changed.
   local function swingWrite(composite)
     local old = util:deepClone(swingRead()) or {}
     if compositesEqual(old, composite) then return end
@@ -1026,10 +973,7 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.PopID(ctx)
   end
 
-  -- Height estimate for auto-resize on factor-count change. The
-  -- composite-preview tile follows window width, so we approximate it
-  -- from the last-known width. Intentionally loose — ImGui pads widgets
-  -- differently; a few px off is fine.
+  -- Loose estimate — ImGui pads widgets differently; a few px off is fine.
   local function idealSwingHeight(nFactors, winW)
     local nTiles   = math.max(1, math.floor((winW - 20) / TARGET_TILE))
     local tileSize = (winW - 20) / nTiles
@@ -1050,8 +994,6 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.SetNextWindowSizeConstraints(ctx, 400, 120, 9999, vpH)
     ImGui.SetNextWindowSize(ctx, 560, 420, ImGui.Cond_FirstUseEver)
 
-    -- Auto-resize height when the factor stack changes. Width is
-    -- preserved from the last known value (or initial default).
     if swingEditor.lastCount ~= n then
       local w = swingEditor.lastW or 560
       local h = math.min(idealSwingHeight(n, w), vpH)
@@ -1126,9 +1068,7 @@ function newRenderManager(vm, cm, cmgr)
     end
   end
 
-  --------------------
-  -- Public interface
-  --------------------
+  ---------- PUBLIC
 
   local rm = {}
 

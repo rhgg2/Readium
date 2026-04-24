@@ -1,3 +1,5 @@
+-- See docs/util.md for the model and API reference.
+
 util = {}
 
 function util:print(...)
@@ -12,7 +14,6 @@ local function print(...)
   return util:print(...)
 end
 
--- dev only
 function util:print_r(root)
   local cache = {  [root] = '.' }
   local function _dump(t,space,name)
@@ -54,10 +55,6 @@ function util:add(tbl, val)
   return val
 end
 
--- seek: find an item on one side of a boundary in a key-sorted list.
--- mode is 'before' | 'at-or-before' | 'after' | 'at-or-after'.
--- keyFn extracts the scalar key from an item (defaults to .ppq).
--- filter is an optional predicate to restrict the match.
 function util:seek(items, mode, key, filter, keyFn)
   keyFn = keyFn or function(x) return x.ppq end
   local before = mode == 'before' or mode == 'at-or-before'
@@ -109,11 +106,9 @@ function util:installHooks(owner)
   end
 end
 
--- Pure predicates/iterators — dot-defined (no self) so they can be passed
--- directly as filter/predicate args to util:seek, util.between, etc.
+-- Dot-defined so these compose as filter/predicate args to util:seek etc.
 function util.isNote(e) return e and e.endppq end
 
--- between: iterate events with ppq in [lo, hi). Assumes ppq-sorted input.
 function util.between(events, lo, hi, filter)
   filter = filter or function(e) return true end
   local i = 0
@@ -137,24 +132,17 @@ function util:clamp(val,min,max)
   end
 end
 
--- Writes digit `d` at place `pos` (0 = ones, 1 = next up, …) in numeric
--- `base`, zeroing all lower places and keeping higher ones. `half` adds
--- place/2 to support shift-digit half-step entry.
 function util:setDigit(val, d, pos, base, half)
   local place = base ^ pos // 1
   local above = val - (val % (place * base))
   return above + d * place + (half and place // 2 or 0)
 end
 
--- Snap v to the next multiple of `interval` in the `dir` direction;
--- values already on a boundary move a full interval.
 function util:snapTo(v, dir, interval)
   if dir > 0 then return (math.floor(v / interval) + 1) * interval end
   return (math.ceil(v / interval) - 1) * interval
 end
 
--- Snapped or fine-nudged target clamped to [lo, hi]. With `interval`,
--- snaps to the next multiple in `dir`; without, a unit step.
 function util:nudgedScalar(v, lo, hi, dir, interval)
   local target = interval and self:snapTo(v, dir, interval) or (v + dir)
   return self:clamp(target, lo, hi)

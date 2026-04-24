@@ -1,3 +1,5 @@
+-- See docs/readium.md for the model and API reference.
+
 function loadModule(module)
   local info = debug.getinfo(1,'S')
   local script_path = info.source:match[[^@?(.*[\/])[^\/]-$]]
@@ -16,8 +18,6 @@ local function print(...)
   return util:print(...)
 end
 
----
-
 local function err_handler(err)
   reaper.ShowConsoleMsg('\nERROR:\n' .. tostring(err) .. '\n\n')
   reaper.ShowConsoleMsg(debug.traceback() .. '\n')
@@ -28,8 +28,6 @@ local function run(fn)
   reaper.ClearConsole()
   xpcall(fn, err_handler)
 end
-
----
 
 function Main()
   local item = reaper.GetSelectedMediaItem(0, 0)

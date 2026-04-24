@@ -24,9 +24,8 @@ return {
       }
       -- grid is private; reach in via chanFirstCol/chanLastCol by selecting col 1.
       h.vm:setGridSize(80, 40)
-      h.vm:selectColumn(1)
-      local row, col = h.vm:cursor()
-      t.eq(col, 1, 'cursor lands on first column')
+      h.ec:selectColumn(1)
+      t.eq(h.ec:col(), 1, 'cursor lands on first column')
     end,
   },
 
@@ -43,10 +42,10 @@ return {
       }
       h.vm:setGridSize(80, 40)
 
-      h.vm:selectChannel(1)
-      local _, col1 = h.vm:cursor()
-      h.vm:selectChannel(3)
-      local _, col3 = h.vm:cursor()
+      h.ec:selectChannel(1)
+      local col1 = h.ec:col()
+      h.ec:selectChannel(3)
+      local col3 = h.ec:col()
       t.truthy(col3 > col1, 'channel 3 column lies after channel 1 column')
     end,
   },
@@ -111,7 +110,9 @@ return {
         },
       }
       local types = {}
-      for _, col in ipairs(h.vm.grid.cols) do types[#types+1] = col.type end
+      for _, col in ipairs(h.vm.grid.cols) do
+        if col.midiChan == 1 then types[#types+1] = col.type end
+      end
       t.deepEq(types, { 'pc', 'pb', 'note', 'at', 'cc' }, 'canonical order')
     end,
   },
@@ -131,7 +132,7 @@ return {
       }
       local lanes = {}
       for _, col in ipairs(h.vm.grid.cols) do
-        if col.type == 'note' then lanes[#lanes+1] = col.lane end
+        if col.type == 'note' and col.midiChan == 1 then lanes[#lanes+1] = col.lane end
       end
       t.deepEq(lanes, { 1, 2 }, 'note cols dense lane indices')
     end,
@@ -180,10 +181,14 @@ return {
   },
 
   {
-    name = 'grid.lane1Col has no entries when no channels carry notes',
+    name = 'grid.lane1Col has an entry per channel even on an empty take',
     run = function(harness)
       local h = harness.mk()
-      t.eq(next(h.vm.grid.lane1Col), nil, 'empty')
+      for chan = 1, 16 do
+        local c = h.vm.grid.lane1Col[chan]
+        t.truthy(c, 'chan ' .. chan .. ' has a lane-1 col')
+        t.eq(c.type, 'note'); t.eq(c.lane, 1); t.eq(c.midiChan, chan)
+      end
     end,
   },
 

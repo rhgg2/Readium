@@ -81,7 +81,7 @@ return {
 
       -- Retune to 0 via tm's intent-speaking API.
       local note = h.tm:getChannel(1).columns.notes[1].events[1]
-      h.tm:retuneNote(note, { detune = 0 })
+      h.tm:assignEvent('note', note, { detune = 0 })
       h.tm:flush()
 
       local dump = h.fm:dump()

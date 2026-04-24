@@ -26,14 +26,14 @@ return {
     name = 'mm fires callbacks after modify() — tm rebuilds',
     run = function(harness)
       local h = harness.mk()
-      t.eq(#h.tm:getChannel(1).columns.notes, 0, 'no note columns initially')
+      t.eq(#h.tm:getChannel(1).columns.notes[1].events, 0, 'lane 1 empty initially')
 
       h.fm:modify(function()
         h.fm:addNote{ ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100 }
       end)
 
       -- tm only sees this if the mm callback fired AND tm is attached.
-      t.eq(#h.tm:getChannel(1).columns.notes, 1, 'note column appeared via callback chain')
+      t.eq(#h.tm:getChannel(1).columns.notes[1].events, 1, 'note landed via callback chain')
     end,
   },
 
@@ -89,7 +89,7 @@ return {
 
       local b = harness.mk()
       t.eq(#b.fm:dump().notes, 0, 'scenario B starts empty')
-      t.eq(#b.tm:getChannel(1).columns.notes, 0, 'tm in B has no columns')
+      t.eq(#b.tm:getChannel(1).columns.notes[1].events, 0, 'tm in B has empty lane 1')
     end,
   },
 
@@ -159,11 +159,11 @@ return {
         },
       }
 
-      -- Both channels should now be reachable via vm's channel selection.
-      h.vm:selectChannel(1)
-      local _, col1 = h.vm:cursor()
-      h.vm:selectChannel(5)
-      local _, col5 = h.vm:cursor()
+      -- Both channels should now be reachable via ec's channel selection.
+      h.ec:selectChannel(1)
+      local col1 = h.ec:col()
+      h.ec:selectChannel(5)
+      local col5 = h.ec:col()
       t.truthy(col1 > 0, 'channel 1 column exists after post-hoc seed')
       t.truthy(col5 > col1, 'channel 5 column lies after channel 1')
     end,

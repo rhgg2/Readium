@@ -1,31 +1,13 @@
---[[
-@noindex
---
--- microtuning.lua
---
--- Pure module: tuning library + conversions between (midi pitch, detune cents)
--- and (octave, step) under a given tuning.
---
--- All functions take an explicit tuning argument; no module-level state.
--- Two coordinate systems on the cents line:
---   MIDI:  (pitch, detune)  with detune in cents
---   Scale: (step, octave)   step is 1-indexed into tuning.cents
--- Cents 0 corresponds to C-1 (MIDI 0). The first step of every tuning is C.
---
--- Octave labels follow the ASCII-MIDI convention: C4 = MIDI 60. Octave -1
--- is rendered as "M" so the cell width stays fixed (so MIDI 0 = "C-M").
-]]--
+-- See docs/microtuning.md for the model and API reference.
+-- @noindex
 
 microtuning = {}
 local M = microtuning
 
---------------------
--- Tuning library
---------------------
+----- Tuning library
 
--- Steps from this index onward have their displayed octave bumped by +1,
--- because their note name (e.g. C↓ in 31EDO, C↓ in 53EDO) is enharmonically
--- the next C — they belong to the octave above. Auto-derived from the names.
+-- Scan from the end: every trailing C-variant step (e.g. C↓ in 31EDO)
+-- is enharmonically the next C and belongs to the octave above.
 local function computeOctaveStep(stepNames)
   for i = #stepNames, 1, -1 do
     if stepNames[i]:sub(1, 1) ~= 'C' then return i + 1 end
@@ -71,12 +53,8 @@ function M.findTuning(name)
   return M.tunings[name]
 end
 
---------------------
--- Coordinate conversions
---------------------
+----- Coordinate conversions
 
--- (midi, detune) → (step, octave). Snaps to the nearest scale point.
--- The returned octave is in MIDI octave numbering (C4 → 4, C-1 → -1).
 function M.midiToStep(tuning, midi, detune)
   detune = detune or 0
   local cents  = midi * 100 + detune
@@ -90,7 +68,7 @@ function M.midiToStep(tuning, midi, detune)
     local d = math.abs(res - steps[i])
     if d < bestDist then best, bestDist = i, d end
   end
-  -- Period boundary: step 1 of the next period sits at cents = period.
+  -- Step 1 of the next period sits at cents = period.
   if math.abs(res - period) < bestDist then
     best, octave = 1, octave + 1
   end
@@ -98,8 +76,6 @@ function M.midiToStep(tuning, midi, detune)
   return best, octave - 1
 end
 
--- (step, octave) → (midi, detune). Wraps step into [1, n], adjusting octave.
--- Clamps the resulting MIDI note to 0..127 by folding the overflow into detune.
 function M.stepToMidi(tuning, step, octave)
   local steps, n = tuning.cents, #tuning.cents
   while step < 1 do step = step + n; octave = octave - 1 end
@@ -118,23 +94,18 @@ function M.stepToMidi(tuning, step, octave)
   return midi, detune
 end
 
--- Snap a (midi, detune) onto the nearest scale point, returning the new
--- (midi, detune). Composition of midiToStep then stepToMidi.
 function M.snap(tuning, midi, detune)
   return M.stepToMidi(tuning, M.midiToStep(tuning, midi, detune))
 end
 
--- Move by n scale steps from the current (midi, detune), returning the
--- new (midi, detune). Negative n moves down. The octave carries automatically.
 function M.transposeStep(tuning, midi, detune, n)
   local step, oct = M.midiToStep(tuning, midi, detune)
   return M.stepToMidi(tuning, step + n, oct)
 end
 
---------------------
--- Display
---------------------
+----- Display
 
+-- Octave -1 renders as "M" so the cell width stays fixed.
 local function octaveLabel(o)
   return o == -1 and 'M' or tostring(o)
 end
