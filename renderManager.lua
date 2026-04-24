@@ -420,7 +420,6 @@ function newRenderManager(vm, cm, cmgr)
     local cursorRow, cursorCol = ec:row(), ec:col()
     local rowPerBeat, _, _, currentOctave, advanceBy = vm:displayParams()
     local col      = vm.grid.cols[cursorCol]
-    local ppq      = vm:rowToPPQ(cursorRow, col and col.midiChan)
     local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
     local tsLabel  = ts and string.format('%d/%d', ts.num, ts.denom) or '?'
@@ -428,8 +427,8 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.Separator(ctx)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
     ImGui.Text(ctx, string.format(
-      '%s | PPQ: %d | %d:%d.%d/%d | Octave: %d | Advance: %d',
-      colLabel, math.floor(ppq), bar, beat, sub, rowPerBeat, currentOctave, advanceBy
+      '%s | %d:%d.%d/%d | Octave: %d | Advance: %d',
+      colLabel, bar, beat, sub, rowPerBeat, currentOctave, advanceBy
     ))
     ImGui.PopStyleColor(ctx)
   end

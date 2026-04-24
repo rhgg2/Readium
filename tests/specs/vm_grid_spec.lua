@@ -51,20 +51,6 @@ return {
   },
 
   {
-    name = 'ppq<->row round-trips through vm',
-    run = function(harness)
-      local h = harness.mk{
-        seed = { resolution = 240, length = 3840 },
-      }
-      -- At 4 rows per beat, 1 row = 60 ppq.
-      t.eq(h.vm:ppqToRow(0,   1), 0)
-      t.eq(h.vm:ppqToRow(60,  1), 1)
-      t.eq(h.vm:ppqToRow(240, 1), 4)
-      t.eq(h.vm:rowToPPQ(4,   1), 240)
-    end,
-  },
-
-  {
     name = 'rowBeatInfo reports bar/beat for row 0 under 4/4',
     run = function(harness)
       local h = harness.mk()

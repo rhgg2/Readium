@@ -1804,6 +1804,107 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
+  ----- Command helpers
+
+  local function deleteOrBackspace()
+    if ec:isSticky() then deleteSelection()
+    else ec:selClear(); deleteEvent(); moveRow(advanceBy) end
+  end
+
+  local function playFromCursor()
+    local col = grid.cols[ec:col()]
+    tm:playFrom(ctx:rowToPPQ(ec:row(), col and col.midiChan))
+  end
+
+  local function addTypedColModal()
+    return 'modal', {
+      title    = 'Add Column',
+      prompt   = 'cc0-127, pb, at, pc, dly',
+      callback = addTypedColFromString,
+    }
+  end
+
+  local function setRPBModal()
+    return 'modal', {
+      title    = 'Rows per beat',
+      prompt   = '1-32',
+      callback = function(buf)
+        local n = tonumber(buf)
+        if n then vm:setRowPerBeat(n) end
+      end,
+    }
+  end
+
+  -- Toggle: snap grid to cursor event's frame, or release if already overriding.
+  -- RPB change rescales ec so the cursor stays visually put.
+  local function matchGridToCursor()
+    local oldRPB = rowPerBeat
+    if frameOverride then
+      frameOverride = nil
+    else
+      local col = grid.cols[ec:col()]
+      local evt = col and col.type == 'note' and col.cells and col.cells[ec:row()]
+      if not (evt and evt.frame) then return end
+      frameOverride = {
+        swing = evt.frame.swing,
+        col   = evt.frame.colSwing,
+        chan  = col.midiChan,
+        rpb   = evt.frame.rpb,
+      }
+    end
+    local newRPB = effectiveRPB()
+    if newRPB ~= oldRPB then ec:rescaleRow(oldRPB, newRPB) end
+    vm:rebuild({ data = true })
+  end
+
+  local function cycleTuning()
+    local names = { '12EDO', '19EDO', '31EDO', '53EDO' }
+    local cur, i = cm:get('tuning'), 0
+    for k, v in ipairs(names) do if v == cur then i = k; break end end
+    cm:set('track', 'tuning', names[(i + 1) % (#names + 1)])
+  end
+
+  -- Swing
+
+  -- 'off' is the nil-slot sentinel for cycling; in storage, absent = id.
+  local function cycleSwing()
+    local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
+    local cur = cm:get('swing') or 'off'
+    local i = 1
+    for k, v in ipairs(stops) do if v == cur then i = k; break end end
+    local next = stops[(i % #stops) + 1]
+    if next == 'off' then
+      cm:remove('take', 'swing')
+    else
+      -- Seed into project lib on first use so the slot name resolves.
+      local lib = cm:get('swings')
+      if not lib[next] then
+        local proj = cm:getAt('project', 'swings') or {}
+        proj[next] = timing.presets[next]
+        cm:set('project', 'swings', proj)
+      end
+      cm:set('take', 'swing', next)
+    end
+    util:print('swing: ' .. next)
+  end
+
+  local function setSwingComposite(name, composite)
+    if not name or name == '' then return end
+    local lib = cm:getAt('project', 'swings') or {}
+    lib[name] = composite
+    cm:set('project', 'swings', lib)
+  end
+
+  local function setSwingSlot(name)
+    if name and name ~= '' then cm:set('take', 'swing', name)
+    else cm:remove('take', 'swing') end
+  end
+
+  local function reswingPreset(name, oldComp, newComp)
+    if not name or name == '' then return end
+    reswingPresetChange(name, oldComp, newComp)
+  end
+
   -- Command table — rm binds keys to these names via cmgr.
   cmgr:registerAll{
     cursorDown     = function() moveRow(1) end,
@@ -1828,10 +1929,7 @@ function newViewManager(tm, cm, cmgr)
     cycleBlock     = function() ec:cycleHBlock() end,
     cycleVBlock    = function() ec:cycleVBlock() end,
     swapBlockEnds  = function() ec:swapEnds() end,
-    delete         = function()
-      if ec:isSticky() then deleteSelection()
-      else ec:selClear(); deleteEvent(); moveRow(advanceBy) end
-    end,
+    delete         = deleteOrBackspace,
     interpolate    = function() interpolate() end,
     deleteSel      = function() deleteSelection() end,
     copy           = function() copySelection(); ec:selClear() end,
@@ -1844,10 +1942,10 @@ function newViewManager(tm, cm, cmgr)
     noteOff        = noteOff,
     growNote       = function() adjustDuration(1) end,
     shrinkNote     = function() adjustDuration(-1) end,
-    nudgeBack    = function() adjustPosition(-1) end,
-    nudgeForward = function() adjustPosition(1) end,
-    insertRow    = function() insertRow() end,
-    deleteRow    = function() deleteRow() end,
+    nudgeBack      = function() adjustPosition(-1) end,
+    nudgeForward   = function() adjustPosition(1) end,
+    insertRow      = function() insertRow() end,
+    deleteRow      = function() deleteRow() end,
     nudgeCoarseUp   = function() nudge( 1, true)  end,
     nudgeCoarseDown = function() nudge(-1, true)  end,
     nudgeFineUp     = function() nudge( 1, false) end,
@@ -1855,115 +1953,28 @@ function newViewManager(tm, cm, cmgr)
     play           = function() tm:play() end,
     playPause      = function() tm:playPause() end,
     playFromTop    = function() tm:playFrom(0) end,
-    playFromCursor = function()
-      local col = grid.cols[ec:col()]
-      tm:playFrom(ctx:rowToPPQ(ec:row(), col and col.midiChan))
-    end,
+    playFromCursor = playFromCursor,
     stop           = function() tm:stop() end,
     addNoteCol     = function() vm:addExtraCol('note') end,
-    addTypedCol    = function()
-      return 'modal', {
-        title    = 'Add Column',
-        prompt   = 'cc0-127, pb, at, pc, dly',
-        callback = addTypedColFromString,
-      }
-    end,
+    addTypedCol    = addTypedColModal,
     hideExtraCol   = function() vm:hideExtraCol() end,
     doubleRPB      = function() vm:setRowPerBeat(rowPerBeat * 2) end,
     halveRPB       = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
-    matchGridToCursor = function()
-      local oldRPB = rowPerBeat
-      if frameOverride then
-        frameOverride = nil
-      else
-        local col = grid.cols[ec:col()]
-        local evt = col and col.type == 'note' and col.cells and col.cells[ec:row()]
-        if not (evt and evt.frame) then return end
-        frameOverride = {
-          swing = evt.frame.swing,
-          col   = evt.frame.colSwing,
-          chan  = col.midiChan,
-          rpb   = evt.frame.rpb,
-        }
-      end
-      local newRPB = effectiveRPB()
-      if newRPB ~= oldRPB then ec:rescaleRow(oldRPB, newRPB) end
-      vm:rebuild({ data = true })
-    end,
-    setRPB         = function()
-      return 'modal', {
-        title    = 'Rows per beat',
-        prompt   = '1-32',
-        callback = function(buf)
-          local n = tonumber(buf)
-          if n then vm:setRowPerBeat(n) end
-        end,
-      }
-    end,
-    cycleTuning    = function()
-      local names = { '12EDO', '19EDO', '31EDO', '53EDO' }
-      local cur, i = cm:get('tuning'), 0
-      for k, v in ipairs(names) do if v == cur then i = k; break end end
-      cm:set('track', 'tuning', names[(i + 1) % (#names + 1)])
-    end,
-    reswing                  = function() return reswing() end,
-    reswingAll               = function() reswingAll() end,
-    quantize                 = function() return quantize() end,
-    quantizeAll              = function() quantizeAll() end,
-    quantizeKeepRealised     = function() return quantizeKeepRealised() end,
-    quantizeKeepRealisedAll  = function() quantizeKeepRealisedAll() end,
-    cycleSwing     = function()
-      -- 'off' is the nil-slot sentinel for cycling; in storage, absent = id.
-      local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
-      local cur = cm:get('swing') or 'off'
-      local i = 1
-      for k, v in ipairs(stops) do if v == cur then i = k; break end end
-      local next = stops[(i % #stops) + 1]
-      if next == 'off' then
-        cm:remove('take', 'swing')
-      else
-        -- Seed the composite into the project library on first use, so
-        -- the name resolves. The project library is the sole source of
-        -- truth for name → composite; timing.presets is just seed data.
-        local lib = cm:get('swings')
-        if not lib[next] then
-          local proj = cm:getAt('project', 'swings') or {}
-          proj[next] = timing.presets[next]
-          cm:set('project', 'swings', proj)
-        end
-        cm:set('take', 'swing', next)
-      end
-      util:print('swing: ' .. next)
-    end,
-    -- Atomic write of a named composite into the project library.
-    -- composite == nil deletes the entry. Pure library mutation — the
-    -- editor pairs this with reswingPreset for live edits, or uses it
-    -- alone for create mode and intra-drag preview.
-    setSwingComposite = function(name, composite)
-      if not name or name == '' then return end
-      local lib = cm:getAt('project', 'swings') or {}
-      lib[name] = composite
-      cm:set('project', 'swings', lib)
-    end,
-    -- Reswing all events whose authoring frame references `name`,
-    -- moving their realised ppq from oldComp to newComp. Both composites
-    -- are inlined, so callers needn't coordinate with the library's
-    -- current state.
-    reswingPreset = function(name, oldComp, newComp)
-      if not name or name == '' then return end
-      reswingPresetChange(name, oldComp, newComp)
-    end,
-    -- Point the take's global swing slot at a library entry; pass nil
-    -- or '' to clear the slot (falls back to identity).
-    setSwingSlot = function(name)
-      if name and name ~= '' then cm:set('take', 'swing', name)
-      else cm:remove('take', 'swing') end
-    end,
-    -- Signal to renderManager that the swing editor should open. The
-    -- command itself mutates nothing; the editor reads cfg and writes
-    -- via setSwingComposite.
-    openSwingEditor = function() return 'swingEditor' end,
-    quit           = function() return 'quit' end,
+    matchGridToCursor = matchGridToCursor,
+    setRPB         = setRPBModal,
+    cycleTuning    = cycleTuning,
+    reswing                 = function() return reswing() end,
+    reswingAll              = function() reswingAll() end,
+    quantize                = function() return quantize() end,
+    quantizeAll             = function() quantizeAll() end,
+    quantizeKeepRealised    = function() return quantizeKeepRealised() end,
+    quantizeKeepRealisedAll = function() quantizeKeepRealisedAll() end,
+    cycleSwing        = cycleSwing,
+    setSwingComposite = setSwingComposite,
+    setSwingSlot      = setSwingSlot,
+    reswingPreset     = reswingPreset,
+    openSwingEditor   = function() return 'swingEditor' end,
+    quit              = function() return 'quit' end,
   }
 
   -- In mark mode, paste's first press is swallowed as a cancel: it pastes at
