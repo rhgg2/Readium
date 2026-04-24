@@ -13,7 +13,6 @@ function newEditCursor(deps)
   local cursorRow, cursorCol, cursorStop = 0, 1, 1
   local sel, selAnchor                   = nil, nil
   local hBlockScope, vBlockScope         = 0, 0
-  local lastCycleRow                     = nil
   local moveHook                         = nil
 
   local function selGrpAt(col, stop)
@@ -111,7 +110,7 @@ function newEditCursor(deps)
 
   local function selClear()
     sel = nil; selAnchor = nil
-    hBlockScope = 0; vBlockScope = 0; lastCycleRow = nil
+    hBlockScope = 0; vBlockScope = 0
   end
 
   local function cycleHBlock()
@@ -317,7 +316,6 @@ function newEditCursor(deps)
 
   function ec:cursorKind()                return cursorKind() end
   function ec:kindAt(col, stop)           return kindAt(col, stop) end
-  function ec:firstStopForKind(col, kind) return firstStopForKind(col, kind) end
 
   -- No-sel: degenerates to 1x1 at cursor.
   function ec:region()
@@ -328,6 +326,16 @@ function newEditCursor(deps)
     end
     local k = cursorKind()
     return cursorRow, cursorRow, cursorCol, cursorCol, k, k
+  end
+
+  -- Top-left corner of the region as an addressable position. Complement
+  -- to ec:region(): where region() returns semantic bounds, regionFrom()
+  -- returns a (row, col, stop) triple suitable for ec:setPos. Degenerates
+  -- to the cursor when no selection.
+  function ec:regionFrom()
+    if not sel then return cursorRow, cursorCol, cursorStop end
+    return sel.row1, sel.col1,
+           firstStopForKind(sel.col1, kindFromSelGrp(sel.col1, sel.selgrp1))
   end
 
   function ec:setSelection(r1, r2, c1, c2, kind1, kind2)
@@ -405,4 +413,397 @@ function newEditCursor(deps)
   end
 
   return ec
+end
+
+function newClipboard(deps)
+  local ec           = deps.ec
+  local grid         = deps.grid
+  local tm           = deps.tm
+  local cm           = deps.cm
+  local addNoteEvent = deps.addNoteEvent
+  local getCtx       = deps.getCtx
+  local getLength    = deps.getLength
+
+  local function save(clip)
+    reaper.SetExtState('rdm', 'clipboard', util:serialise(clip, { loc = true, sourceIdx = true }), false)
+  end
+
+  local function load()
+    local raw = reaper.GetExtState('rdm', 'clipboard')
+    if raw == '' then return end
+    return util:unserialise(raw)
+  end
+
+  local function collect()
+    local ctx = getCtx()
+    local r1, r2, c1, c2, kind1 = ec:region()
+    local numRows  = r2 - r1 + 1
+
+    -- Rows are encoded per source column, in that column's own swing frame,
+    -- via ppqToRow_c. Paste decodes into the destination column via
+    -- rowToPPQ_c, so the round-trip is consistent even when source and
+    -- destination columns have different effective swings.
+    local function noteEvent(col, evt, endPPQ)
+      local chan = col.midiChan
+      local ce = { row = ctx:ppqToRow(evt.ppq, chan) - r1,
+                   pitch = evt.pitch, vel = evt.vel, loc = evt.loc }
+      if util.isNote(evt) and evt.endppq <= endPPQ then
+        ce.endRow = ctx:ppqToRow(evt.endppq, chan) - r1
+      end
+      return ce
+    end
+
+    local function scalarEvent(col, evt, val)
+      return { row = ctx:ppqToRow(evt.ppq, col.midiChan) - r1, val = val, loc = evt.loc }
+    end
+
+    -- Single-column mode
+    if c1 == c2 then
+      local col = grid.cols[c1]
+      if not col then return end
+      local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+
+      local clipType, events = nil, {}
+      local emit
+      if col.type == 'note' and kind1 == 'pitch' then
+        clipType, emit = 'note', function(e) return noteEvent(col, e, endPPQ) end
+      elseif col.type == 'note' and kind1 == 'vel' then
+        clipType, emit = '7bit', function(e) return scalarEvent(col, e, e.vel) end
+      elseif col.type == 'pb' then
+        clipType, emit = 'pb',   function(e) return scalarEvent(col, e, e.val) end
+      else
+        clipType, emit = '7bit', function(e) return scalarEvent(col, e, e.val) end
+      end
+      for evt in util.between(col.events, startPPQ, endPPQ) do
+        util:add(events, emit(evt))
+      end
+
+      if #events == 0 then return end
+      return { mode = 'single', type = clipType, numRows = numRows,
+               sourceIdx = c1, events = events }
+    end
+
+    -- Multi-column mode. Each col carries (type, chanDelta, key, events):
+    --   note: key = 0-indexed positional note-col index within its source channel
+    --   cc:   key = cc number (keyed paste)
+    --   pb/pc/at: key = nil (channel singletons)
+    local cols = {}
+    local leftChan
+    local notePosByChan = {}
+    for col in ec:eachSelectedCol() do
+      leftChan = leftChan or col.midiChan
+
+      local entry = {
+        type = col.type,
+        chanDelta = col.midiChan - leftChan,
+        events = {},
+      }
+      if col.type == 'note' then
+        local n = notePosByChan[col.midiChan] or 0
+        entry.key = n
+        notePosByChan[col.midiChan] = n + 1
+      elseif col.type == 'cc' then
+        entry.key = col.cc
+      end
+
+      local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+      for evt in util.between(col.events, startPPQ, endPPQ) do
+        if col.type == 'note' then
+          util:add(entry.events, noteEvent(col, evt, endPPQ))
+        else
+          util:add(entry.events, scalarEvent(col, evt, evt.val))
+        end
+      end
+      util:add(cols, entry)
+    end
+
+    if #cols == 0 then return end
+    return { mode = 'multi', numRows = numRows, startType = cols[1].type, cols = cols }
+  end
+
+  local function pasteVelocities(events, dstCol, startPPQ, endPPQ)
+    local last = util:seek(dstCol.events, 'before', startPPQ)
+    local currentVel = last and last.vel or cm:get('defaultVelocity')
+
+    -- Delete existing PA events in the paste region
+    for evt in util.between(dstCol.events, startPPQ, endPPQ) do
+      if evt.type == 'pa' then tm:deleteEvent('pa', evt) end
+    end
+
+    -- Pass 1: carry-forward velocities onto note-ons
+    local ci = 1
+    for evt in util.between(dstCol.events, startPPQ, endPPQ) do
+      if evt.pitch then
+        while ci <= #events and events[ci].ppq <= evt.ppq do
+          if events[ci].val > 0 then
+            currentVel = util:clamp(events[ci].val, 1, 127)
+          end
+          ci = ci + 1
+        end
+        tm:assignEvent('note', evt, { vel = currentVel })
+      end
+    end
+
+    -- Pass 2: create PA events for clipboard values landing on sustain rows
+    if cm:get('polyAftertouch') then
+      for _, ce in ipairs(events) do
+        local note = util:seek(dstCol.events, 'before', ce.ppq, util.isNote)
+        if note and note.endppq > ce.ppq
+          and note.ppq ~= ce.ppq then
+          tm:addEvent('pa', {
+            ppq = ce.ppq, chan = dstCol.midiChan,
+            pitch = note.pitch, val = util:clamp(ce.val, 1, 127)
+          })
+        end
+      end
+    end
+
+    tm:flush()
+  end
+
+  local function pasteSingle(clip)
+    local ctx = getCtx()
+    local dstCol = grid.cols[ec:col()]
+    if not dstCol then return end
+    local chan = dstCol.midiChan
+    local r = ec:row()
+    local startPPQ = ctx:rowToPPQ(r, chan)
+    local endPPQ = ctx:rowToPPQ(r + clip.numRows, chan)
+    local kind = ec:cursorKind()
+
+    -- Resolve clipboard events to target PPQs, truncating past end
+    local events = {}
+    for _, ce in ipairs(clip.events) do
+      local ppq = ctx:rowToPPQ(r + ce.row, chan)
+      if ppq >= endPPQ then goto nextCe end
+      local e = util:assign({ ppq = ppq }, ce)
+      if ce.endRow then
+        e.endppq = math.min(ctx:rowToPPQ(r + ce.endRow, chan), endPPQ)
+      end
+      util:add(events, e)
+      ::nextCe::
+    end
+    table.sort(events, function(a, b) return a.ppq < b.ppq end)
+
+    if clip.type == 'note' and dstCol.type == 'note' and kind == 'pitch' then
+      local velList = {}
+      for evt in util.between(dstCol.events, startPPQ, endPPQ) do
+        if evt.pitch and evt.vel > 0 then
+          util:add(velList, { ppq = evt.ppq, val = evt.vel })
+        end
+      end
+      local last = util:seek(dstCol.events, 'before', startPPQ)
+      local currentVel = last and last.vel or cm:get('defaultVelocity')
+
+      local lastNote = util:seek(dstCol.events, 'before', startPPQ, util.isNote)
+      local nextNote = util:seek(dstCol.events, 'at-or-after', endPPQ, util.isNote)
+      local nextNotePPQ = nextNote and nextNote.ppq or getLength()
+      local lane = dstCol.lane
+
+      -- Delete in-region events directly: queueDeleteNotes' survivor-extension
+      -- fixup is for leaving a hole, but we're filling it. An extended lastNote
+      -- would overlap the new notes and force the allocator to spill on rebuild.
+      if lastNote and events[1] and lastNote.endppq > events[1].ppq then
+        tm:assignEvent('note', lastNote, { endppq = events[1].ppq })
+      end
+      for evt in util.between(dstCol.events, startPPQ, endPPQ) do
+        tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
+      end
+
+      local vi = 1
+      for _, ce in ipairs(events) do
+        while vi <= #velList and velList[vi].ppq <= ce.ppq do
+          currentVel = util:clamp(velList[vi].val, 1, 127)
+          vi = vi + 1
+        end
+        addNoteEvent(dstCol, {
+          ppq = ce.ppq,
+          endppq = ce.endppq or nextNotePPQ,
+          chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
+          lane = lane,
+        })
+      end
+      tm:flush()
+      return
+    end
+
+    if clip.type == '7bit' and dstCol.type == 'note' and kind == 'vel' then
+      pasteVelocities(events, dstCol, startPPQ, endPPQ)
+      return
+    end
+
+    if (clip.type == 'pb' and dstCol.type == 'pb')
+    or (clip.type == '7bit' and dstCol.type ~= 'note' and dstCol.type ~= 'pb') then
+      for evt in util.between(dstCol.events, startPPQ, endPPQ) do
+        tm:deleteEvent(dstCol.type, evt)
+      end
+
+      for _, ce in ipairs(events) do
+        local add = { ppq = ce.ppq, chan = dstCol.midiChan, val = ce.val }
+        if dstCol.type == 'cc' then add.cc = dstCol.cc end
+        tm:addEvent(dstCol.type, add)
+      end
+      tm:flush()
+      return
+    end
+  end
+
+  local function pasteMulti(clip)
+    local ctx = getCtx()
+    local cursor = grid.cols[ec:col()]
+    if not cursor then return end
+    -- Notes need a note-col home; other kinds paste wherever, using cursor's
+    -- channel as the anchor.
+    if clip.startType == 'note' and cursor.type ~= 'note' then return end
+
+    -- Per-channel lookup for destination columns, built lazily. Note
+    -- columns are indexed by lane (1..N, dense); cc columns by number;
+    -- singletons by type.
+    local chanInfo = {}
+    local function infoFor(chan)
+      local info = chanInfo[chan]
+      if info then return info end
+      info = { noteCols = {}, ccCols = {}, other = {} }
+      local first, last = grid.chanFirstCol[chan], grid.chanLastCol[chan]
+      local lane = 0
+      for ci = first or 1, last or 0 do
+        local col = grid.cols[ci]
+        if col.type == 'note' then
+          lane = lane + 1
+          info.noteCols[lane] = col
+        elseif col.type == 'cc' then
+          info.ccCols[col.cc] = col
+        else
+          info.other[col.type] = col
+        end
+      end
+      chanInfo[chan] = info
+      return info
+    end
+
+    local cursorNotePos = cursor.lane or 0
+
+    -- Resolve a clip col to a dst target, or nil if out of 1..16.
+    --   note: { type='note', chan, lane, col }  (col may be nil => will create)
+    --   cc:   { type='cc',   chan, ccNum, col }  (col may be nil => will create)
+    --   pb/pc/at: { type, chan, col }
+    local function resolve(clipCol)
+      local chan = cursor.midiChan + clipCol.chanDelta
+      if chan < 1 or chan > 16 then return end
+      local info = infoFor(chan)
+
+      if clipCol.type == 'note' then
+        local base = (clipCol.chanDelta == 0 and cursorNotePos > 0) and cursorNotePos or 1
+        local lane = base + clipCol.key
+        return { type = 'note', chan = chan, lane = lane, col = info.noteCols[lane] }
+      elseif clipCol.type == 'cc' then
+        return { type = 'cc', chan = chan, ccNum = clipCol.key, col = info.ccCols[clipCol.key] }
+      else
+        return { type = clipCol.type, chan = chan, col = info.other[clipCol.type] }
+      end
+    end
+
+    local cRow = ec:row()
+    for _, clipCol in ipairs(clip.cols) do
+      local r = resolve(clipCol)
+      if not r then goto nextCol end
+      local dst = r.col
+      local startPPQ = ctx:rowToPPQ(cRow, r.chan)
+      local endPPQ   = ctx:rowToPPQ(cRow + clip.numRows, r.chan)
+
+      -- Materialise clip events to target PPQs, sorted.
+      local events = {}
+      for _, ce in ipairs(clipCol.events) do
+        local ppq = ctx:rowToPPQ(cRow + ce.row, r.chan)
+        if ppq < endPPQ then
+          local e = util:assign({ ppq = ppq }, ce)
+          if ce.endRow then
+            e.endppq = math.min(ctx:rowToPPQ(cRow + ce.endRow, r.chan), endPPQ)
+          end
+          util:add(events, e)
+        end
+      end
+      table.sort(events, function(a, b) return a.ppq < b.ppq end)
+
+      -- Wipe existing events in the paste region. For notes, delete directly
+      -- rather than via queueDeleteNotes — its survivor-extension fixup is for
+      -- leaving a hole, but we're filling it. An extended last-survivor would
+      -- overlap the new notes and force the allocator to spill on rebuild.
+      -- Attached PAs cascade-delete with their host note.
+      if dst then
+        if r.type == 'note' then
+          local last = util:seek(dst.events, 'before', startPPQ, util.isNote)
+          if last and events[1] and last.endppq > events[1].ppq then
+            tm:assignEvent('note', last, { endppq = events[1].ppq })
+          end
+          for evt in util.between(dst.events, startPPQ, endPPQ, util.isNote) do
+            tm:deleteEvent('note', evt)
+          end
+        else
+          for evt in util.between(dst.events, startPPQ, endPPQ) do
+            tm:deleteEvent(r.type, evt)
+          end
+        end
+      end
+
+      -- End cap for pasted notes that lack an explicit endppq.
+      local capPPQ = endPPQ
+      if r.type == 'note' and dst then
+        local nn = util:seek(dst.events, 'at-or-after', endPPQ, util.isNote)
+        if nn then capPPQ = math.min(capPPQ, nn.ppq) end
+      end
+
+      -- Write clip events.
+      for _, e in ipairs(events) do
+        if r.type == 'note' then
+          addNoteEvent(dst, {
+            ppq = e.ppq, endppq = e.endppq or capPPQ,
+            chan = r.chan, pitch = e.pitch, vel = e.vel,
+            lane = r.lane,
+          })
+        elseif r.type == 'cc' then
+          tm:addEvent('cc', { ppq = e.ppq, chan = r.chan, cc = r.ccNum, val = e.val })
+        else
+          tm:addEvent(r.type, { ppq = e.ppq, chan = r.chan, val = e.val })
+        end
+      end
+      ::nextCol::
+    end
+    tm:flush()
+  end
+
+  local function pasteClip(clip)
+    if clip.mode == 'single' then pasteSingle(clip) else pasteMulti(clip) end
+  end
+
+  -- Drop the top `trim` rows of a clip in place, re-indexing surviving events.
+  -- A note whose start row falls within the trimmed band is dropped entirely.
+  local function trimTop(clip, trim)
+    local function filter(events)
+      local i = 1
+      for _, e in ipairs(events) do
+        if e.row >= trim then
+          e.row = e.row - trim
+          if e.endRow then e.endRow = e.endRow - trim end
+          events[i] = e
+          i = i + 1
+        end
+      end
+      for j = #events, i, -1 do events[j] = nil end
+    end
+    clip.numRows = clip.numRows - trim
+    if clip.mode == 'single' then
+      filter(clip.events)
+    else
+      for _, c in ipairs(clip.cols) do filter(c.events) end
+    end
+  end
+
+  local clipboard = {}
+  function clipboard:collect()           return collect() end
+  function clipboard:copy()              local c = collect(); if c then save(c) end end
+  function clipboard:paste()             local c = load(); if c then pasteClip(c) end end
+  function clipboard:pasteClip(clip)     pasteClip(clip) end
+  function clipboard:trimTop(clip, trim) trimTop(clip, trim) end
+  return clipboard
 end

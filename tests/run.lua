@@ -24,6 +24,7 @@ local specs = {
   'vm_editing_spec',
   'view_context_spec',
   'edit_cursor_spec',
+  'clipboard_spec',
 }
 
 local pass, fail, failures = 0, 0, {}

@@ -109,7 +109,7 @@ The cursor and selection live in a `newEditCursor` factory in
 via `vm:ec()`. ec owns: position (`row/col/stop/setPos/clampPos`),
 motion (`moveRow/Stop/Col/Channel`), selection
 (`selStart/Update/Clear/isSticky/unstick/swapEnds/cycleHBlock/VBlock/setSelection/shiftSelection/selectChannel/Column/eachSelectedCol`),
-kind (`cursorKind/kindAt/firstStopForKind/region/selectionStopSpan`),
+kind (`cursorKind/kindAt/region/regionFrom/selectionStopSpan`),
 grid-column kind decoration (`decorateCol`), and lifecycle
 (`reset/rescaleRow`). Cursor-axis clamping lives in `ec:clampPos`;
 viewport follow stays vm-side because it touches scrollRow/scrollCol
@@ -214,7 +214,15 @@ and optionally auditions the new pitch.
 
 ## Clipboard
 
-The clipboard is stored in REAPER ExtState under `rdm.clipboard`,
+The clipboard lives in a `newClipboard` factory in `editCursor.lua`
+(co-located with ec, since clipboard reads ec's region/eachSelectedCol/
+cursorKind to drive collect and paste). vm constructs it once over
+`{ ec, grid, tm, cm, addNoteEvent, getCtx, getLength }` and exposes it
+via `vm:clipboard()`. Public surface: `collect`, `copy`, `paste`,
+`pasteClip(clip)` (paste a given clip without touching ExtState — used
+by `duplicate`), `trimTop(clip, n)`.
+
+The persistent store is REAPER ExtState under `rdm.clipboard`,
 serialised via `util:serialise` with `loc` / `sourceIdx` stripped.
 
 Clip events encode rows in the **source column's** own swing frame;
@@ -246,9 +254,11 @@ cc/singleton column) are skipped. Notes anchor to the cursor's lane,
 other clip cols shift relative.
 
 `duplicate(dir)` copies the selection to the adjacent block without
-touching the user clipboard. Going up past row 0 `trimClipTop`s the
-clip in place — the start of the block is cut off, not the end — so
-selection follows and repeated invocations stack cleanly.
+touching the user clipboard: it calls `clipboard:collect()` and
+`clipboard:pasteClip(clip)` directly. Going up past row 0
+`clipboard:trimTop`s the clip in place — the start of the block is cut
+off, not the end — so selection follows and repeated invocations stack
+cleanly.
 
 ## Reswing / quantize
 

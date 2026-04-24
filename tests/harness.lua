@@ -59,7 +59,8 @@ function harness.mk(opts)
   local cmgr = newCommandManager(cm)
   local vm = newViewManager(tm, cm, cmgr)
 
-  return { fm = mm, cm = cm, tm = tm, vm = vm, ec = vm:ec(), cmgr = cmgr, reaper = fakeReaper }
+  return { fm = mm, cm = cm, tm = tm, vm = vm, ec = vm:ec(),
+           clipboard = vm:clipboard(), cmgr = cmgr, reaper = fakeReaper }
 end
 
 return harness

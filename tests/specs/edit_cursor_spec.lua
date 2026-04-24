@@ -252,6 +252,75 @@ return {
     end,
   },
 
+  -- 4b. duplicate's sel path. pasteSingle branches on ec:cursorKind(),
+  -- which reads the stop ec lands on before paste. The invariant is
+  -- that the pre-paste stop shares a kind with sel.col1/kind1 — held
+  -- today by firstStopForKind(c1, kind1), and by the regionFrom verb
+  -- that replaces it. Pitch and vel probe distinct paste branches;
+  -- together they catch a kind-dispatch regression in the refactor.
+  {
+    name = 'duplicateDown with 1x1 pitch-kind sel clones cursor-row note',
+    run = function(harness)
+      local h = mkNoteHarness(harness)
+      h.ec:setPos(4, 1, 1)  -- pitch stop
+      degenerateSel(h)
+      h.cmgr.commands.duplicateDown()
+
+      local notes = h.fm:dump().notes
+      t.eq(#notes, 2, 'one new note created')
+      local orig, clone
+      for _, n in ipairs(notes) do
+        if     n.ppq == 240 then orig  = n
+        elseif n.ppq == 300 then clone = n end
+      end
+      t.truthy(orig,  'original preserved at ppq=240')
+      t.truthy(clone, 'clone lands at ppq=300 (one row below)')
+      t.eq(clone.pitch, 60, 'pitch-kind paste reproduces pitch')
+      t.eq(clone.vel,   100)
+    end,
+  },
+
+  -- 4c. Kind-width counterpart: 1x1 sel on a vel stop (selGrp 2, stop 3
+  -- on a plain note col). pasteSingle's vel branch requires an existing
+  -- note at the target row, so seed two notes and verify the source vel
+  -- is written onto the target note. Pinning this guards against a
+  -- regionFrom implementation that lands on stop 1 (pitch) instead of
+  -- the first stop of kind1 (vel) — the paste would silently take the
+  -- pitch branch and blow away the target note.
+  {
+    name = 'duplicateDown with 1x1 vel-kind sel copies vel to target-row note',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 240, endppq = 300, chan = 1, pitch = 60, vel = 77,
+              detune = 0, delay = 0 },
+            { ppq = 300, endppq = 360, chan = 1, pitch = 62, vel = 100,
+              detune = 0, delay = 0 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(4, 1, 3)  -- vel stop on the row-4 note
+      degenerateSel(h)
+      h.cmgr.commands.duplicateDown()
+
+      -- Target is row 5 (ppq=300) — the second note. Its vel should
+      -- now carry the source vel (77), not its own (100).
+      local notes = h.fm:dump().notes
+      t.eq(#notes, 2, 'no new note created by vel paste')
+      local src, dst
+      for _, n in ipairs(notes) do
+        if     n.ppq == 240 then src = n
+        elseif n.ppq == 300 then dst = n end
+      end
+      t.truthy(src and dst, 'both notes present')
+      t.eq(src.vel, 77,  'source note vel unchanged')
+      t.eq(dst.vel, 77,  'target note vel copied from source')
+      t.eq(dst.pitch, 62, 'target note pitch untouched (vel-only paste)')
+    end,
+  },
+
   -- 5a. adjustPosition (nudgeForward) with no sel moves the cursor-row
   -- note's ppq forward by rowPerBeat-unit. cursorNoteBefore → at-or-
   -- before means cursor on the note's row picks up the note.
