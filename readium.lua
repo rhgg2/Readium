@@ -11,6 +11,7 @@ loadModule('configManager')
 loadModule('midiManager')
 loadModule('trackerManager')
 loadModule('commandManager')
+loadModule('editCursor')
 loadModule('viewManager')
 loadModule('renderManager')
 

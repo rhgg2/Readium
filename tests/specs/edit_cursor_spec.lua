@@ -298,4 +298,65 @@ return {
       t.eq(n.endppq, 300, 'endppq truncated to cursor row ppq')
     end,
   },
+
+  -- 6. ec:eachSelectedCol — iterator pins. Seeds three chans so the grid
+  -- has multiple note cols; tests no-sel / 1×1 / multi-col behaviour.
+  {
+    name = 'eachSelectedCol yields nothing when no selection is active',
+    run = function(harness)
+      local h = mkNoteHarness(harness)
+      local n = 0
+      for _ in h.ec:eachSelectedCol() do n = n + 1 end
+      t.eq(n, 0, 'no iterations when sel == nil')
+    end,
+  },
+
+  {
+    name = 'eachSelectedCol yields (col, ci) for each column in the selection',
+    run = function(harness)
+      local h = harness.mk{
+        seed = { notes = {
+          { ppq=0, endppq=60, chan=1, pitch=60, vel=100 },
+          { ppq=0, endppq=60, chan=2, pitch=60, vel=100 },
+          { ppq=0, endppq=60, chan=3, pitch=60, vel=100 },
+        }},
+      }
+      h.vm:setGridSize(80, 40)
+      h.ec:setSelection(0, 0, 1, 3, 'pitch', 'pitch')
+
+      local got = {}
+      for col, ci in h.ec:eachSelectedCol() do
+        got[#got + 1] = { ci = ci, chan = col.midiChan }
+      end
+      t.eq(#got, 3, 'three cols yielded for a 3-col selection')
+      t.eq(got[1].ci, 1,   'first ci = col1')
+      t.eq(got[3].ci, 3,   'last ci = col2')
+      t.eq(got[1].chan, 1, 'first col is chan 1')
+      t.eq(got[3].chan, 3, 'last col is chan 3')
+    end,
+  },
+
+  -- vm:showDelay routed through the iterator: enabling delay via a
+  -- selection flips exactly the selected note cols, not the grid at large.
+  {
+    name = 'vm:showDelay enables delay on every note col in the selection',
+    run = function(harness)
+      local h = harness.mk{
+        seed = { notes = {
+          { ppq=0, endppq=60, chan=1, pitch=60, vel=100 },
+          { ppq=0, endppq=60, chan=2, pitch=60, vel=100 },
+          { ppq=0, endppq=60, chan=3, pitch=60, vel=100 },
+        }},
+      }
+      h.vm:setGridSize(80, 40)
+      h.ec:setSelection(0, 0, 1, 2, 'pitch', 'pitch')  -- chans 1..2
+
+      h.vm:showDelay()
+      local nd = h.cm:get('noteDelay')
+
+      t.truthy(nd[1] and nd[1][1], 'delay enabled on chan 1 lane 1')
+      t.truthy(nd[2] and nd[2][1], 'delay enabled on chan 2 lane 1')
+      t.falsy (nd[3] and nd[3][1], 'delay untouched on unselected chan 3')
+    end,
+  },
 }
