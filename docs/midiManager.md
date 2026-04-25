@@ -170,3 +170,17 @@ mm:timeSigs()            -> array of { ppq, num, denom } in take-relative ppq
                          -- subsequent entries are markers strictly inside the take
                          -- tempo-only markers (num==0) are skipped
 ```
+
+### Interpolation
+
+```
+mm:interpolate(A, B, ppq) -> val at ppq between scalar events A and B
+```
+
+Uses the shape/tension carried on A (REAPER convention: a point's shape
+governs the curve from that point to the next). Returns `A.val` for
+`step` / no-shape / zero-span pairs. Shape evaluation uses the standard
+REAPER codes (`linear`, `slow`, `fast-start`, `fast-end`) plus a
+recovered cubic-Bézier handle table indexed by tension ∈ [-1, 1].
+
+Pure function of its arguments — no take state touched.

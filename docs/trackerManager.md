@@ -305,6 +305,9 @@ tm:length()                 -> take length in PPQ
 tm:resolution()             -> PPQ per quarter note
 tm:timeSigs()               -> array of { ppq, num, denom }
 tm:editCursor()             -> edit cursor in take-relative PPQ
+tm:interpolate(A, B, ppq)   -> passthrough to mm:interpolate; value at ppq
+                               between scalar events A and B, using A's
+                               shape / tension
 ```
 
 ### Swing

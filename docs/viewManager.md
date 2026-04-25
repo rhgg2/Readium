@@ -12,7 +12,7 @@ swing snapshot, `rowPPQs` (prefix array of PPQ per row boundary),
 a function of the bound state plus its args — no callbacks, no
 mutation. Throw it away and rebuild a new one; there is no migration.
 
-Three responsibilities:
+Two responsibilities:
 
 - **Row ↔ PPQ projection.** `ppqToRow(ppq, chan)` binary-searches
   `rowPPQs`, unapplying channel-relevant swing first; `rowToPPQ` is the
@@ -21,12 +21,18 @@ Three responsibilities:
 - **Tuning lens.** `noteProjection(evt)` resolves `(pitch, detune)`
   into `(label, gap, halfGap)` under the bound microtuning, or nil if
   none active.
-- **Ghost sampling.** `sampleGhosts(events, chan, occupied)` walks
-  consecutive scalar pairs whose first event has a non-step shape and
-  produces interpolated cell values for the rows between them.
-  REAPER's shape codes (`linear`, `slow`, `fast-start`, `fast-end`,
-  `bezier`) evaluate via a recovered bezier handle table for the
-  tension slider.
+
+## Ghost sampling
+
+For each consecutive scalar pair whose first event has a non-step
+shape, `vm:rebuild` samples the curve at every row strictly between
+A and B (skipping occupied rows) and writes `{ val, fromEvt, toEvt }`
+into `gridCol.ghosts[y]` for rm to render. The sample point for row
+`y` is `ctx:rowToPPQ(y, chan)` — so under swing the ghost reflects
+the value at the row's realised time, not at "fraction of rows
+traversed". Curve evaluation is delegated to `tm:interpolate` (which
+forwards to `mm:interpolate`); the shape / tension / bezier-handle
+table are owned by midiManager.
 
 `pa` events are not ghosted — they live inside note columns.
 

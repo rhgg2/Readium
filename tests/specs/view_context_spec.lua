@@ -196,36 +196,6 @@ return {
   ---------- TIME SIGNATURE / METERING
 
   {
-    name = 'timeSigAt: returns the active ts before and after a change',
-    run = function()
-      local ctx = mkCtx{
-        timeSigs = {
-          { ppq = 0,    num = 4, denom = 4 },
-          { ppq = 1920, num = 3, denom = 4 },
-        },
-      }
-      t.eq(ctx:timeSigAt(0).num,    4)
-      t.eq(ctx:timeSigAt(1919).num, 4)
-      t.eq(ctx:timeSigAt(1920).num, 3)
-      t.eq(ctx:timeSigAt(9999).num, 3)
-    end,
-  },
-
-  {
-    name = 'tsRow: returns the row of a time-sig start',
-    run = function()
-      local ctx = mkCtx{
-        timeSigs = {
-          { ppq = 0,    num = 4, denom = 4 },
-          { ppq = 1920, num = 3, denom = 4 },
-        },
-      }
-      t.eq(ctx:tsRow(ctx:timeSigAt(0)), 0)
-      t.eq(ctx:tsRow(ctx:timeSigAt(1920)), 32)  -- 1920 ppq / 60 ppq-per-row
-    end,
-  },
-
-  {
     name = 'rowBeatInfo at row 0 under 4/4 reports (bar, beat) = (true, true)',
     run = function()
       local bar, beat = mkCtx():rowBeatInfo(0)
@@ -320,78 +290,6 @@ return {
     end,
   },
 
-  ---------- GHOST SAMPLING
-
-  {
-    name = 'sampleGhosts: linear shape interpolates val proportionally',
-    run = function()
-      local ctx = mkCtx()
-      -- Two events 4 rows apart (ppq 0 and 240), linear shape, vals 0 → 100.
-      local A = { ppq = 0,   val = 0,   shape = 'linear' }
-      local B = { ppq = 240, val = 100 }
-      local ghosts = ctx:sampleGhosts({ A, B }, 1, nil)
-      -- Rows 1, 2, 3 should hold ghosts. Row 2 is the midpoint ⇒ val = 50.
-      t.truthy(ghosts[1], 'ghost at row 1')
-      t.eq(ghosts[2].val, 50, 'midpoint ghost val')
-      t.truthy(ghosts[3], 'ghost at row 3')
-      t.eq(ghosts[0], nil, 'no ghost on row 0 (host A)')
-      t.eq(ghosts[4], nil, 'no ghost on row 4 (host B)')
-    end,
-  },
-
-  {
-    name = 'sampleGhosts: step shape produces no ghosts',
-    run = function()
-      local ctx = mkCtx()
-      local A = { ppq = 0,   val = 0,   shape = 'step' }
-      local B = { ppq = 240, val = 100 }
-      t.eq(next(ctx:sampleGhosts({ A, B }, 1, nil)), nil)
-    end,
-  },
-
-  {
-    name = 'sampleGhosts: nil shape produces no ghosts',
-    run = function()
-      local ctx = mkCtx()
-      local A = { ppq = 0,   val = 0 }
-      local B = { ppq = 240, val = 100 }
-      t.eq(next(ctx:sampleGhosts({ A, B }, 1, nil)), nil)
-    end,
-  },
-
-  {
-    name = 'sampleGhosts: skips rows in the occupied predicate',
-    run = function()
-      local ctx = mkCtx()
-      local A = { ppq = 0,   val = 0,   shape = 'linear' }
-      local B = { ppq = 240, val = 100 }
-      local ghosts = ctx:sampleGhosts({ A, B }, 1, { [2] = true })
-      t.truthy(ghosts[1], 'row 1 still ghosted')
-      t.eq(ghosts[2], nil, 'row 2 skipped because occupied')
-      t.truthy(ghosts[3], 'row 3 still ghosted')
-    end,
-  },
-
-  {
-    name = 'sampleGhosts: ghost entries carry fromEvt and toEvt references',
-    run = function()
-      local ctx = mkCtx()
-      local A = { ppq = 0,   val = 0,   shape = 'linear' }
-      local B = { ppq = 240, val = 100 }
-      local g = ctx:sampleGhosts({ A, B }, 1, nil)[2]
-      t.eq(g.fromEvt, A)
-      t.eq(g.toEvt,   B)
-    end,
-  },
-
-  {
-    name = 'sampleGhosts: a single event yields no ghosts (no following pair)',
-    run = function()
-      local ctx = mkCtx()
-      t.eq(next(ctx:sampleGhosts({ { ppq = 0, val = 0, shape = 'linear' } }, 1, nil)), nil)
-    end,
-  },
-
   ---------- VM ↔ CTX WIRING
   --
   -- These pin that vm:rebuild produces a fresh ctx from the current
@@ -419,8 +317,13 @@ return {
     end,
   },
 
+  -- Ghost-sampling coverage runs through the vm surface (gridCol.ghosts)
+  -- because that's the contract rm consumes. Shape semantics themselves
+  -- are owned by midiManager (mm:interpolate); these tests only pin that
+  -- the vm→tm→mm pathway wires up correctly and preserves val/refs.
+
   {
-    name = 'rebuild populates ghost cells on non-step scalar columns',
+    name = 'ghosts: linear pair populates interior rows with proportional vals',
     run = function(harness)
       local h = harness.mk{
         seed = {
@@ -435,15 +338,39 @@ return {
         if c.type == 'cc' and c.cc == 1 then ccCol = c end
       end
       t.truthy(ccCol,             'cc column built')
-      t.truthy(ccCol.ghosts,      'ghosts table present')
-      t.truthy(ccCol.ghosts[1],   'ghost at row 1 between linear pair')
-      t.truthy(ccCol.ghosts[2],   'ghost at row 2 between linear pair')
-      t.truthy(ccCol.ghosts[3],   'ghost at row 3 between linear pair')
+      t.truthy(ccCol.ghosts[1],   'ghost at row 1')
+      t.eq(ccCol.ghosts[2].val, 50, 'linear midpoint val')
+      t.truthy(ccCol.ghosts[3],   'ghost at row 3')
+      t.eq(ccCol.ghosts[0], nil,  'no ghost on row 0 (host A)')
+      t.eq(ccCol.ghosts[4], nil,  'no ghost on row 4 (host B)')
     end,
   },
 
   {
-    name = 'rebuild does NOT populate ghosts when shape is step',
+    name = 'ghosts: entries carry fromEvt and toEvt references',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          ccs = {
+            { ppq = 0,   chan = 1, msgType = 'cc', cc = 1, val = 0,   shape = 'linear' },
+            { ppq = 240, chan = 1, msgType = 'cc', cc = 1, val = 100 },
+          },
+        },
+      }
+      local ccCol
+      for _, c in ipairs(h.vm.grid.cols) do
+        if c.type == 'cc' and c.cc == 1 then ccCol = c end
+      end
+      local g = ccCol.ghosts[2]
+      t.eq(g.fromEvt.ppq, 0,   'fromEvt is A (ppq 0)')
+      t.eq(g.fromEvt.val, 0,   'fromEvt val is A.val')
+      t.eq(g.toEvt.ppq,   240, 'toEvt is B (ppq 240)')
+      t.eq(g.toEvt.val,   100, 'toEvt val is B.val')
+    end,
+  },
+
+  {
+    name = 'ghosts: step shape produces no ghosts',
     run = function(harness)
       local h = harness.mk{
         seed = {
@@ -458,6 +385,45 @@ return {
           t.eq(next(c.ghosts or {}), nil, 'no ghosts under step shape')
         end
       end
+    end,
+  },
+
+  {
+    name = 'ghosts: single event yields no ghosts',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          ccs = {
+            { ppq = 0, chan = 1, msgType = 'cc', cc = 1, val = 0, shape = 'linear' },
+          },
+        },
+      }
+      for _, c in ipairs(h.vm.grid.cols) do
+        if c.type == 'cc' and c.cc == 1 then
+          t.eq(next(c.ghosts or {}), nil, 'no ghosts without a following pair')
+        end
+      end
+    end,
+  },
+
+  {
+    name = 'ghosts: non-linear shape routes through tm:interpolate',
+    -- Pins that shape other than linear/step actually reaches the
+    -- interpolator; t=0.5 under bezier tension 0 ≡ linear midpoint.
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          ccs = {
+            { ppq = 0,   chan = 1, msgType = 'cc', cc = 1, val = 0,   shape = 'bezier', tension = 0 },
+            { ppq = 240, chan = 1, msgType = 'cc', cc = 1, val = 100 },
+          },
+        },
+      }
+      local ccCol
+      for _, c in ipairs(h.vm.grid.cols) do
+        if c.type == 'cc' and c.cc == 1 then ccCol = c end
+      end
+      t.eq(ccCol.ghosts[2].val, 50, 'bezier@tension=0 midpoint matches linear')
     end,
   },
 

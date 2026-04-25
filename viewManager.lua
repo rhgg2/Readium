@@ -19,16 +19,29 @@ function newViewContext(args)
   local rowPerBeat = args.rowPerBeat
   local timeSigs   = args.timeSigs
   local tuning     = args.tuning
+  local ctx        = {}
 
-  ----- Curve shapes
-  --
-  -- Single consumer is sampleGhosts below. Bezier handle table recovered
-  -- from REAPER's `bezier` shape; indexed by |τ| at 0.1 steps. Row format:
-  -- { h, θ_large (rad), θ_small (rad) }. See design/curves.md.
+  ----- Tuning
 
-  local ctx = {}
+  function ctx:activeTuning() return tuning end
 
-  ----- Ppq / row
+  function ctx:noteProjection(evt)
+    if not (tuning and evt and evt.pitch) then return end
+    local detune    = evt.detune or 0
+    local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
+    local label     = microtuning.stepToText(tuning, step, oct)
+    local tm_, td_  = microtuning.stepToMidi(tuning, step, oct)
+    local gap       = (evt.pitch * 100 + detune) - (tm_ * 100 + td_)
+
+    local steps, n, period = tuning.cents, #tuning.cents, tuning.period
+    local left    = step == 1 and steps[n] - period or steps[step - 1]
+    local right   = step == n and steps[1] + period or steps[step + 1]
+    local halfGap = math.min(steps[step] - left, right - steps[step]) / 2
+
+    return label, gap, halfGap
+  end
+
+  ----- Timing
 
   function ctx:ppqToRow(ppq, chan)
     ppq = swing.unapply(chan, ppq)
@@ -56,92 +69,46 @@ function newViewContext(args)
 
   function ctx:snapRow(ppq, chan) return util:round(self:ppqToRow(ppq, chan)) end
 
-  ----- Tuning
-
-  function ctx:activeTuning() return tuning end
-
-  function ctx:noteProjection(evt)
-    if not (tuning and evt and evt.pitch) then return end
-    local detune    = evt.detune or 0
-    local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
-    local label     = microtuning.stepToText(tuning, step, oct)
-    local tm_, td_  = microtuning.stepToMidi(tuning, step, oct)
-    local gap       = (evt.pitch * 100 + detune) - (tm_ * 100 + td_)
-
-    local steps, n, period = tuning.cents, #tuning.cents, tuning.period
-    local left    = step == 1 and steps[n] - period or steps[step - 1]
-    local right   = step == n and steps[1] + period or steps[step + 1]
-    local halfGap = math.min(steps[step] - left, right - steps[step]) / 2
-
-    return label, gap, halfGap
-  end
-
-  ----- Timing
-
-  function ctx:timeSigAt(ppq)
-    local active = timeSigs[1]
-    for i = 2, #timeSigs do
-      if timeSigs[i].ppq <= ppq then active = timeSigs[i]
-      else break end
-    end
-    return active
-  end
-
-  -- Time sigs land on bar boundaries — swing fixpoints — so the round-trip
-  -- through ppqToRow is stable and the floor is exact.
-  function ctx:tsRow(ts) return math.floor(self:ppqToRow(ts.ppq)) end
-
-  function ctx:rowBeatInfo(row)
-    local ts = self:timeSigAt(self:rowToPPQ(row))
-    if not ts then return false, false end
-    local rel = row - self:tsRow(ts)
-    return rel % (rowPerBeat * ts.num) == 0, rel % rowPerBeat == 0
-  end
-
-  function ctx:barBeatSub(row)
-    local bar = 1
-    for i, ts in ipairs(timeSigs) do
-      local rpbar   = rowPerBeat * ts.num
-      local next_   = timeSigs[i + 1]
-      local nextRow = next_ and self:tsRow(next_) or math.huge
-      if row < nextRow then
-        local rel = row - self:tsRow(ts)
-        return bar + rel // rpbar,
-               (rel % rpbar) // rowPerBeat + 1,
-               rel % rowPerBeat + 1,
-               ts
+  do -- exports ctx:rowBeatInfo, ctx:barBeatSub
+    local function timeSigAt(ppq)
+      local active = timeSigs[1]
+      for i = 2, #timeSigs do
+        if timeSigs[i].ppq <= ppq then active = timeSigs[i]
+        else break end
       end
-      bar = bar + (nextRow - self:tsRow(ts)) // rpbar
+      return active
     end
-    return bar, 1, 1, timeSigs[1]
-  end
+  
+    -- Time sigs land on bar boundaries — swing fixpoints — so the round-trip
+    -- through ppqToRow is stable and the floor is exact.
+    local function tsRow(ts) return math.floor(ctx:ppqToRow(ts.ppq)) end
 
-  ----- Ghosts
+    function ctx:rowBeatInfo(row)
+      local ts = timeSigAt(self:rowToPPQ(row))
+      if not ts then return false, false end
+      local rel = row - tsRow(ts)
+      return rel % (rowPerBeat * ts.num) == 0, rel % rowPerBeat == 0
+    end
 
-  -- Occupied[y] truthy means a real event already lives at row y — skip.
-  -- Shape of A governs the pair (A, B).
-  function ctx:sampleGhosts(events, chan, occupied)
-    local ghosts = {}
-    for i = 1, #events - 1 do
-      local A, B = events[i], events[i + 1]
-      local shape = A.shape
-      if shape and shape ~= 'step' then
-        local rA = self:ppqToRow(A.ppq, chan)
-        local rB = self:ppqToRow(B.ppq, chan)
-        local yA, yB = util:round(rA), util:round(rB)
-        local span, delta = rB - rA, (B.val or 0) - (A.val or 0)
-        for y = yA + 1, yB - 1 do
-          if y >= 0 and y < numRows and not (occupied and occupied[y]) then
-            local t   = (y - rA) / span
-            local val = (A.val or 0) + curveSample(shape, A.tension, t) * delta
-            ghosts[y] = { val = util:round(val), fromEvt = A, toEvt = B }
-          end
+    function ctx:barBeatSub(row)
+      local bar = 1
+      for i, ts in ipairs(timeSigs) do
+        local rpbar   = rowPerBeat * ts.num
+        local next_   = timeSigs[i + 1]
+        local nextRow = next_ and tsRow(next_) or math.huge
+        if row < nextRow then
+          local rel = row - tsRow(ts)
+          return bar + rel // rpbar,
+            (rel % rpbar) // rowPerBeat + 1,
+            rel % rowPerBeat + 1,
+            ts
         end
+        bar = bar + (nextRow - tsRow(ts)) // rpbar
       end
+      return bar, 1, 1, timeSigs[1]
     end
-    return ghosts
   end
-
+  
   return ctx
 end
 
@@ -174,31 +141,40 @@ function newViewManager(tm, cm, cmgr)
   local ec, clipboard, ctx
 
   -- Scalar column types whose consecutive events can be interpolated.
-  local ghostable = { cc = true, pb = true, at = true, pc = true }
+  local interpolable = { cc = true, pb = true, at = true }
 
-  ----- Frame override
-
-  local function effectiveSwing()
-    if frameOverride then return frameOverride.swing end
-    return cm:get('swing')
-  end
-
-  local function effectiveColSwing(chan)
-    if frameOverride and frameOverride.chan == chan then return frameOverride.col end
-    return cm:get('colSwing')[chan]
-  end
-
-  local function effectiveRPB()
-    return (frameOverride and frameOverride.rpb) or cm:get('rowPerBeat')
+  local function interpolateValues(events, chan, occupied)
+    local ghosts = {}
+    for i = 1, #events - 1 do
+      local A, B = events[i], events[i + 1]
+      if A.shape and A.shape ~= 'step' then
+        local rA = ctx:ppqToRow(A.ppq, chan)
+        local rB = ctx:ppqToRow(B.ppq, chan)
+        for y = util:round(rA) + 1, util:round(rB) - 1 do
+          if y >= 0 and y < grid.numRows and not (occupied and occupied[y]) then
+            local val = tm:interpolate(A, B, ctx:rowToPPQ(y, chan))
+            ghosts[y] = { val = util:round(val), fromEvt = A, toEvt = B }
+          end
+        end
+      end
+    end
+    return ghosts
   end
 
   -- Bookmark stamped onto a new note — captures the authoring frame so
   -- matchGridToCursor can restore it later.
   local function currentFrame(chan)
+    if frameOverride then
+      return {
+        swing    = frameOverride.swing,
+        colSwing = frameOverride.chan == chan and frameOverride.col or cm:get('colSwing')[chan],
+        rpb      = frameOverride.rpb,
+      }
+    end
     return {
-      swing    = effectiveSwing(),
-      colSwing = effectiveColSwing(chan),
-      rpb      = effectiveRPB(),
+      swing    = cm:get('swing'),
+      colSwing = cm:get('colSwing')[chan],
+      rpb      = cm:get('rowPerBeat'),
     }
   end
 
@@ -598,7 +574,7 @@ function newViewManager(tm, cm, cmgr)
       if ec:hasSelection() then
         local r1, r2 = ec:region()
         for col in ec:eachSelectedCol() do
-          if ghostable[col.type] then
+          if interpolable[col.type] then
             local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
             local prev
             for evt in util.between(col.events, startPPQ, endPPQ) do
@@ -612,7 +588,7 @@ function newViewManager(tm, cm, cmgr)
       end
 
       local col = grid.cols[ec:col()]
-      if not (col and ghostable[col.type]) then return end
+      if not (col and interpolable[col.type]) then return end
       local r = ec:row()
       local ghost = col.ghosts and col.ghosts[r]
       local A = ghost and ghost.fromEvt
@@ -1800,8 +1776,8 @@ function newViewManager(tm, cm, cmgr)
       end
 
       for _, gridCol in ipairs(grid.cols) do
-        if ghostable[gridCol.type] then
-          gridCol.ghosts = ctx:sampleGhosts(gridCol.events, gridCol.midiChan, gridCol.cells)
+        if interpolable[gridCol.type] then
+          gridCol.ghosts = interpolateValues(gridCol.events, gridCol.midiChan, gridCol.cells)
         end
       end
 

@@ -795,6 +795,10 @@ function newTrackerManager(mm, cm)
     return mm and mm:timeSigs() or {}
   end
 
+  function tm:interpolate(A, B, ppq)
+    return mm and mm:interpolate(A, B, ppq)
+  end
+
   -- E_c: column is inner, global is outer (see design/swing.md).
   function tm:swingSnapshot(override)
     local global, column = nil, {}
