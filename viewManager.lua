@@ -135,24 +135,20 @@ function newViewManager(tm, cm, cmgr)
     chanLastCol  = {},
   }
 
+  local vm = {}
+  vm.grid = grid  -- live handle for rm; mutated in place on rebuild
+
   local ec, clipboard, ctx
 
   -- Scalar column types whose consecutive events can be interpolated.
   local interpolable = { cc = true, pb = true, at = true }
 
-  local vm = {}
-  vm.grid = grid  -- live handle for rm; mutated in place on rebuild
-
   ----- Frames
 
-  -- Keys that constitute a "frame": swing slot, per-column swing map,
-  -- and rowPerBeat. matchGridToCursor writes them as a unit at the
-  -- transient tier; toolbar edits at any persisted tier release them.
+  -- An authoring frame comprises swing slot, per-column swing map,
+  -- and rowPerBeat.
   local FRAME_KEYS = { swing = true, colSwing = true, rowPerBeat = true }
 
-  -- Bookmark stamped onto a new note — captures the authoring frame so
-  -- matchGridToCursor can later reinstate it. Reads merged cm, so a
-  -- transient-tier override is naturally inherited.
   local function currentFrame(chan)
     return {
       swing    = cm:get('swing'),
@@ -161,18 +157,16 @@ function newViewManager(tm, cm, cmgr)
     }
   end
 
-  local function frameTransientActive()
-    for k in pairs(FRAME_KEYS) do
-      if cm:getAt('transient', k) ~= nil then return true end
-    end
-    return false
-  end
-
   -- Drop the transient frame override (if any) and re-align ec to the
-  -- rpb that surfaces from underneath. Used both by matchGridToCursor's
-  -- toggle-off and by configCallback when a real edit lands on a frame
-  -- key while transient is active.
+  -- rpb that surfaces from underneath. Returns true if a frame was
+  -- released, false otherwise.
   local function releaseTransientFrame()
+    local releasing = false
+    for k in pairs(FRAME_KEYS) do
+      if cm:getAt('transient', k) ~= nil then releasing = true; break end
+    end
+    if not releasing then return false end
+
     local oldRPB = cm:get('rowPerBeat')
     cm:assign('transient', {
       swing      = util.REMOVE,
@@ -184,16 +178,14 @@ function newViewManager(tm, cm, cmgr)
       ec:rescaleRow(oldRPB, newRPB)
       vm:rebuild({ data = true })
     end
+    return true
   end
 
-  -- Toggle: snap grid to the cursor event's authoring frame, or release
-  -- if already overriding. Override lives in cm's transient tier so it
-  -- auto-vanishes when the script reloads.
+  -- Snap grid to the cursor event's authoring frame, or release if
+  -- already overriding.
   local function matchGridToCursor()
-    if frameTransientActive() then
-      releaseTransientFrame()
-      return
-    end
+    if releaseTransientFrame() then return end
+
     local col = grid.cols[ec:col()]
     local evt = col and col.type == 'note' and col.cells and col.cells[ec:row()]
     if not (evt and evt.frame) then return end
@@ -1331,7 +1323,7 @@ function newViewManager(tm, cm, cmgr)
     -- Release any active transient frame override first so configCallback
     -- doesn't see a non-transient frame-key write and try to release-and-
     -- rescale on top of our own pre-cm:set rescale (double-rescaling ec).
-    if frameTransientActive() then releaseTransientFrame() end
+    releaseTransientFrame()
     ec:rescaleRow(rowPerBeat, n)
     cm:set('track', 'rowPerBeat', n)
   end
@@ -1823,47 +1815,37 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Lifecycle
 
-  local callback = function(changed, _tm)
-    if changed.data or changed.take then
-      vm:rebuild(changed)
-    end
-  end
-
-  -- Mute/solo changes don't affect grid shape — only colour and the
-  -- effective set pushed to tm. Skip the full rebuild for those keys.
-  local muteKeys = { mutedChannels = true, soloedChannels = true }
-
-  local configCallback = function(changed, _cm)
-    if not changed.config then return end
-
-    -- A real edit on a frame key while transient override is active:
-    -- drop the override so the user's change becomes visible. The
-    -- recursive callback fired by releaseTransientFrame's cm:assign
-    -- handles the rebuild; we early-return.
-    if FRAME_KEYS[changed.key] and changed.level ~= 'transient'
-       and frameTransientActive() then
-      releaseTransientFrame()
-      return
+  do
+    local callback = function(changed, _tm)
+      if changed.data or changed.take then
+        vm:rebuild(changed)
+      end
     end
 
-    if muteKeys[changed.key] then pushMute()
-    else vm:rebuild({ take = false, data = true }) end
-  end
+    -- Mute/solo changes don't affect grid shape, so skip rebuild.
+    local muteKeys = { mutedChannels = true, soloedChannels = true }
 
-  function vm:attach(newTM, newCM)
-    if not (newTM and newCM) then return end
+    local configCallback = function(changed, _cm)
+      if not changed.config then return end
+      -- The callback fired by releaseTransientFrame handles rebuild.
+      if FRAME_KEYS[changed.key] and changed.level ~= 'transient' and releaseTransientFrame() then return end
+      if muteKeys[changed.key] then pushMute(); return end
+      vm:rebuild({ take = false, data = true })
+    end
 
-    self:detach()
-    tm = newTM
-    cm = newCM
-    tm:addCallback(callback)
-    cm:addCallback(configCallback)
-    self:rebuild({ take = true, data = true })
-  end
+    function vm:attach(newTM, newCM)
+      if not (newTM and newCM) then return end
+      self:detach()
+      tm, cm = newTM, newCM
+      tm:addCallback(callback)
+      cm:addCallback(configCallback)
+      self:rebuild({ take = true, data = true })
+    end
 
-  function vm:detach()
-    if tm then tm:removeCallback(callback) end
-    if cm then cm:removeCallback(configCallback) end
+    function vm:detach()
+      if tm then tm:removeCallback(callback) end
+      if cm then cm:removeCallback(configCallback) end
+    end
   end
 
   ----- Factory load
