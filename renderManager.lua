@@ -303,20 +303,16 @@ function newRenderManager(vm, cm, cmgr)
     local viewTop  = scrollRow
     local viewBot  = scrollRow + gridHeight
     for _, col in ipairs(grid.cols) do
-      if col.x and col.type == 'note' and col.events then
+      if col.x and col.tails then
         local colPx = gridOriginX + col.x * gridX
-        for _, evt in ipairs(col.events) do
-          if evt.endppq then
-            local startFrac = vm:ppqToRow(evt.ppq, col.midiChan)
-            local endFrac   = vm:ppqToRow(evt.endppq, col.midiChan)
-            if endFrac > viewTop and startFrac < viewBot then
-              local y1 = gridOriginY + math.max(startFrac - scrollRow, 0) * gridY
-              local y2 = gridOriginY + math.min(endFrac - scrollRow, gridHeight) * gridY
-              local x1 = colPx - 4
-              ImGui.DrawList_AddRectFilled(drawList, x1-1, y1-1, x1 + 4, y1+1, tailBord)
-              ImGui.DrawList_AddRectFilled(drawList, x1-2, y1, x1, y2, tailBord)
-              ImGui.DrawList_AddRectFilled(drawList, x1-1, y2-1, x1 + 4, y2+1, tailBord)
-            end
+        for _, tail in ipairs(col.tails) do
+          if tail.endRow > viewTop and tail.startRow < viewBot then
+            local y1 = gridOriginY + math.max(tail.startRow - scrollRow, 0) * gridY
+            local y2 = gridOriginY + math.min(tail.endRow - scrollRow, gridHeight) * gridY
+            local x1 = colPx - 4
+            ImGui.DrawList_AddRectFilled(drawList, x1-1, y1-1, x1 + 4, y1+1, tailBord)
+            ImGui.DrawList_AddRectFilled(drawList, x1-2, y1, x1, y2, tailBord)
+            ImGui.DrawList_AddRectFilled(drawList, x1-1, y2-1, x1 + 4, y2+1, tailBord)
           end
         end
       end
@@ -857,14 +853,14 @@ function newRenderManager(vm, cm, cmgr)
   -- Mid-drag write: composite changes but no reswing. The reswing is
   -- committed once on slider release.
   local function swingPreview(composite)
-    cmgr.commands.setSwingComposite(swingEditor.name, composite)
+    vm:setSwingComposite(swingEditor.name, composite)
   end
 
   local function swingWrite(composite)
     local old = util:deepClone(swingRead()) or {}
     if compositesEqual(old, composite) then return end
-    cmgr.commands.setSwingComposite(swingEditor.name, composite)
-    cmgr.commands.reswingPreset(swingEditor.name, old, composite)
+    vm:setSwingComposite(swingEditor.name, composite)
+    vm:reswingPreset(swingEditor.name, old, composite)
   end
 
   local function patchFactor(i, patch)
@@ -936,7 +932,7 @@ function newRenderManager(vm, cm, cmgr)
       local old, cur = swingEditor.dragOld, swingRead() or {}
       swingEditor.dragOld = nil
       if not compositesEqual(old, cur) then
-        cmgr.commands.reswingPreset(swingEditor.name, old, cur)
+        vm:reswingPreset(swingEditor.name, old, cur)
       end
     end
     if frozen then ImGui.EndDisabled(ctx) end
@@ -1029,8 +1025,8 @@ function newRenderManager(vm, cm, cmgr)
           elseif lib[name] then
             swingEditor.createError = 'Name already in use.'
           else
-            cmgr.commands.setSwingComposite(name, {})
-            cmgr.commands.setSwingSlot(name)
+            vm:setSwingComposite(name, {})
+            vm:setSwingSlot(name)
             swingEditor.name        = name
             swingEditor.snapshot    = {}
             swingEditor.createBuf   = ''

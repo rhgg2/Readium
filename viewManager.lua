@@ -140,8 +140,53 @@ function newViewManager(tm, cm, cmgr)
 
   local ec, clipboard, ctx
 
-  -- Scalar column types whose consecutive events can be interpolated.
-  local interpolable = { cc = true, pb = true, at = true }
+  ---------- SHARED HELPERS
+
+  ----- Note geometry (used by editing, adjust*, nudge, quantizeKeepRealised)
+
+  local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
+    local off  = allowOverlap and cm:get('overlapOffset') * resolution or 0
+    local pred = excludeEvt
+      and function(e) return util.isNote(e) and e ~= excludeEvt end
+      or util.isNote
+    local prev = util:seek(col.events, 'before', ppq, pred)
+    local next = util:seek(col.events, 'after',  ppq, pred)
+    local minStart = prev and (prev.endppq + timing.delayToPPQ(prev.delay, resolution) - off) or 0
+    local maxEnd   = next and (next.ppq    + timing.delayToPPQ(next.delay, resolution) + off) or length
+    return minStart, maxEnd
+  end
+
+  local function delayRange(col, n)
+    local minStart, maxEnd = overlapBounds(col, n.ppq, n, true)
+    return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
+  end
+
+  ----- Show events by column, used by lots of selection ops
+
+  local function eventsByCol()
+    local r1, r2, c1, c2, kind1, kind2 = ec:region()
+    local singleNoteKind = (c1 == c2 and kind1 == kind2
+      and grid.cols[c1] and grid.cols[c1].type == 'note') and kind1 or nil
+
+    local result = {}
+    for ci = c1, c2 do
+      local col = grid.cols[ci]
+      if not col then goto nextCol end
+
+      local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+      local locs = {}
+      -- Keyed by event reference, not loc: notes and CCs use disjoint loc
+      -- spaces, so a PA (cc loc=N) and a note (note loc=N) can collide.
+      for evt in util.between(col.events, startPPQ, endPPQ) do
+        locs[evt] = evt
+      end
+
+      local kind = col.type == 'note' and (singleNoteKind or 'pitch') or 'val'
+      util:add(result, { col = col, locs = locs, kind = kind })
+      ::nextCol::
+    end
+    return result
+  end
 
   ----- Frames
 
@@ -301,25 +346,6 @@ function newViewManager(tm, cm, cmgr)
     function vm:scroll()
       return scrollRow, scrollCol, lastVisibleFrom(scrollCol)
     end
-  end
-
-  ----- Note geometry  (shared by editing, adjust*, nudge, quantizeKeepRealised)
-
-  local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
-    local off  = allowOverlap and cm:get('overlapOffset') * resolution or 0
-    local pred = excludeEvt
-      and function(e) return util.isNote(e) and e ~= excludeEvt end
-      or util.isNote
-    local prev = util:seek(col.events, 'before', ppq, pred)
-    local next = util:seek(col.events, 'after',  ppq, pred)
-    local minStart = prev and (prev.endppq + timing.delayToPPQ(prev.delay, resolution) - off) or 0
-    local maxEnd   = next and (next.ppq    + timing.delayToPPQ(next.delay, resolution) + off) or length
-    return minStart, maxEnd
-  end
-
-  local function delayRange(col, n)
-    local minStart, maxEnd = overlapBounds(col, n.ppq, n, true)
-    return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
   end
 
   ----- Editing
@@ -510,83 +536,9 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
-  ----- Deletion
-
-  local function deleteNote(col, note)
-    local P = note.ppq
-    tm:deleteEvent('note', note)
-
-    local last = util:seek(col.events, 'before', P, util.isNote)
-    if last and last.endppq >= note.ppq then
-      local after = util:seek(col.events, 'after', P, util.isNote)
-      tm:assignEvent('note', last, { endppq = after and after.ppq or length })
-    end
-    tm:flush()
-  end
-
-  local function deleteEvent()
-    local col = grid.cols[ec:col()]
-    if not col then return end
-    local r = ec:row()
-    local evt = col.cells and col.cells[r]
-    if not evt then
-      -- Delete on a ghost cell: unset interpolation on the governing event.
-      local ghost = col.ghosts and col.ghosts[r]
-      if ghost then
-        tm:assignEvent(col.type, ghost.fromEvt, { shape = 'step' })
-        tm:flush()
-      end
-      return
-    end
-
-    if col.type ~= 'note' then
-      tm:deleteEvent(col.type, evt)
-      return tm:flush()
-    end
-
-    local kind = ec:cursorKind()
-    if evt.type == 'pa' then
-      if kind == 'vel' then tm:deleteEvent('pa', evt); tm:flush() end
-    elseif kind == 'vel' then
-      local prev = util:seek(col.events, 'before', evt.ppq, util.isNote)
-      tm:assignEvent('note', evt, { vel = (prev and prev.vel) or cm:get('defaultVelocity') })
-      tm:flush()
-    elseif kind == 'delay' then
-      if evt.delay ~= 0 then
-        tm:assignEvent('note', evt, { delay = 0 })
-        tm:flush()
-      end
-    else
-      deleteNote(col, evt)
-    end
-  end
-
-  ----- Selection ops
-
-  local function eventsByCol()
-    local r1, r2, c1, c2, kind1, kind2 = ec:region()
-    local singleNoteKind = (c1 == c2 and kind1 == kind2
-      and grid.cols[c1] and grid.cols[c1].type == 'note') and kind1 or nil
-
-    local result = {}
-    for ci = c1, c2 do
-      local col = grid.cols[ci]
-      if not col then goto nextCol end
-
-      local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
-      local locs = {}
-      for evt in util.between(col.events, startPPQ, endPPQ) do
-        locs[evt.loc] = evt
-      end
-
-      local kind = col.type == 'note' and (singleNoteKind or 'pitch') or 'val'
-      util:add(result, { col = col, locs = locs, kind = kind })
-      ::nextCol::
-    end
-    return result
-  end
-
   ----- Interpolation
+
+  local interpolable = { cc = true, pb = true, at = true }
 
   local interpolate do
     local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end' }
@@ -1180,35 +1132,44 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
-  local deleteSelection do
-    -- Queue note deletions with predecessor endppq fixup. PAs are ignored in the
-    -- fixup pass (they have no duration).
+  ----- Deletion
+
+  local deleteEvent, deleteSelection do
+    -- Delete notes; extend each predecessor that ended at-or-past a deleted run
+    -- into the next survivor's start (or `length`). PAs are out of scope here.
+    -- Fixups are computed before any mutation: tm:assignEvent's same-key clamp
+    -- reads live state, so we must delete first and stretch second.
     local function queueDeleteNotes(col, locs)
+      local fixups = {}
       local lastSurvivor, pendingFixup = nil, false
       for _, evt in ipairs(col.events) do
         if evt.type ~= 'pa' then
-          if locs[evt.loc] then
-            if not pendingFixup and lastSurvivor and lastSurvivor.endppq == evt.ppq then
+          if locs[evt] then
+            if not pendingFixup and lastSurvivor and lastSurvivor.endppq >= evt.ppq then
               pendingFixup = true
             end
           else
-            if pendingFixup and lastSurvivor then
-              tm:assignEvent('note', lastSurvivor, { endppq = evt.ppq })
+            if pendingFixup then
+              util:add(fixups, { evt = lastSurvivor, endppq = evt.ppq })
             end
             pendingFixup = false
             lastSurvivor = evt
           end
         end
       end
-      if pendingFixup and lastSurvivor then
-        tm:assignEvent('note', lastSurvivor, { endppq = length })
+      if pendingFixup then
+        util:add(fixups, { evt = lastSurvivor, endppq = length })
       end
+
       for _, evt in pairs(locs) do
-        tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
+        if evt.type ~= 'pa' then tm:deleteEvent('note', evt) end
+      end
+      for _, f in ipairs(fixups) do
+        tm:assignEvent('note', f.evt, { endppq = f.endppq })
       end
     end
 
-    -- Queue delay resets; zero the `delay` metadata on each selected note.
+    -- Zero `delay` on each selected note. PAs have no delay.
     local function queueResetDelays(col, locs)
       for _, evt in pairs(locs) do
         if evt.type ~= 'pa' and evt.delay ~= 0 then
@@ -1217,12 +1178,12 @@ function newViewManager(tm, cm, cmgr)
       end
     end
 
-    -- Queue velocity resets; delete selected PA events, use non-selected PA/note vels for carry-forward.
+    -- Reset selected note vels to the prior event's vel (notes or PAs carry
+    -- forward); delete selected PAs outright.
     local function queueResetVelocities(col, locs)
       local prevVel = cm:get('defaultVelocity')
       for _, evt in ipairs(col.events) do
-        local toMatch = locs[evt.loc]
-        if toMatch and toMatch.type == evt.type then
+        if locs[evt] then
           if evt.type == 'pa' then
             tm:deleteEvent('pa', evt)
           else
@@ -1245,6 +1206,25 @@ function newViewManager(tm, cm, cmgr)
       val   = queueDeleteCCs,
     }
 
+    function deleteEvent()
+      local col = grid.cols[ec:col()]
+      if not col then return end
+      local r = ec:row()
+      local evt = col.cells and col.cells[r]
+      if not evt then
+        -- Delete on a ghost cell: unset interpolation on the governing event.
+        local ghost = col.ghosts and col.ghosts[r]
+        if ghost then
+          tm:assignEvent(col.type, ghost.fromEvt, { shape = 'step' })
+          tm:flush()
+        end
+        return
+      end
+      local kind = col.type == 'note' and ec:cursorKind() or 'val'
+      DELETE_BY_KIND[kind](col, { [evt] = evt })
+      tm:flush()
+    end
+
     function deleteSelection()
       for _, g in ipairs(eventsByCol()) do
         DELETE_BY_KIND[g.kind](g.col, g.locs)
@@ -1252,6 +1232,11 @@ function newViewManager(tm, cm, cmgr)
       tm:flush()
       ec:selClear()
     end
+  end
+
+  local function deleteOrBackspace()
+    if ec:isSticky() then deleteSelection()
+    else ec:selClear(); deleteEvent(); ec:moveRow(advanceBy) end
   end
 
 
@@ -1290,30 +1275,26 @@ function newViewManager(tm, cm, cmgr)
   function vm:ec()        return ec end
   function vm:clipboard() return clipboard end
 
+  ----- Accessors for renderManager
+
   function vm:displayParams()
     return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
   end
-
-  function vm:ppqToRow(ppq, chan) return ctx:ppqToRow(ppq, chan) end
-  function vm:rowToPPQ(row, chan) return ctx:rowToPPQ(row, chan) end
-
   function vm:activeTuning()   return ctx:activeTuning() end
   function vm:noteProjection(evt) return ctx:noteProjection(evt) end
-
   function vm:rowBeatInfo(row) return ctx:rowBeatInfo(row) end
   function vm:barBeatSub(row) return ctx:barBeatSub(row) end
-
-  -- First time sig of the take; used by UI layers that need to map
-  -- musical units (e.g. "1/4 bar") into QN independent of PPQ context.
   function vm:timeSig()
     local ts = timeSigs[1] or { num = 4, denom = 4 }
     return ts.num, ts.denom
   end
 
+  ----- Non-command callbacks from renderManager
+
   function vm:setGridSize(w, h)
     gridWidth, gridHeight = w, h
   end
-
+  
   function vm:setRowPerBeat(n)
     n = util:clamp(n, 1, 32)
     if n == rowPerBeat then return end
@@ -1324,12 +1305,24 @@ function newViewManager(tm, cm, cmgr)
     cm:set('track', 'rowPerBeat', n)
   end
 
-  ----- Command helpers
-
-  local function deleteOrBackspace()
-    if ec:isSticky() then deleteSelection()
-    else ec:selClear(); deleteEvent(); ec:moveRow(advanceBy) end
+  function vm:setSwingComposite(name, composite)
+    if not name or name == '' then return end
+    local lib = cm:getAt('project', 'swings') or {}
+    lib[name] = composite
+    cm:set('project', 'swings', lib)
   end
+
+  function vm:setSwingSlot(name)
+    if name and name ~= '' then cm:set('take', 'swing', name)
+    else cm:remove('take', 'swing') end
+  end
+
+  function vm:reswingPreset(name, oldComp, newComp)
+    if not name or name == '' then return end
+    reswingPresetChange(name, oldComp, newComp)
+  end
+
+  ----- Command helpers
 
   local function playFromCursor()
     local col = grid.cols[ec:col()]
@@ -1376,23 +1369,6 @@ function newViewManager(tm, cm, cmgr)
       cm:set('take', 'swing', next)
     end
     util:print('swing: ' .. next)
-  end
-
-  local function setSwingComposite(name, composite)
-    if not name or name == '' then return end
-    local lib = cm:getAt('project', 'swings') or {}
-    lib[name] = composite
-    cm:set('project', 'swings', lib)
-  end
-
-  local function setSwingSlot(name)
-    if name and name ~= '' then cm:set('take', 'swing', name)
-    else cm:remove('take', 'swing') end
-  end
-
-  local function reswingPreset(name, oldComp, newComp)
-    if not name or name == '' then return end
-    reswingPresetChange(name, oldComp, newComp)
   end
 
   ----- Columns
@@ -1548,74 +1524,72 @@ function newViewManager(tm, cm, cmgr)
   ----- Command table
 
   cmgr:registerAll{
-    cursorDown     = function() ec:moveRow(1) end,
-    cursorUp       = function() ec:moveRow(-1) end,
-    pageDown       = function() ec:moveRow(rowPerBar) end,
-    pageUp         = function() ec:moveRow(-rowPerBar) end,
-    goTop          = function() ec:moveRow(-ec:row()) end,
-    goBottom       = function() ec:moveRow((grid.numRows or 1) - ec:row()) end,
-    goLeft         = function() ec:moveCol(-ec:col()) end,
-    goRight        = function() ec:moveCol(#grid.cols - ec:col()) end,
-    cursorRight    = function() ec:moveStop(1) end,
-    cursorLeft     = function() ec:moveStop(-1) end,
-    selectDown     = function() ec:moveRow(1, true) end,
-    selectUp       = function() ec:moveRow(-1, true) end,
-    selectRight    = function() ec:moveStop(1, true) end,
-    selectLeft     = function() ec:moveStop(-1, true) end,
-    selectClear    = function() ec:selClear() end,
-    colRight       = function() ec:moveCol(1) end,
-    colLeft        = function() ec:moveCol(-1) end,
-    channelRight   = function() ec:moveChannel(1) end,
-    channelLeft    = function() ec:moveChannel(-1) end,
-    cycleBlock     = function() ec:cycleHBlock() end,
-    cycleVBlock    = function() ec:cycleVBlock() end,
-    swapBlockEnds  = function() ec:swapEnds() end,
-    copy           = function() clipboard:copy(); ec:selClear() end,
-    cut            = function() clipboard:copy(); deleteSelection() end,
-    paste          = function() if ec:isSticky() then ec:selClear() else clipboard:paste() end end,
-    delete         = deleteOrBackspace,
-    interpolate    = function() interpolate() end,
-    deleteSel      = function() deleteSelection() end,
-    duplicateDown  = function() duplicate( 1) end,
-    duplicateUp    = function() duplicate(-1) end,
-    inputOctaveUp   = function() cm:set('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
-    inputOctaveDown = function() cm:set('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
-    noteOff        = noteOff,
-    growNote       = function() adjustDuration(1) end,
-    shrinkNote     = function() adjustDuration(-1) end,
-    nudgeBack      = function() adjustPosition(-1) end,
-    nudgeForward   = function() adjustPosition(1) end,
-    insertRow      = function() insertRow() end,
-    deleteRow      = function() deleteRow() end,
-    nudgeCoarseUp   = function() nudge( 1, true)  end,
-    nudgeCoarseDown = function() nudge(-1, true)  end,
-    nudgeFineUp     = function() nudge( 1, false) end,
-    nudgeFineDown   = function() nudge(-1, false) end,
-    play           = function() tm:play() end,
-    playPause      = function() tm:playPause() end,
-    playFromTop    = function() tm:playFrom(0) end,
-    playFromCursor = playFromCursor,
-    stop           = function() tm:stop() end,
-    addNoteCol     = function() vm:addExtraCol('note') end,
-    addTypedCol    = addTypedColModal,
-    hideExtraCol   = function() vm:hideExtraCol() end,
-    doubleRPB      = function() vm:setRowPerBeat(rowPerBeat * 2) end,
-    halveRPB       = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
-    matchGridToCursor = matchGridToCursor,
-    setRPB         = setRPBModal,
-    cycleTuning    = cycleTuning,
+    cursorDown              = function() ec:moveRow(1) end,
+    cursorUp                = function() ec:moveRow(-1) end,
+    pageDown                = function() ec:moveRow(rowPerBar) end,
+    pageUp                  = function() ec:moveRow(-rowPerBar) end,
+    goTop                   = function() ec:moveRow(-ec:row()) end,
+    goBottom                = function() ec:moveRow((grid.numRows or 1) - ec:row()) end,
+    goLeft                  = function() ec:moveCol(-ec:col()) end,
+    goRight                 = function() ec:moveCol(#grid.cols - ec:col()) end,
+    cursorRight             = function() ec:moveStop(1) end,
+    cursorLeft              = function() ec:moveStop(-1) end,
+    selectDown              = function() ec:moveRow(1, true) end,
+    selectUp                = function() ec:moveRow(-1, true) end,
+    selectRight             = function() ec:moveStop(1, true) end,
+    selectLeft              = function() ec:moveStop(-1, true) end,
+    selectClear             = function() ec:selClear() end,
+    colRight                = function() ec:moveCol(1) end,
+    colLeft                 = function() ec:moveCol(-1) end,
+    channelRight            = function() ec:moveChannel(1) end,
+    channelLeft             = function() ec:moveChannel(-1) end,
+    cycleBlock              = function() ec:cycleHBlock() end,
+    cycleVBlock             = function() ec:cycleVBlock() end,
+    swapBlockEnds           = function() ec:swapEnds() end,
+    copy                    = function() clipboard:copy(); ec:selClear() end,
+    cut                     = function() clipboard:copy(); deleteSelection() end,
+    paste                   = function() if ec:isSticky() then ec:selClear() else clipboard:paste() end end,
+    delete                  = deleteOrBackspace,
+    interpolate             = function() interpolate() end,
+    deleteSel               = function() deleteSelection() end,
+    duplicateDown           = function() duplicate( 1) end,
+    duplicateUp             = function() duplicate(-1) end,
+    inputOctaveUp           = function() cm:set('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
+    inputOctaveDown         = function() cm:set('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
+    noteOff                 = noteOff,
+    growNote                = function() adjustDuration(1) end,
+    shrinkNote              = function() adjustDuration(-1) end,
+    nudgeBack               = function() adjustPosition(-1) end,
+    nudgeForward            = function() adjustPosition(1) end,
+    insertRow               = function() insertRow() end,
+    deleteRow               = function() deleteRow() end,
+    nudgeCoarseUp           = function() nudge( 1, true)  end,
+    nudgeCoarseDown         = function() nudge(-1, true)  end,
+    nudgeFineUp             = function() nudge( 1, false) end,
+    nudgeFineDown           = function() nudge(-1, false) end,
+    play                    = function() tm:play() end,
+    playPause               = function() tm:playPause() end,
+    playFromTop             = function() tm:playFrom(0) end,
+    playFromCursor          = playFromCursor,
+    stop                    = function() tm:stop() end,
+    addNoteCol              = function() vm:addExtraCol('note') end,
+    addTypedCol             = addTypedColModal,
+    hideExtraCol            = function() vm:hideExtraCol() end,
+    doubleRPB               = function() vm:setRowPerBeat(rowPerBeat * 2) end,
+    halveRPB                = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
+    matchGridToCursor       = matchGridToCursor,
+    setRPB                  = setRPBModal,
+    cycleTuning             = cycleTuning,
     reswing                 = function() return reswing() end,
     reswingAll              = function() reswingAll() end,
     quantize                = function() return quantize() end,
     quantizeAll             = function() quantizeAll() end,
     quantizeKeepRealised    = function() return quantizeKeepRealised() end,
     quantizeKeepRealisedAll = function() quantizeKeepRealisedAll() end,
-    cycleSwing        = cycleSwing,
-    setSwingComposite = setSwingComposite,
-    setSwingSlot      = setSwingSlot,
-    reswingPreset     = reswingPreset,
-    openSwingEditor   = function() return 'swingEditor' end,
-    quit              = function() return 'quit' end,
+    cycleSwing              = cycleSwing,
+    openSwingEditor         = function() return 'swingEditor' end,
+    quit                    = function() return 'quit' end,
+    
   }
 
   for i = 0, 9 do
@@ -1649,6 +1623,7 @@ function newViewManager(tm, cm, cmgr)
     cmgr:doBefore(name, killAudition)
   end
 
+  
   ----- Rebuild
 
   local rebuilding = false
@@ -1770,6 +1745,7 @@ function newViewManager(tm, cm, cmgr)
       for _, gridCol in ipairs(grid.cols) do
         gridCol.overflow = {}
         gridCol.offGrid  = {}
+        if gridCol.type == 'note' then gridCol.tails = {} end
         local chan = gridCol.midiChan
         for _, evt in ipairs(gridCol.events) do
           local exact = ctx:ppqToRow(evt.ppq or 0, chan)
@@ -1781,6 +1757,12 @@ function newViewManager(tm, cm, cmgr)
               gridCol.cells[y] = evt
               if math.abs(exact - y) > 1e-3 then gridCol.offGrid[y] = true end
             end
+          end
+          if evt.endppq then
+            util:add(gridCol.tails, {
+              startRow = exact,
+              endRow   = ctx:ppqToRow(evt.endppq, chan),
+            })
           end
         end
       end

@@ -128,6 +128,166 @@ return {
 
   -- No-op when delay is already zero: the branch is guarded so the
   -- keystroke doesn't emit a redundant flush.
+  -- Single-cell pitch delete extends the predecessor's endppq to the next
+  -- note's start when the predecessor was tied to the deleted note.
+  {
+    name = 'delete on pitch tied predecessor extends to next note',
+    run = function(harness)
+      -- res=240, 4 rpb → 1 row = 60 ppq. Three sequential same-pitch notes:
+      --   A: rows 0..1 (ppq 0..120), tied to B
+      --   B: rows 2..3 (ppq 120..240), tied to C
+      --   C: rows 4..5 (ppq 240..360)
+      -- Delete B → A.endppq should jump to C.ppq=240.
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0,   endppq = 120, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+            { ppq = 120, endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+            { ppq = 240, endppq = 360, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(2, 1, 1) -- row 2 = ppq 120 (B), pitch stop
+      h.cmgr.commands.delete()
+
+      local notes = h.fm:dump().notes
+      t.eq(#notes, 2, 'B deleted')
+      local A, C
+      for _, n in ipairs(notes) do
+        if     n.ppq == 0   then A = n
+        elseif n.ppq == 240 then C = n end
+      end
+      t.truthy(A and C, 'A and C survive')
+      t.eq(A.endppq, 240, 'A extended to C.ppq')
+    end,
+  },
+
+  -- Single-cell vel delete carries forward from the most recent prior event,
+  -- including PAs — not just the previous note.
+  {
+    name = 'delete on vel inherits from a prior PA event',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0,   endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+            { ppq = 240, endppq = 480, chan = 1, pitch = 60, vel = 80,  detune = 0, delay = 0 },
+          },
+          ccs = {
+            { ppq = 120, chan = 1, msgType = 'pa', pitch = 60, val = 70 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(4, 1, 3) -- row 4 = ppq 240 (note B), vel stop
+      h.cmgr.commands.delete()
+
+      local note
+      for _, n in ipairs(h.fm:dump().notes) do
+        if n.ppq == 240 then note = n end
+      end
+      t.truthy(note, 'B survives')
+      t.eq(note.vel, 70, 'B.vel inherits from prior PA, not prior note')
+    end,
+  },
+
+  -- Single-cell pitch delete on a PA cell is a no-op: pitch kind targets
+  -- notes only, even when the cell under the cursor is a PA.
+  {
+    name = 'delete on pitch over a PA cell is a no-op',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+          },
+          ccs = {
+            { ppq = 120, chan = 1, msgType = 'pa', pitch = 60, val = 70 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(2, 1, 1) -- row 2 = ppq 120 (PA cell), pitch stop
+      h.cmgr.commands.delete()
+
+      local dump = h.fm:dump()
+      t.eq(#dump.notes, 1, 'note untouched')
+      local stillPA = false
+      for _, c in ipairs(dump.ccs) do
+        if c.msgType == 'pa' and c.ppq == 120 then stillPA = true end
+      end
+      t.truthy(stillPA, 'PA untouched')
+    end,
+  },
+
+  -- Selection pitch delete operates on notes only; PAs in the rectangle
+  -- are left alone (vel-kind delete is the channel for removing PAs).
+  -- Host note sits outside the selection so its survival isolates what the
+  -- queue function does on its own — no cascade-from-host noise.
+  {
+    name = 'selection pitch delete leaves PAs alone',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            -- Cell at row 0; covers ppq 0..480 so it hosts the PA.
+            { ppq = 0, endppq = 480, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+          },
+          ccs = {
+            -- Cell at row 2; pitch=60 means hosted by the note above.
+            { ppq = 120, chan = 1, msgType = 'pa', pitch = 60, val = 70 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      -- Selection rows 1..3 (ppq [60, 240)) excludes the host note (row 0)
+      -- and includes the PA (row 2).
+      h.ec:setSelection(1, 3, 1, 1, 'pitch', 'pitch')
+
+      h.cmgr.commands.deleteSel()
+
+      local dump = h.fm:dump()
+      t.eq(#dump.notes, 1, 'host note untouched (outside selection)')
+      local stillPA = false
+      for _, c in ipairs(dump.ccs) do
+        if c.msgType == 'pa' and c.ppq == 120 then stillPA = true end
+      end
+      t.truthy(stillPA, 'PA preserved under pitch-kind selection delete')
+    end,
+  },
+
+  -- Selection vel delete removes PAs in the rectangle; notes get vel reset.
+  {
+    name = 'selection vel delete deletes PAs and resets note vels',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            -- Host note for the PA, sits at row 0 outside the selection.
+            { ppq = 0, endppq = 480, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+          },
+          ccs = {
+            { ppq = 120, chan = 1, msgType = 'pa', pitch = 60, val = 70 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      -- Rows 1..3 covers the PA cell (row 2) but not the host note (row 0).
+      h.ec:setSelection(1, 3, 1, 1, 'vel', 'vel')
+
+      h.cmgr.commands.deleteSel()
+
+      local dump = h.fm:dump()
+      t.eq(#dump.notes, 1, 'host note survives')
+      local paGone = true
+      for _, c in ipairs(dump.ccs) do
+        if c.msgType == 'pa' and c.ppq == 120 then paGone = false end
+      end
+      t.truthy(paGone, 'PA in vel-kind selection deleted')
+    end,
+  },
+
   {
     name = 'delete on delay stop is a no-op when delay is already 0',
     run = function(harness)
