@@ -302,8 +302,6 @@ function newViewManager(tm, cm, cmgr)
   local function moveCol(n)             killAudition(); ec:moveCol(n)             end
   local function moveChannel(n)         killAudition(); ec:moveChannel(n)         end
 
-  function vm:lastVisibleFrom(startCol) return lastVisibleFrom(startCol) end
-
   ----- Note geometry  (shared by editing, adjust*, nudge, quantizeKeepRealised)
 
   local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
@@ -1255,6 +1253,10 @@ function newViewManager(tm, cm, cmgr)
   end
 
 
+  -- Stamp the current selection (or cursor row) onto the adjacent block in
+  -- the given direction (dir=1 below, dir=-1 above), overwriting what's there.
+  -- Going up past row 0 trims the top of the clip — the start is cut off,
+  -- not the end — so repeated upward stamps stay anchored at the cursor.
   local function duplicate(dir)
     local clip = clipboard:collect()
     if not clip then return end
@@ -1285,7 +1287,7 @@ function newViewManager(tm, cm, cmgr)
 
   function vm:ec()        return ec end
   function vm:clipboard() return clipboard end
-  function vm:scroll()    return scrollRow, scrollCol end
+  function vm:scroll()    return scrollRow, scrollCol, lastVisibleFrom(scrollCol) end
 
   function vm:displayParams()
     return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
@@ -1314,6 +1316,8 @@ function newViewManager(tm, cm, cmgr)
   function vm:setRowPerBeat(n)
     n = util:clamp(n, 1, 32)
     if n == rowPerBeat then return end
+    -- Release before cm:set: otherwise configCallback sees a non-transient
+    -- frame-key write and rescales ec on top of our own rescaleRow below.
     releaseTransientFrame()
     ec:rescaleRow(rowPerBeat, n)
     cm:set('track', 'rowPerBeat', n)
@@ -1391,7 +1395,7 @@ function newViewManager(tm, cm, cmgr)
   end
 
   ----- Columns
-  
+
   -- Parses "cc74", "pb", "at", "pc", "dly". Selection/cursor fallback is
   -- resolved inside the vm methods.
   local function addTypedColFromString(typeStr)
@@ -1542,7 +1546,6 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Command table
 
-    -- Command table — rm binds keys to these names via cmgr.
   cmgr:registerAll{
     cursorDown     = function() moveRow(1) end,
     cursorUp       = function() moveRow(-1) end,
@@ -1571,6 +1574,8 @@ function newViewManager(tm, cm, cmgr)
     deleteSel      = function() deleteSelection() end,
     copy           = function() clipboard:copy(); ec:selClear() end,
     cut            = function() clipboard:copy(); deleteSelection() end,
+    -- In mark mode, the first press is swallowed as a cancel (it would
+    -- paste at cursor, not over the selection); a second press then pastes.
     paste          = function() if ec:isSticky() then ec:selClear() else clipboard:paste() end end,
     duplicateDown  = function() duplicate( 1) end,
     duplicateUp    = function() duplicate(-1) end,
@@ -1621,32 +1626,22 @@ function newViewManager(tm, cm, cmgr)
   -- These commands make a sticky selection unsticky, so it doesn't
   -- extend on further move.
   for _, name in ipairs({
-    'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
-    'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward',
+    'nudgeCoarseUp', 'nudgeCoarseDown',
+    'nudgeFineUp', 'nudgeFineDown',
+    'nudgeBack', 'nudgeForward',
+    'growNote', 'shrinkNote',
     'duplicateDown', 'duplicateUp', 'interpolate',
     'insertRow', 'deleteRow', 'noteOff',
     'reswing', 'reswingAll',
     'quantize', 'quantizeAll',
     'quantizeKeepRealised', 'quantizeKeepRealisedAll',
   }) do
-    cmgr:wrap(name, function(orig)
-      return function()
-        local r, s = orig()
-        ec:unstick()
-        return r, s
-      end
-    end)
+    cmgr:doAfter(name, function() ec:unstick() end)
   end
 
   -- Clear selection after these commands
   for _, name in ipairs({ 'delete', 'deleteSel', 'cut' }) do
-    cmgr:wrap(name, function(orig)
-      return function()
-        local r, s = orig()
-        ec:selClear()
-        return r, s
-      end
-    end)
+    cmgr:doAfter(name, function() ec:selClear() end)
   end
 
   ----- Rebuild

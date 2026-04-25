@@ -54,6 +54,16 @@ function newCommandManager(cm)
     self.commands[name] = wrapper(orig)
   end
 
+  function mgr:doAfter(name, after)
+    local orig = self.commands[name]
+    if not orig then return end
+    self.commands[name] = function()
+      local r, s = orig()
+      after()
+      return r, s
+    end
+  end
+
   function mgr:bind(name, keys)
     self.keymap[name] = keys
   end

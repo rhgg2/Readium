@@ -199,7 +199,7 @@ function newRenderManager(vm, cm, cmgr)
     local grid = vm.grid
     local ec = vm:ec()
     local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
-    local scrollRow, scrollCol = vm:scroll()
+    local scrollRow, scrollCol, lastVisCol = vm:scroll()
 
     if not gridX then
       local charW, charH = ImGui.CalcTextSize(ctx, 'W')
@@ -387,7 +387,7 @@ function newRenderManager(vm, cm, cmgr)
 
     if ec:hasSelection() then
       local r1, r2, c1i, c2i = ec:region()
-      if c2i >= scrollCol and c1i <= vm:lastVisibleFrom(scrollCol) then
+      if c2i >= scrollCol and c1i <= lastVisCol then
         local yFrom = math.max(r1 - scrollRow, 0)
         local yTo   = math.min(r2 - scrollRow, gridHeight - 1)
         local c1, c2 = grid.cols[c1i], grid.cols[c2i]
@@ -458,7 +458,7 @@ function newRenderManager(vm, cm, cmgr)
     local grid = vm.grid
     local ec = vm:ec()
     local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
-    local scrollRow, scrollCol = vm:scroll()
+    local scrollRow, scrollCol, lastVisCol = vm:scroll()
 
     local clicked      = ImGui.IsMouseClicked(ctx, 0)
     local rightClicked = ImGui.IsMouseClicked(ctx, 1)
@@ -511,8 +511,7 @@ function newRenderManager(vm, cm, cmgr)
       local charY = math.floor((mouseY - gridOriginY) / gridY)
       local row = scrollRow + charY
       local fracX = (mouseX - gridOriginX) / gridX
-      local lastVis = vm:lastVisibleFrom(scrollCol)
-      local rightEdge = grid.cols[lastVis].x + grid.cols[lastVis].width
+      local rightEdge = grid.cols[lastVisCol].x + grid.cols[lastVisCol].width
 
       local col, stop
       if fracX < 0 then
