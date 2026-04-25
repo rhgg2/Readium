@@ -243,7 +243,7 @@ return {
       h.vm:setGridSize(80, 40)
       -- Selection rows 1..3 (ppq [60, 240)) excludes the host note (row 0)
       -- and includes the PA (row 2).
-      h.ec:setSelection(1, 3, 1, 1, 'pitch', 'pitch')
+      h.ec:setSelection{ row1=1, row2=3, col1=1, col2=1, kind1='pitch', kind2='pitch' }
 
       h.cmgr.commands.deleteSel()
 
@@ -274,7 +274,7 @@ return {
       }
       h.vm:setGridSize(80, 40)
       -- Rows 1..3 covers the PA cell (row 2) but not the host note (row 0).
-      h.ec:setSelection(1, 3, 1, 1, 'vel', 'vel')
+      h.ec:setSelection{ row1=1, row2=3, col1=1, col2=1, kind1='vel', kind2='vel' }
 
       h.cmgr.commands.deleteSel()
 

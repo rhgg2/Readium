@@ -20,7 +20,9 @@ util → configManager → midiManager → trackerManager
 
 `util` comes first because everything else calls `util:installHooks`
 during construction. `commandManager` loads before `viewManager`
-because vm populates the command registry at construction time.
+because vm, ec and clipboard populate the command registry at
+construction time. `editCursor` loads before `viewManager` because vm
+constructs ec / clipboard from `newEditCursor` / `newClipboard`.
 
 ## Wiring
 
@@ -35,10 +37,13 @@ because vm populates the command registry at construction time.
      take.
    - `tm = newTrackerManager(mm, cm)` — registers callbacks with both.
    - `cmgr = newCommandManager(cm)` — empty command/keymap tables.
-   - `vm = newViewManager(tm, cm, cmgr)` — registers the full command
-     table and applies wrappers.
-   - `renderer = newRenderManager(vm, cm, cmgr)` — installs the default
-     keymap and the ImGui context.
+   - `vm = newViewManager(tm, cm, cmgr)` — registers vm's editing
+     commands, constructs ec and clipboard (which self-register their
+     own navigation / clipboard commands via `:registerCommands(cmgr)`),
+     then applies cross-cutting wrappers.
+   - `renderer = newRenderManager(vm, cm, cmgr)` — registers rm's UX
+     commands (modals, confirms, swing editor, quit), installs the
+     default keymap, and creates the ImGui context.
 4. `renderer:init()` opens the window.
 5. A defer loop drives each frame: `renderer:loop()` returns `true`
    while the script should keep running; `false` / `nil` ends the loop

@@ -15,6 +15,7 @@ local filter = arg[1]
 
 local specs = {
   'harness_sanity_spec',
+  'command_manager_spec',
   'config_schema_spec',
   'util_edit_primitives_spec',
   'tm_rebuild_spec',

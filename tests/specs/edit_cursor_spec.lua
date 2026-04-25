@@ -23,9 +23,9 @@ local function mkNoteHarness(harness, noteOverrides, takeCfg)
 end
 
 -- Selection with both ends at the current cursor → 1×1 region at cursor.
+-- extendTo to current pos: creates a fresh sel (no movement, no anchor drift).
 local function degenerateSel(h)
-  h.ec:selStart()
-  h.ec:selUpdate()
+  h.ec:extendTo(h.ec:pos())
 end
 
 return {
@@ -255,7 +255,7 @@ return {
   -- 4b. duplicate's sel path. pasteSingle branches on ec:cursorKind(),
   -- which reads the stop ec lands on before paste. The invariant is
   -- that the pre-paste stop shares a kind with sel.col1/kind1 — held
-  -- today by firstStopForKind(c1, kind1), and by the regionFrom verb
+  -- today by firstStopForKind(c1, kind1), and by the regionStart verb
   -- that replaces it. Pitch and vel probe distinct paste branches;
   -- together they catch a kind-dispatch regression in the refactor.
   {
@@ -284,7 +284,7 @@ return {
   -- on a plain note col). pasteSingle's vel branch requires an existing
   -- note at the target row, so seed two notes and verify the source vel
   -- is written onto the target note. Pinning this guards against a
-  -- regionFrom implementation that lands on stop 1 (pitch) instead of
+  -- regionStart implementation that lands on stop 1 (pitch) instead of
   -- the first stop of kind1 (vel) — the paste would silently take the
   -- pitch branch and blow away the target note.
   {
@@ -371,12 +371,16 @@ return {
   -- 6. ec:eachSelectedCol — iterator pins. Seeds three chans so the grid
   -- has multiple note cols; tests no-sel / 1×1 / multi-col behaviour.
   {
-    name = 'eachSelectedCol yields nothing when no selection is active',
+    name = 'eachSelectedCol with no selection yields the cursor col as a 1x1 fallback',
     run = function(harness)
       local h = mkNoteHarness(harness)
-      local n = 0
-      for _ in h.ec:eachSelectedCol() do n = n + 1 end
-      t.eq(n, 0, 'no iterations when sel == nil')
+      h.ec:setPos(0, 2)
+      local got = {}
+      for col, ci in h.ec:eachSelectedCol() do
+        got[#got + 1] = { ci = ci, chan = col.midiChan }
+      end
+      t.eq(#got, 1,        'exactly the cursor col is yielded')
+      t.eq(got[1].ci, 2,   'yielded ci is the cursor col')
     end,
   },
 
@@ -391,7 +395,7 @@ return {
         }},
       }
       h.vm:setGridSize(80, 40)
-      h.ec:setSelection(0, 0, 1, 3, 'pitch', 'pitch')
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=3, kind1='pitch', kind2='pitch' }
 
       local got = {}
       for col, ci in h.ec:eachSelectedCol() do
@@ -418,7 +422,7 @@ return {
         }},
       }
       h.vm:setGridSize(80, 40)
-      h.ec:setSelection(0, 0, 1, 2, 'pitch', 'pitch')  -- chans 1..2
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=2, kind1='pitch', kind2='pitch' }  -- chans 1..2
 
       h.vm:showDelay()
       local nd = h.cm:get('noteDelay')
@@ -426,6 +430,70 @@ return {
       t.truthy(nd[1] and nd[1][1], 'delay enabled on chan 1 lane 1')
       t.truthy(nd[2] and nd[2][1], 'delay enabled on chan 2 lane 1')
       t.falsy (nd[3] and nd[3][1], 'delay untouched on unselected chan 3')
+    end,
+  },
+
+  -- Pins ec:extendTo's two-mode contract: with no sel, anchors at the
+  -- current cursor and grows to the target; with sel, leaves the anchor
+  -- alone and just moves the moving end. Both rm shift-click and drag
+  -- ride this verb.
+  {
+    name = 'ec:extendTo with no sel anchors at cursor and grows to target',
+    run = function(harness)
+      local h = mkNoteHarness(harness)
+      h.ec:setPos(2, 1, 1)
+      h.ec:extendTo(5, 1, 1)
+      t.truthy(h.ec:hasSelection(), 'sel created')
+      local r1, r2 = h.ec:region()
+      t.eq(r1, 2, 'sel anchored at original cursor row')
+      t.eq(r2, 5, 'sel grown to target row')
+    end,
+  },
+
+  {
+    name = 'ec:extendTo with active sel preserves anchor, moves the loose end',
+    run = function(harness)
+      local h = mkNoteHarness(harness)
+      h.ec:setPos(2, 1, 1)
+      h.ec:extendTo(5, 1, 1)   -- anchor=2, end=5
+      h.ec:extendTo(7, 1, 1)   -- second extend should keep anchor=2
+      local r1, r2 = h.ec:region()
+      t.eq(r1, 2, 'anchor preserved across second extend')
+      t.eq(r2, 7, 'loose end advanced')
+    end,
+  },
+
+  -- ec:pos returns the cursor triple in setPos order, so a setPos →
+  -- pos round-trip is the identity. Guards against a future drift in
+  -- the pair convention (e.g. swapping col/stop, or returning a record).
+  {
+    name = 'ec:pos round-trips ec:setPos in (row, col, stop) order',
+    run = function(harness)
+      local h = mkNoteHarness(harness)
+      h.ec:setPos(7, 1, 3)
+      local r, c, s = h.ec:pos()
+      t.eq(r, 7, 'row')
+      t.eq(c, 1, 'col')
+      t.eq(s, 3, 'stop')
+    end,
+  },
+
+  -- Pins the public-boundary contract: ec:region speaks kinds, not
+  -- selgroups. setSelection round-trips a vel-kind sel through region
+  -- and out the other side as kind='vel' (selgrp 2). A regression that
+  -- leaks selgrp through region would surface as kind1=2 here.
+  {
+    name = 'setSelection / region round-trip preserves kind',
+    run = function(harness)
+      local h = mkNoteHarness(harness)
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=1, kind1='vel', kind2='vel' }
+      local r1, r2, c1, c2, k1, k2 = h.ec:region()
+      t.eq(r1, 0,     'row1')
+      t.eq(r2, 0,     'row2')
+      t.eq(c1, 1,     'col1')
+      t.eq(c2, 1,     'col2')
+      t.eq(k1, 'vel', 'kind1 emerges as kind, not selgrp')
+      t.eq(k2, 'vel', 'kind2 emerges as kind, not selgrp')
     end,
   },
 }

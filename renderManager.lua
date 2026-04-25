@@ -33,6 +33,7 @@ function newRenderManager(vm, cm, cmgr)
   local dragWinX, dragWinY = 0, 0
   local modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
   local swingEditor = nil  -- nil = closed, else { name, snapshot, createBuf, createError }
+  local quitting   = false -- set by the quit command, observed by rm:loop
 
   ----- Cell renderers
 
@@ -179,7 +180,7 @@ function newRenderManager(vm, cm, cmgr)
   end
 
   local function drawToolbar()
-    local rowPerBeat = vm:displayParams()
+    local rowPerBeat = cm:get('rowPerBeat')
 
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
     ImGui.Text(ctx, 'Rows/beat:')
@@ -198,7 +199,7 @@ function newRenderManager(vm, cm, cmgr)
   local function drawTracker()
     local grid = vm.grid
     local ec = vm:ec()
-    local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
+    local cursorRow, cursorCol, cursorStop = ec:pos()
     local scrollRow, scrollCol, lastVisCol = vm:scroll()
 
     if not gridX then
@@ -414,7 +415,9 @@ function newRenderManager(vm, cm, cmgr)
   local function drawStatusBar()
     local ec = vm:ec()
     local cursorRow, cursorCol = ec:row(), ec:col()
-    local rowPerBeat, _, _, currentOctave, advanceBy = vm:displayParams()
+    local rowPerBeat    = cm:get('rowPerBeat')
+    local currentOctave = cm:get('currentOctave')
+    local advanceBy     = cm:get('advanceBy')
     local col      = vm.grid.cols[cursorCol]
     local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
@@ -453,7 +456,7 @@ function newRenderManager(vm, cm, cmgr)
   local function handleMouse()
     local grid = vm.grid
     local ec = vm:ec()
-    local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
+    local cursorRow, cursorCol, cursorStop = ec:pos()
     local scrollRow, scrollCol, lastVisCol = vm:scroll()
 
     local clicked      = ImGui.IsMouseClicked(ctx, 0)
@@ -492,9 +495,7 @@ function newRenderManager(vm, cm, cmgr)
       local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
 
       if shift then
-        if not ec:hasSelection() then ec:selStart() end
-        ec:setPos(scrollRow + charY, col, stop)
-        ec:selUpdate()
+        ec:extendTo(scrollRow + charY, col, stop)
       else
         ec:selClear()
         ec:setPos(scrollRow + charY, col, stop)
@@ -529,9 +530,7 @@ function newRenderManager(vm, cm, cmgr)
 
       -- Only start selection once cursor moves to a different position
       if row ~= cursorRow or col ~= cursorCol or stop ~= cursorStop then
-        if not ec:hasSelection() then ec:selStart() end
-        ec:setPos(row, col, stop)
-        ec:selUpdate()
+        ec:extendTo(row, col, stop)
       end
 
     elseif dragging and not held then
@@ -562,7 +561,7 @@ function newRenderManager(vm, cm, cmgr)
 
     local grid = vm.grid
     local ec = vm:ec()
-    local cursorRow, cursorCol, cursorStop = ec:row(), ec:col(), ec:stop()
+    local cursorRow, cursorCol, cursorStop = ec:pos()
 
     if ImGui.IsWindowFocused(ctx) then
       local commandHeld = false
@@ -577,27 +576,8 @@ function newRenderManager(vm, cm, cmgr)
           end
           if ImGui.IsKeyDown(ctx, key) and mods == ImGui.Mod_None then commandHeld = true end
           if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then
-            local result, state = cmgr.commands[command]()
-            if result == 'quit' then
-              return true
-            elseif result == 'modal' then
-              modalState = state
-              modalState.buf = ''
-              ImGui.OpenPopup(ctx, state.title)
-              return
-            elseif result == 'swingEditor' then
-              if not swingEditor then
-                local name = cm:get('swing')
-                local lib  = cm:get('swings')
-                swingEditor = {
-                  name      = name,
-                  snapshot  = name and lib[name] or nil,
-                  createBuf = '',
-                }
-              end
-              return
-            elseif result == 'fallthrough' then
-              commandHeld = false
+            if cmgr.commands[command]() == false then
+              commandHeld = false  -- command declined; let the char queue see it
             else
               return
             end
@@ -683,6 +663,75 @@ function newRenderManager(vm, cm, cmgr)
       modalState = nil
     end
   end
+
+  ----- Modal-driven commands
+
+  local function openPrompt(title, prompt, callback)
+    modalState = { title = title, prompt = prompt, callback = callback, buf = '' }
+    ImGui.OpenPopup(ctx, title)
+  end
+
+  local function openConfirm(title, callback)
+    modalState = {
+      title    = title,
+      prompt   = 'No selection — ' .. title .. ' whole take? (y/n)',
+      kind     = 'confirm',
+      callback = callback,
+      buf      = '',
+    }
+    ImGui.OpenPopup(ctx, title)
+  end
+
+  -- Selection → vm:<base>Selection();  no selection → confirm → vm:<base>All().
+  -- The naming convention is the contract — keeps the registration tight.
+  local function scopedAction(title, base)
+    return function()
+      if vm:ec():hasSelection() then vm[base..'Selection'](vm)
+      else openConfirm(title, function(yes) if yes then vm[base..'All'](vm) end end)
+      end
+    end
+  end
+
+  cmgr:registerAll{
+    setRPB = function()
+      openPrompt('Rows per beat', '1-32', function(buf)
+        local n = tonumber(buf); if n then vm:setRowPerBeat(n) end
+      end)
+    end,
+
+    addTypedCol = function()
+      openPrompt('Add Column', 'cc0-127, pb, at, pc, dly', function(typeStr)
+        local type, idStr = typeStr:lower():match('^(%a+)(%d*)$')
+        if not type then return end
+        local id = idStr ~= '' and tonumber(idStr) or nil
+        if type == 'dly' then vm:showDelay()
+        elseif util:oneOf('cc pb at pc', type) then
+          if type == 'cc' and (not id or id < 0 or id > 127) then return end
+          vm:addExtraCol(type, id)
+        end
+      end)
+    end,
+
+    reswing              = scopedAction('reswing',                'reswing'),
+    quantize             = scopedAction('quantize',               'quantize'),
+    quantizeKeepRealised = scopedAction('quantize keep realised', 'quantizeKeepRealised'),
+
+    openSwingEditor = function()
+      if swingEditor then return end
+      local name = cm:get('swing')
+      local lib  = cm:get('swings')
+      swingEditor = {
+        name      = name,
+        snapshot  = name and lib[name] or nil,
+        createBuf = '',
+      }
+    end,
+
+    quit = function() quitting = true end,
+  }
+
+  cmgr:doAfter({ 'reswing', 'quantize', 'quantizeKeepRealised' },
+               function() vm:ec():unstick() end)
 
   ----- Swing editor
 
@@ -1087,7 +1136,6 @@ function newRenderManager(vm, cm, cmgr)
       | ImGui.WindowFlags_NoScrollWithMouse
       | ImGui.WindowFlags_NoDocking
       | ImGui.WindowFlags_NoNav)
-    local quit = false
 
     if visible then
       if #vm.grid.cols > 0 then
@@ -1095,7 +1143,7 @@ function newRenderManager(vm, cm, cmgr)
         drawTracker()
         drawStatusBar()
         handleMouse()
-        quit = handleKeys()
+        handleKeys()
         drawModal()
       else
         ImGui.Text(ctx, 'Select a MIDI item to begin.')
@@ -1111,7 +1159,7 @@ function newRenderManager(vm, cm, cmgr)
 
     vm:tick()
 
-    return open and not quit
+    return open and not quitting
   end
 
   return rm

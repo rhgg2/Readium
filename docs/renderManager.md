@@ -7,8 +7,9 @@ everything from `vm` each frame and routes all writes back through `vm` or
 ## Pull-only discipline
 
 rm caches almost nothing of what vm/tm know. Every frame it re-reads
-`vm.grid`, `vm:cursor()`, `vm:selection()`, `vm:displayParams()` etc.
-fresh. The only persistent local state is ephemeral UI:
+`vm.grid`, `vm:ec()`, `vm:rowPerBar()` etc. fresh, and reads pure
+config (`rowPerBeat`, `currentOctave`, `advanceBy`) directly from cm.
+The only persistent local state is ephemeral UI:
 
 - grid cell metrics (`gridX`, `gridY`) — derived once from
   `CalcTextSize('W')` and held.
@@ -116,11 +117,11 @@ wheel ignores command return codes.
 Strictly ordered, one pass per frame:
 
 1. **Command dispatch.** Iterate `cmgr.keymap`; `IsKeyPressed(key) &&
-   GetKeyMods() == mods` fires the command. Return-code protocol is
-   the one documented in `docs/commandManager.md` — `'quit'` exits the
-   loop, `'modal'` / `'swingEditor'` open the respective overlays,
-   `'fallthrough'` keeps scanning the keymap, anything else stops the
-   pass.
+   GetKeyMods() == mods` fires the command. The command returns `false`
+   to decline (keep scanning, let the char queue see the press) or
+   anything else (incl. `nil`) to consume the keypress. UI effects
+   (modal, swing editor, quit) are produced as side effects by commands
+   rm itself registers — see `docs/commandManager.md`.
 2. **Edit char queue** (unmodified, no command key held). One
    character dequeued via `GetInputQueueCharacter` per frame and
    routed to `vm:editEvent`. The `commandHeld` flag is tracked across
@@ -137,8 +138,9 @@ is set, so the popup owns the keyboard until dismissed.
 
 ## Modal
 
-Centred on the viewport, driven by whatever state the triggering
-command returned via the `'modal'` return code:
+Centred on the viewport. Triggered by rm-internal commands calling
+`openPrompt(title, prompt, callback)` or `openConfirm(title, callback)`,
+which set `modalState` and call `ImGui.OpenPopup`. The dispatch table:
 
 - **confirm** — Y / Enter → `callback(true)`; N / Escape →
   `callback(false)`; no text buffer.

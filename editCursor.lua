@@ -7,7 +7,7 @@ function newEditCursor(deps)
   ---------- PRIVATE
 
   local grid     = deps.grid
-  local getRPB   = deps.rowPerBeat
+  local cm       = deps.cm
   local getRPBar = deps.rowPerBar
   local moveHook = deps.moveHook or function () end
 
@@ -80,7 +80,7 @@ function newEditCursor(deps)
 
     local r1, r2
     if vBlockScope == 1 or vBlockScope == 2 then
-      local unit = vBlockScope == 1 and getRPB() or getRPBar()
+      local unit = vBlockScope == 1 and cm:get('rowPerBeat') or getRPBar()
       r1 = math.floor(cursorRow / unit) * unit
       r2 = math.min(r1 + unit - 1, numRows - 1)
     elseif vBlockScope == 3 then
@@ -183,79 +183,74 @@ function newEditCursor(deps)
     if selecting or isSticky() then selUpdate() end
   end
 
-  local function moveUnit(n, toFirstStop, toLastStop)
-    if not isSticky() then selClear() end
-    local sgn  = n > 0 and 1 or -1
-    local land = sgn > 0 and toLastStop or toFirstStop
+  local moveCol, moveChannel do
+    local function moveUnit(n, toFirstStop, toLastStop)
+      if not isSticky() then selClear() end
+      local sgn  = n > 0 and 1 or -1
+      local land = sgn > 0 and toLastStop or toFirstStop
 
-    if isSticky() then
-      for _ = 1, math.abs(n) do
-        local extending = (sgn > 0 and cursorCol >= selAnchor.col)
-                       or (sgn < 0 and cursorCol <= selAnchor.col)
-        if extending then moveStop(sgn); land()
-        else              land();        moveStop(sgn) end
-      end
-    else
-      for _ = 1, math.abs(n) do
-        if sgn > 0 then toLastStop();  moveStop(1)
-        else            toFirstStop(); moveStop(-1); toFirstStop()
+      if isSticky() then
+        for _ = 1, math.abs(n) do
+          local extending = (sgn > 0 and cursorCol >= selAnchor.col)
+                         or (sgn < 0 and cursorCol <= selAnchor.col)
+          if extending then moveStop(sgn); land()
+          else              land();        moveStop(sgn) end
+        end
+      else
+        for _ = 1, math.abs(n) do
+          if sgn > 0 then toLastStop();  moveStop(1)
+          else            toFirstStop(); moveStop(-1); toFirstStop()
+          end
         end
       end
+      if isSticky() then selUpdate() end
     end
-    if isSticky() then selUpdate() end
-  end
 
-  local function moveCol(n)
-    moveUnit(n,
-      function()
-        cursorStop = 1
-        if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
-          moveStop(1)
+    function moveCol(n)
+      moveUnit(n,
+        function()
+          cursorStop = 1
+          if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
+            moveStop(1)
+            cursorStop = #grid.cols[cursorCol].stopPos
+          end
+        end,
+        function()
           cursorStop = #grid.cols[cursorCol].stopPos
-        end
-      end,
-      function()
-        cursorStop = #grid.cols[cursorCol].stopPos
-        if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
-          moveStop(1)
-          cursorStop = #grid.cols[cursorCol].stopPos
-        end
-    end)
-  end
-
-  local function moveChannel(n)
-    local function chanRange()
-      local chan = grid.cols[cursorCol].midiChan
-      return grid.chanFirstCol[chan], grid.chanLastCol[chan]
-    end
-    moveUnit(n,
-      function()
-        local first, _ = chanRange()
-        cursorCol, cursorStop = first, 1
-      end,
-      function()
-        local _, last = chanRange()
-        cursorCol  = last
-        cursorStop = #grid.cols[cursorCol].stopPos
+          if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
+            moveStop(1)
+            cursorStop = #grid.cols[cursorCol].stopPos
+          end
       end)
-    -- pc/pb sit left of the note column, so the raw scroll lands on pc.
-    -- Snap forward to the first note column of the landing channel.
-    if not isSticky() then
-      local first, last = chanRange()
-      for ci = first, last do
-        if grid.cols[ci].type == 'note' then
-          cursorCol, cursorStop = ci, 1
-          break
+    end
+
+    function moveChannel(n)
+      local function chanRange()
+        local chan = grid.cols[cursorCol].midiChan
+        return grid.chanFirstCol[chan], grid.chanLastCol[chan]
+      end
+      moveUnit(n,
+        function()
+          local first, _ = chanRange()
+          cursorCol, cursorStop = first, 1
+        end,
+        function()
+          local _, last = chanRange()
+          cursorCol  = last
+          cursorStop = #grid.cols[cursorCol].stopPos
+        end)
+      -- pc/pb sit left of the note column, so the raw scroll lands on pc.
+      -- Snap forward to the first note column of the landing channel.
+      if not isSticky() then
+        local first, last = chanRange()
+        for ci = first, last do
+          if grid.cols[ci].type == 'note' then
+            cursorCol, cursorStop = ci, 1
+            break
+          end
         end
       end
     end
-  end
-
-  local function selectSpan(scope, col, stop1, stop2)
-    cursorCol, cursorStop = col, stop2
-    selAnchor = { row = cursorRow, col = col, stop = stop1 }
-    hBlockScope, vBlockScope = scope, 3
-    selUpdate()
   end
 
   ---------- PUBLIC
@@ -264,16 +259,24 @@ function newEditCursor(deps)
 
   function ec:row()           return cursorRow  end
   function ec:col()           return cursorCol  end
-  function ec:stop()          return cursorStop end
-  function ec:selection()     return sel end
-  function ec:anchor()        return selAnchor end
+  function ec:pos()           return cursorRow, cursorCol, cursorStop end
   function ec:hasSelection()  return sel ~= nil end
   function ec:isSticky()      return isSticky() end
 
-  -- Iterator over cols covered by the active selection, skipping nils.
-  -- Yields nothing when no selection is active; cursor fallback is caller policy.
+  -- Iterator over the cols an op should target: the selection's cols if
+  -- a selection is active, otherwise just the cursor's col (or nothing if
+  -- it's nil). Skips nil cols. Callers that need to distinguish a real
+  -- selection from the cursor-fallback case still have ec:hasSelection().
   function ec:eachSelectedCol()
-    if not sel then return function() end end
+    if not sel then
+      local col, ci = grid.cols[cursorCol], cursorCol
+      local done = col == nil
+      return function()
+        if done then return end
+        done = true
+        return col, ci
+      end
+    end
     local ci = sel.col1 - 1
     return function()
       ci = ci + 1
@@ -313,9 +316,11 @@ function newEditCursor(deps)
   end
 
   function ec:cursorKind()                return cursorKind() end
-  function ec:kindAt(col, stop)           return kindAt(col, stop) end
 
-  -- No-sel: degenerates to 1x1 at cursor.
+  -- The rect to operate on, kind-typed. Internal sel stores selgrp
+  -- (selUpdate / selectionStopSpan need the numeric handle); the public
+  -- boundary speaks kinds. Degenerates to 1x1 at cursor when no selection
+  -- — `hasSelection()` is the bit when that distinction matters.
   function ec:region()
     if sel then
       return sel.row1, sel.row2, sel.col1, sel.col2,
@@ -326,22 +331,21 @@ function newEditCursor(deps)
     return cursorRow, cursorRow, cursorCol, cursorCol, k, k
   end
 
-  -- Top-left corner of the region as an addressable position. Complement
-  -- to ec:region(): where region() returns semantic bounds, regionFrom()
-  -- returns a (row, col, stop) triple suitable for ec:setPos. Degenerates
-  -- to the cursor when no selection.
-  function ec:regionFrom()
-    if not sel then return cursorRow, cursorCol, cursorStop end
-    return sel.row1, sel.col1,
+  -- (col, stop) of the region's top-left corner. Returns a pair so callers
+  -- can splat directly into setPos: `ec:setPos(row, ec:regionStart())`.
+  -- Degenerates to the cursor's col/stop when no selection.
+  function ec:regionStart()
+    if not sel then return cursorCol, cursorStop end
+    return sel.col1,
            firstStopForKind(sel.col1, kindFromSelGrp(sel.col1, sel.selgrp1))
   end
 
-  function ec:setSelection(r1, r2, c1, c2, kind1, kind2)
-    local g1 = SELGRP_BY_NOTE_KIND[kind1] or 1
-    local g2 = SELGRP_BY_NOTE_KIND[kind2] or 1
-    sel = { row1 = r1, row2 = r2, col1 = c1, col2 = c2,
+  function ec:setSelection(r)
+    local g1 = SELGRP_BY_NOTE_KIND[r.kind1] or 1
+    local g2 = SELGRP_BY_NOTE_KIND[r.kind2] or 1
+    sel = { row1 = r.row1, row2 = r.row2, col1 = r.col1, col2 = r.col2,
             selgrp1 = g1, selgrp2 = g2 }
-    selAnchor = { row = r1, col = c1, stop = firstStopForSelGrp(c1, g1) }
+    selAnchor = { row = r.row1, col = r.col1, stop = firstStopForSelGrp(r.col1, g1) }
     hBlockScope, vBlockScope = 0, 0
   end
 
@@ -364,33 +368,69 @@ function newEditCursor(deps)
     return s1, s2
   end
 
-  function ec:selStart()  selStart()  end
-  function ec:selUpdate() selUpdate() end
   function ec:selClear()  selClear()  end
   function ec:unstick()   hBlockScope, vBlockScope = 0, 0 end
 
-  function ec:cycleHBlock() cycleHBlock() end
-  function ec:cycleVBlock() cycleVBlock() end
-  function ec:swapEnds()    swapEnds() end
-
-  function ec:moveRow(n, selecting)  moveRow(n, selecting) end
-  function ec:moveStop(n, selecting) moveStop(n, selecting) end
-  function ec:moveCol(n)             moveCol(n) end
-  function ec:moveChannel(n)         moveChannel(n) end
-
-  function ec:selectChannel(chan)
-    local first = grid.chanFirstCol[chan]
-    if first then selectSpan(2, first, 1, 1) end
+  -- Extend the selection to land on (row, col, stop), creating a fresh
+  -- 1x1 sel anchored at the current cursor first if none was active.
+  -- Mouse shift-click and drag both speak this verb.
+  function ec:extendTo(row, col, stop)
+    if not sel then selStart() end
+    self:setPos(row, col, stop)
+    selUpdate()
   end
 
-  function ec:selectColumn(col)
-    local c = grid.cols[col]
-    if c then selectSpan(1, col, 1, #c.stopPos) end
+  function ec:advance() moveRow(cm:get('advanceBy')) end
+
+  do
+    local function selectSpan(scope, col, stop1, stop2)
+      cursorCol, cursorStop = col, stop2
+      selAnchor = { row = cursorRow, col = col, stop = stop1 }
+      hBlockScope, vBlockScope = scope, 3
+      selUpdate()
+    end
+
+    function ec:selectChannel(chan)
+      local first = grid.chanFirstCol[chan]
+      if first then selectSpan(2, first, 1, 1) end
+    end
+
+    function ec:selectColumn(col)
+      local c = grid.cols[col]
+      if c then selectSpan(1, col, 1, #c.stopPos) end
+    end
+  end
+
+  function ec:registerCommands(cmgr)
+    cmgr:registerAll{
+      cursorDown    = function() moveRow(1) end,
+      cursorUp      = function() moveRow(-1) end,
+      pageDown      = function() moveRow(getRPBar()) end,
+      pageUp        = function() moveRow(-getRPBar()) end,
+      goTop         = function() moveRow(-cursorRow) end,
+      goBottom      = function() moveRow((grid.numRows or 1) - cursorRow) end,
+      goLeft        = function() moveCol(-cursorCol) end,
+      goRight       = function() moveCol(#grid.cols - cursorCol) end,
+      cursorRight   = function() moveStop(1) end,
+      cursorLeft    = function() moveStop(-1) end,
+      selectDown    = function() moveRow(1, true) end,
+      selectUp      = function() moveRow(-1, true) end,
+      selectRight   = function() moveStop(1, true) end,
+      selectLeft    = function() moveStop(-1, true) end,
+      selectClear   = function() selClear() end,
+      colRight      = function() moveCol(1) end,
+      colLeft       = function() moveCol(-1) end,
+      channelRight  = function() moveChannel(1) end,
+      channelLeft   = function() moveChannel(-1) end,
+      cycleBlock    = function() cycleHBlock() end,
+      cycleVBlock   = function() cycleVBlock() end,
+      swapBlockEnds = function() swapEnds() end,
+    }
   end
 
   -- Stamp kind-shape fields onto a half-built grid column. ec owns both
   -- the shape tables and the field names; addGridCol never names them.
-  function ec:decorateCol(col)
+  do
     local STOPS = {
       note          = {0,2,4,5},          -- C-4 30
       noteWithDelay = {0,2,4,5,7,8,9},    -- C-4 30 [040]
@@ -405,9 +445,11 @@ function newEditCursor(deps)
       cc = {1,1}, pa = {1,1}, at = {1,1}, pc = {1,1},
     }
 
-    local key = (col.type == 'note' and col.showDelay) and 'noteWithDelay' or col.type
-    col.stopPos   = STOPS[key]     or {0}
-    col.selGroups = SELGROUPS[key] or {0}
+    function ec:decorateCol(col)
+      local key = (col.type == 'note' and col.showDelay) and 'noteWithDelay' or col.type
+      col.stopPos   = STOPS[key]     or {0}
+      col.selGroups = SELGROUPS[key] or {0}
+    end
   end
 
   return ec
@@ -800,8 +842,19 @@ function newClipboard(deps)
   local clipboard = {}
   function clipboard:collect()           return collect() end
   function clipboard:copy()              local c = collect(); if c then save(c) end end
-  function clipboard:paste()             local c = load(); if c then pasteClip(c) end end
   function clipboard:pasteClip(clip)     pasteClip(clip) end
   function clipboard:trimTop(clip, trim) trimTop(clip, trim) end
+
+  function clipboard:registerCommands(cmgr)
+    cmgr:registerAll{
+      copy  = function() local c = collect(); if c then save(c) end; ec:selClear() end,
+      paste = function()
+        if ec:isSticky() then ec:selClear()
+        else local c = load(); if c then pasteClip(c) end
+        end
+      end,
+    }
+  end
+
   return clipboard
 end

@@ -1,10 +1,10 @@
 # commandManager
 
-Central registry for named actions and the keys that invoke them. vm (and
-any future manager split) registers command handlers by name; rm binds
-default keys and drives dispatch from its ImGui render loop. Also holds
-the physical-keyboard → note-input layouts used when typing notes into
-the grid.
+Central registry for named actions and the keys that invoke them.
+Managers register command handlers by name — each owns the commands
+that close over its state. rm binds default keys and drives dispatch
+from its ImGui render loop. Also holds the physical-keyboard →
+note-input layouts used when typing notes into the grid.
 
 Two orthogonal tables live on the manager:
 
@@ -20,34 +20,53 @@ wrap existing commands without threading through the dispatch loop.
 
 ```
 newCommandManager(cm)                  -- empty commands + empty keymap
-  → newViewManager(tm, cm, cmgr)       -- vm calls registerAll{...}, then wrap(...)
-  → newRenderManager(vm, cm, cmgr)     -- rm calls installDefaultKeymap(ImGui)
+  → newViewManager(tm, cm, cmgr)       -- vm registers editing commands;
+                                       --   ec / clipboard self-register
+                                       --   navigation + clipboard commands;
+                                       --   then vm applies wrap(...)
+  → newRenderManager(vm, cm, cmgr)     -- rm registers UX commands and
+                                       --   calls installDefaultKeymap(ImGui)
 ```
 
-vm registers the full command table in one bulk `registerAll`, then
-applies a set of `wrap` calls for cross-cutting behaviour (see below).
-rm installs the default keymap at construction; users will eventually
-layer overrides on top.
+Registration is split by ownership rather than packed into one site:
+
+- **ec** (`ec:registerCommands(cmgr)`, called from vm) — navigation and
+  selection-shape commands.
+- **clipboard** (`clipboard:registerCommands(cmgr)`, called from vm) —
+  `copy`, `paste`.
+- **vm** (`cmgr:registerAll`) — editing commands, transport, column
+  management, display, swing/tuning cycling, and cross-layer composites
+  like `cut` (which combines `clipboard:copy` with `vm`'s
+  `deleteSelection`).
+- **rm** (`cmgr:registerAll`) — commands whose effect lives in rm-only
+  state: modals (`setRPB`, `addTypedCol`), confirm-scoped variants of
+  vm's domain verbs (`reswing`, `quantize`, `quantizeKeepRealised`),
+  the swing editor (`openSwingEditor`), and `quit`.
+
+After registration vm applies `wrap` calls for cross-cutting behaviour
+(see below). rm installs the default keymap at construction; users
+will eventually layer overrides on top.
 
 ## Dispatch & result protocol
 
 rm's key-handling loop iterates `cmgr.keymap`, matches ImGui key +
-modifier state, and invokes `cmgr.commands[name]()`. The handler's first
-return value is a control code consumed by rm:
+modifier state, and invokes `cmgr.commands[name]()`. The return value is
+a single boolean-ish:
 
-| return          | meaning                                                   |
-|-----------------|-----------------------------------------------------------|
+| return          | meaning                                                    |
+|-----------------|------------------------------------------------------------|
 | `nil` (default) | command handled; stop scanning further bindings this frame |
-| `'quit'`        | exit the script                                           |
-| `'modal'`       | open a text-input popup; second return is the modal state |
-| `'swingEditor'` | open the swing editor overlay                             |
-| `'fallthrough'` | command ran but did not consume the keypress              |
+| `false`         | command declined the keypress; let the char queue see it   |
 
-Handlers that need to pass state back (currently only modals) return it
-as the second value.
+UI effects (open a modal, open the swing editor, quit) are not
+expressed in the return value — the commands that produce them are
+registered by the layer that owns the effect. rm owns the modal,
+swing-editor, and quit commands and closes over its own state; vm
+exposes the underlying domain verbs (e.g. `vm:reswingSelection`,
+`vm:reswingAll`) for rm's confirm-scoped wrappers to call.
 
 Commands invoked by name outside the keymap path (mouse wheel,
-swing-editor buttons) ignore the result code and just run for effect.
+swing-editor buttons) ignore the return value and just run for effect.
 
 ## Wrapping
 
@@ -117,12 +136,13 @@ newCommandManager(cm)            -- cm used for live noteLayout lookup
 cmgr:register(name, fn)          -- add or overwrite one command
 cmgr:registerAll(tbl)            -- bulk { name = fn, ... }
 cmgr:wrap(name, wrapper)         -- commands[name] = wrapper(orig); no-op if unregistered
+cmgr:doBefore(name, fn)          -- run fn() before name; name may be a string or list
+cmgr:doAfter(name, fn)           -- run fn() after name;  name may be a string or list
 cmgr:invoke(name, ...)           -- call by name; no-op if unregistered
 ```
 
-`fn` returns `nil`, `'quit'`, `'modal'`, `'swingEditor'`, or
-`'fallthrough'` (optionally with a second state value — see dispatch
-protocol).
+`fn` returns `nil` (handled) or `false` (declined — let the char queue
+see the keypress). See dispatch protocol.
 
 ### Keymap
 

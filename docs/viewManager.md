@@ -88,11 +88,17 @@ Note selgroups: 1 = pitch, 2 = velocity, 3 = delay. `(col, selgrp)`
 picks which typed edit a keypress performs (pitch vs velocity vs
 delay) and which clipboard / nudge semantics apply.
 
-A selection extends the caret into a rectangle:
+A selection extends the caret into a rectangle. Internally:
 
 ```
 sel = { row1, row2, col1, col2, selgrp1, selgrp2 }   -- or nil
 ```
+
+At the public boundary `ec:region()` returns
+`row1, row2, col1, col2, kind1, kind2` (with cursor-degenerate fallback
+to a 1×1 rect — `ec:hasSelection()` is the bit when that distinction
+matters), and `ec:setSelection{ row1, row2, col1, col2, kind1, kind2 }`
+takes a kind-typed record. selgrps stay internal.
 
 `selAnchor` is the fixed end; the cursor is the moving end. Sticky
 block scopes cycle orthogonally:
@@ -110,16 +116,20 @@ scope-locked, letting the user drive the opposite edge.
 
 The cursor and selection live in a `newEditCursor` factory in
 `editCursor.lua`. vm constructs one ec at startup over
-`{ grid, rowPerBeat, rowPerBar }` and installs `followViewport` via
-`ec:setMoveHook`. Both vm and rm consume ec directly — rm reaches it
-via `vm:ec()`. ec owns: position (`row/col/stop/setPos/clampPos`),
-motion (`moveRow/Stop/Col/Channel`), selection
-(`selStart/Update/Clear/isSticky/unstick/swapEnds/cycleHBlock/VBlock/setSelection/shiftSelection/selectChannel/Column/eachSelectedCol`),
-kind (`cursorKind/kindAt/region/regionFrom/selectionStopSpan`),
-grid-column kind decoration (`decorateCol`), and lifecycle
-(`reset/rescaleRow`). Cursor-axis clamping lives in `ec:clampPos`;
-viewport follow stays vm-side because it touches scrollRow/scrollCol
-and runs through the move hook.
+`{ grid, cm, rowPerBar, moveHook }`, passing `followViewport`
+as the move hook. ec reads pure config (`advanceBy`, `rowPerBeat`)
+straight from cm; vm only passes the derived `rowPerBar` closure.
+Both vm and rm consume ec directly — rm reaches it via `vm:ec()`.
+ec owns: position (`row/col/pos/setPos/clampPos`),
+motion (`advance` for advance-by; `moveStop/Col/Channel` and
+`cycleHBlock/VBlock/swapEnds` are command-internal), selection
+(`selClear/isSticky/unstick/extendTo/setSelection/shiftSelection/selectChannel/Column/eachSelectedCol`),
+kind (`cursorKind/region/regionStart/selectionStopSpan`),
+grid-column kind decoration (`decorateCol`), lifecycle
+(`reset/rescaleRow`), and command registration (`registerCommands`).
+Cursor-axis clamping lives in `ec:clampPos`; viewport follow stays
+vm-side because it touches scrollRow/scrollCol and runs through the
+move hook.
 
 ## Frames
 
@@ -277,9 +287,10 @@ cleanly.
 
 ## Reswing / quantize
 
-All batch operations go through the same scope protocol: if there's a
-selection, operate on it; otherwise confirm via modal and operate on
-the whole take (`scopeOrConfirm`, `allGroups`).
+vm exposes paired domain verbs `vm:<base>Selection()` /
+`vm:<base>All()` for each batch op (reswing, quantize,
+quantizeKeepRealised). The selection-vs-all-with-confirm UX choice
+lives in rm, which dispatches to one or the other.
 
 - **`reswingScope`** — for each event, unapply its owner's authoring
   frame, apply the current target frame, and restamp notes with the
@@ -328,24 +339,33 @@ kills stale auditions after `AUDITION_TIMEOUT` (0.8s). MIDI chan is
 
 ## Commands & wrappers
 
-vm registers its full command set in a single `cmgr:registerAll` at
-construction, keyed by flat string names. Categories:
+Command registration is split by ownership: ec self-registers
+navigation and selection-shape commands via `ec:registerCommands(cmgr)`,
+clipboard self-registers `copy/paste` via
+`clipboard:registerCommands(cmgr)`, and vm registers everything else
+in a single `cmgr:registerAll` at construction. Categories:
 
-- **navigation** — `cursorDown/Up`, `pageDown/Up`, `goTop/Bottom/Left/Right`,
-  `cursorLeft/Right`, `colLeft/Right`, `channelLeft/Right`
-- **selection** — `select*` variants, `cycleBlock`, `cycleVBlock`,
+- **navigation** (ec) — `cursorDown/Up`, `pageDown/Up`,
+  `goTop/Bottom/Left/Right`, `cursorLeft/Right`, `colLeft/Right`,
+  `channelLeft/Right`
+- **selection** (ec) — `select*` variants, `cycleBlock`, `cycleVBlock`,
   `swapBlockEnds`, `selectClear`
-- **edit** — `delete`, `deleteSel`, `copy`, `cut`, `paste`,
-  `duplicateUp/Down`, `interpolate`, `insertRow`, `deleteRow`
+- **clipboard** (clipboard) — `copy`, `paste`. `cut` stays in vm
+  because it composes `clipboard:copy()` with `deleteSelection`.
+- **edit** (vm) — `delete`, `deleteSel`, `cut`, `duplicateUp/Down`,
+  `interpolate`, `insertRow`, `deleteRow`
 - **note shaping** — `growNote`, `shrinkNote`, `noteOff`,
   `nudgeForward/Back`, `nudgeCoarse/FineUp/Down`
 - **transport** — `play`, `stop`, `playPause`, `playFromTop/Cursor`
-- **column management** — `addNoteCol`, `addTypedCol`, `hideExtraCol`
-- **display** — `doubleRPB`, `halveRPB`, `setRPB`,
+- **column management** — `addNoteCol`, `hideExtraCol`
+- **display** — `doubleRPB`, `halveRPB`,
   `matchGridToCursor`, `cycleTuning`, `inputOctaveUp/Down`, `advBy0..9`
-- **timing** — `reswing[All]`, `quantize[All]`,
-  `quantizeKeepRealised[All]`, `cycleSwing`, `setSwingComposite`,
-  `reswingPreset`, `setSwingSlot`, `openSwingEditor`
+- **timing** — `cycleSwing`, `setSwingComposite`,
+  `reswingPreset`, `setSwingSlot`
+
+`addTypedCol`, `setRPB`, `reswing`, `quantize`, `quantizeKeepRealised`,
+`openSwingEditor`, `quit` are owned by rm (they wrap UI orchestration
+around vm's domain verbs).
 
 See `docs/commandManager.md` for the dispatch protocol and return-code
 convention.
@@ -356,8 +376,9 @@ vm then applies three families of `cmgr:wrap`:
   clears the selection instead of pasting, so the explicit second
   press pastes at the cursor.
 - **auto-unstick** — all nudge / grow / duplicate / interpolate /
-  row-insert / reswing / quantize commands drop sticky flags after
-  running.
+  row-insert / `noteOff` commands drop sticky flags after running.
+  (rm applies the same wrapper to its `reswing` / `quantize` /
+  `quantizeKeepRealised` registrations.)
 - **auto-selClear** — `delete` / `deleteSel` / `cut` clear the
   selection after running, since the affected events are gone.
 
@@ -368,8 +389,9 @@ vm then applies three families of `cmgr:wrap`:
   mutated in place on rebuild, never reassigned, so rm need not
   re-fetch.
 - **rm is pull-only.** vm fires no render callbacks; rm queries
-  `vm.grid`, `vm:cursor()`, `vm:selection()`, `vm:displayParams()`
-  etc. each frame.
+  `vm.grid`, `vm:ec()`, `vm:rowPerBar()` etc. each frame, and reads
+  pure config (`rowPerBeat`, `currentOctave`, `advanceBy`) directly
+  from cm rather than through vm.
 - **Frame stamping is unconditional on note add** via
   `addNoteEvent` — the single choke point. Never call
   `tm:addEvent('note', ...)` from vm directly.
@@ -385,9 +407,7 @@ vm then applies three families of `cmgr:wrap`:
 ### Construction & lifecycle
 
 ```
-newViewManager(tm, cm, cmgr)   -- tm/cm may be nil; attach later
-vm:attach(tm, cm)              -- detach any prior, rebuild immediately
-vm:detach()                    -- remove callbacks from attached tm/cm
+newViewManager(tm, cm, cmgr)   -- wires callbacks on tm/cm and rebuilds
 vm:rebuild(changed)            -- manual rebuild; defaults to { take=false, data=true }
 vm:tick()                      -- called each frame by rm; kills stale audition
 ```
@@ -396,9 +416,8 @@ vm:tick()                      -- called each frame by rm; kills stale audition
 
 ```
 vm.grid                         -- see "Grid shape"; live handle
-vm:cursor()                    -> cursorRow, cursorCol, cursorStop, scrollRow, scrollCol
-vm:selection()                 -> sel or nil
-vm:displayParams()             -> rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
+vm:ec()                        -> editCursor (rm uses ec:pos, ec:hasSelection, ec:region, ec:selectionStopSpan)
+vm:rowPerBar()                 -> rows per bar (rowPerBeat × first ts num)
 vm:timeSig()                   -> num, denom  (first ts of the take)
 vm:markMode()                  -> bool  (inside a sticky block)
 vm:lastVisibleFrom(startCol)   -> last grid col that fits in gridWidth from startCol
@@ -416,14 +435,12 @@ vm:barBeatSub(row)             -> bar, beat, sub, ts
 
 ### Cursor / selection / scroll
 
+vm itself owns viewport sizing and rpb; the cursor and selection live
+on ec (reach via `vm:ec()`).
+
 ```
 vm:setGridSize(w, h)           -- visible viewport in chars / rows
-vm:setCursor(row, col, stop)
 vm:setRowPerBeat(n)            -- clamped 1..32; cursor row rescales
-vm:selStart() / vm:selUpdate() / vm:selClear()
-vm:selectChannel(chan)         -- sticky all-rows channel-wide selection
-vm:selectColumn(col)           -- sticky all-rows single-column selection
-vm:clearMark()                 -- alias for selClear
 ```
 
 ### Channel mute / solo

@@ -883,22 +883,8 @@ function newTrackerManager(mm, cm)
     end
   end
 
-  function tm:attach(newMM, newCM)
-    if not (newMM and newCM) then return end
-
-    self:detach()
-    mm = newMM
-    cm = newCM
-    mm:addCallback(callback)
-    cm:addCallback(configCallback)
-    self:rebuild({ take = true, data = true })
-  end
-
-  function tm:detach()
-    if mm then mm:removeCallback(callback) end
-    if cm then cm:removeCallback(configCallback) end
-  end
-
-  if mm and cm then tm:attach(mm, cm) end
+  mm:addCallback(callback)
+  cm:addCallback(configCallback)
+  tm:rebuild({ take = true, data = true })
   return tm
 end

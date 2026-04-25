@@ -7,10 +7,9 @@ return {
     name = 'empty take produces an empty grid',
     run = function(harness)
       local h = harness.mk()
-      local rpb, rpbar, resolution = h.vm:displayParams()
-      t.eq(rpb,   4,  'default rowPerBeat')
-      t.eq(rpbar, 16, 'default rowPerBar (4/4)')
-      t.truthy(resolution, 'resolution set')
+      t.eq(h.cm:get('rowPerBeat'), 4,  'default rowPerBeat')
+      t.eq(h.vm:rowPerBar(),       16, 'default rowPerBar (4/4)')
+      t.truthy(h.tm:resolution(),       'resolution set')
     end,
   },
 

@@ -24,7 +24,7 @@ return {
       h.vm:setGridSize(80, 40)
       -- Cursor on row 4 (240 ppq @ 4 rpb / res 240), col 1, pitch stop.
       h.ec:setPos(4, 1, 1)
-      h.ec:selStart(); h.ec:selUpdate()
+      h.ec:extendTo(h.ec:pos())  -- degenerate 1x1 sel at cursor
 
       local clip = h.clipboard:collect()
       t.eq(clip.mode,    'single', 'mode')
@@ -87,7 +87,7 @@ return {
       }
       h.vm:setGridSize(80, 40)
       -- Select cols 1..3 (each chan's first note col), pitch kind.
-      h.ec:setSelection(0, 0, 1, 3, 'pitch', 'pitch')
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=3, kind1='pitch', kind2='pitch' }
 
       local clip = h.clipboard:collect()
       t.eq(clip.mode,       'multi', 'mode')

@@ -261,9 +261,7 @@ rebuild (see `vmOnlyKeys`).
 ### Construction & lifecycle
 
 ```
-newTrackerManager(mm, cm)   -- both optional; attach later
-tm:attach(mm, cm)           -- detach any prior, rebuild immediately
-tm:detach()                 -- remove callbacks from attached mm/cm
+newTrackerManager(mm, cm)   -- wires callbacks on mm/cm and rebuilds
 tm:rebuild(changed)         -- manual rebuild; changed defaults to {take=false, data=true}
 ```
 

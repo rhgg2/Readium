@@ -55,7 +55,11 @@ function newCommandManager(cm)
   end
 
   function mgr:doBefore(name, before)
-    mgr:wrap(name, function(orig)
+    if type(name) == 'table' then
+      for _, n in ipairs(name) do self:doBefore(n, before) end
+      return
+    end
+    self:wrap(name, function(orig)
       return function ()
         before()
         return orig()
@@ -64,7 +68,11 @@ function newCommandManager(cm)
   end
 
   function mgr:doAfter(name, after)
-    mgr:wrap(name, function(orig)
+    if type(name) == 'table' then
+      for _, n in ipairs(name) do self:doAfter(n, after) end
+      return
+    end
+    self:wrap(name, function(orig)
       return function ()
         local r, s = orig()
         after()
