@@ -79,8 +79,6 @@ function newViewContext(args)
       return active
     end
   
-    -- Time sigs land on bar boundaries — swing fixpoints — so the round-trip
-    -- through ppqToRow is stable and the floor is exact.
     local function tsRow(ts) return math.floor(ctx:ppqToRow(ts.ppq)) end
 
     function ctx:rowBeatInfo(row)
@@ -161,20 +159,32 @@ function newViewManager(tm, cm, cmgr)
     return ghosts
   end
 
+  local vm = {}
+  vm.grid = grid  -- live handle for rm; mutated in place on rebuild
+
+  ----- Frame override
+
+  local function effectiveSwing()
+    if frameOverride then return frameOverride.swing end
+    return cm:get('swing')
+  end
+
+  local function effectiveColSwing(chan)
+    if frameOverride and frameOverride.chan == chan then return frameOverride.col end
+    return cm:get('colSwing')[chan]
+  end
+
+  local function effectiveRPB()
+    return (frameOverride and frameOverride.rpb) or cm:get('rowPerBeat')
+  end
+
   -- Bookmark stamped onto a new note — captures the authoring frame so
   -- matchGridToCursor can restore it later.
   local function currentFrame(chan)
-    if frameOverride then
-      return {
-        swing    = frameOverride.swing,
-        colSwing = frameOverride.chan == chan and frameOverride.col or cm:get('colSwing')[chan],
-        rpb      = frameOverride.rpb,
-      }
-    end
     return {
-      swing    = cm:get('swing'),
-      colSwing = cm:get('colSwing')[chan],
-      rpb      = cm:get('rowPerBeat'),
+      swing    = effectiveSwing(),
+      colSwing = effectiveColSwing(chan),
+      rpb      = effectiveRPB(),
     }
   end
 
@@ -187,51 +197,85 @@ function newViewManager(tm, cm, cmgr)
     return { swing = frameOverride.swing, colSwing = colMap }
   end
 
-  ----- Mute / solo
-
-  local effectiveMuted = {}  -- cached for cheap per-cell render queries
-
-  local function recomputeEffectiveMute()
-    local m = cm:get('mutedChannels')
-    local s = cm:get('soloedChannels')
-    if next(s) then
-      for c = 1, 16 do
-        if s[c] then m[c] = nil
-        else        m[c] = true end
-      end
+  -- Toggle: snap grid to cursor event's frame, or release if already overriding.
+  -- RPB change rescales ec so the cursor stays visually put.
+  local function matchGridToCursor()
+    local oldRPB = rowPerBeat
+    if frameOverride then
+      frameOverride = nil
+    else
+      local col = grid.cols[ec:col()]
+      local evt = col and col.type == 'note' and col.cells and col.cells[ec:row()]
+      if not (evt and evt.frame) then return end
+      frameOverride = {
+        swing = evt.frame.swing,
+        col   = evt.frame.colSwing,
+        chan  = col.midiChan,
+        rpb   = evt.frame.rpb,
+      }
     end
-    effectiveMuted = m
+    local newRPB = effectiveRPB()
+    if newRPB ~= oldRPB then ec:rescaleRow(oldRPB, newRPB) end
+    vm:rebuild({ data = true })
   end
 
-  local function pushMute()
-    recomputeEffectiveMute()
-    if tm then tm:setMutedChannels(effectiveMuted) end
-  end
+  ----- Mute / solo
+  
+  local pushMute do  
+    local effectiveMuted = {}  -- cached for cheap per-cell render queries
 
-  local function toggleChannelFlag(key, chan)
-    local s = cm:get(key)
-    s[chan] = (not s[chan]) or nil
-    cm:set('take', key, s)
+    local function toggleChannelFlag(key, chan)
+      local s = cm:get(key)
+      s[chan] = (not s[chan]) or nil
+      cm:set('take', key, s)
+    end
+
+    function pushMute()
+      local m = cm:get('mutedChannels')
+      local s = cm:get('soloedChannels')
+      if next(s) then
+        for c = 1, 16 do
+          if s[c] then m[c] = nil
+          else        m[c] = true end
+        end
+      end
+      effectiveMuted = m
+      if tm then tm:setMutedChannels(effectiveMuted) end
+    end
+
+    function vm:isChannelMuted(chan)            return cm:get('mutedChannels')[chan]  == true end
+    function vm:isChannelSoloed(chan)           return cm:get('soloedChannels')[chan] == true end
+    function vm:isChannelEffectivelyMuted(chan) return effectiveMuted[chan] == true end
+    function vm:toggleChannelMute(chan)         toggleChannelFlag('mutedChannels',  chan) end
+    function vm:toggleChannelSolo(chan)         toggleChannelFlag('soloedChannels', chan) end
   end
 
   ----- Audition
 
-  local auditionNote     = nil  -- { chan, pitch } (chan is 0-indexed for MIDI)
-  local auditionTime     = 0    -- reaper.time_precise() when note was sent
-  local AUDITION_TIMEOUT = 0.8  -- seconds
+  local audition, killAudition do
+    local auditionNote     = nil  -- { chan, pitch } (chan is 0-indexed for MIDI)
+    local auditionTime     = 0    -- reaper.time_precise() when note was sent
+    local AUDITION_TIMEOUT = 0.8  -- seconds
 
-  local function killAudition()
-    if not auditionNote then return end
-    reaper.StuffMIDIMessage(0, 0x80 | auditionNote.chan, auditionNote.pitch, 0)
-    auditionNote = nil
-  end
+    function killAudition()
+      if not auditionNote then return end
+      reaper.StuffMIDIMessage(0, 0x80 | auditionNote.chan, auditionNote.pitch, 0)
+      auditionNote = nil
+    end
 
-  local function audition(pitch, vel, chan)
-    killAudition()
-    local midiChan = (chan or 1) - 1  -- internal 1-indexed → MIDI 0-indexed
-    reaper.StuffMIDIMessage(0, 0x90 | midiChan, pitch, vel or 100)
-    auditionNote = { chan = midiChan, pitch = pitch }
-    auditionTime = reaper.time_precise()
+    function audition(pitch, vel, chan)
+      killAudition()
+      local midiChan = (chan or 1) - 1  -- internal 1-indexed → MIDI 0-indexed
+      reaper.StuffMIDIMessage(0, 0x90 | midiChan, pitch, vel or 100)
+      auditionNote = { chan = midiChan, pitch = pitch }
+      auditionTime = reaper.time_precise()
+    end
+
+    function vm:tick()
+      if auditionNote and reaper.time_precise() - auditionTime > AUDITION_TIMEOUT then
+        killAudition()
+      end
+    end
   end
 
   ----- Navigation
@@ -276,42 +320,9 @@ function newViewManager(tm, cm, cmgr)
   local function moveCol(n)             killAudition(); ec:moveCol(n)             end
   local function moveChannel(n)         killAudition(); ec:moveChannel(n)         end
 
-  ----- Editing
+  function vm:lastVisibleFrom(startCol) return lastVisibleFrom(startCol) end
 
-  local hexDigit = {}
-  for i = 0, 9 do hexDigit[string.byte(tostring(i))] = i end
-  for i = 0, 5 do
-    hexDigit[string.byte('a') + i] = 10 + i
-    hexDigit[string.byte('A') + i] = 10 + i
-  end
-
-  local function addNoteEvent(col, update)
-    update.frame = currentFrame(update.chan)
-    tm:addEvent('note', update)
-  end
-
-  local function placeNewNote(col, update)
-    local last = util:seek(col.events, 'before', update.ppq, util.isNote)
-    local next = util:seek(col.events, 'after',  update.ppq, util.isNote)
-    if last and last.endppq >= update.ppq then
-      tm:assignEvent('note', last, { endppq = update.ppq })
-    end
-    update.vel    = last and last.vel or cm:get('defaultVelocity')
-    update.endppq = next and next.ppq or length
-    update.lane   = col.lane
-    addNoteEvent(col, update)
-  end
-
-  local function notePAEvents(col, pitch, startPPQ, endPPQ)
-    local pas = {}
-    for _, evt in ipairs(col.events) do
-      if evt.type == 'pa' and evt.pitch == pitch
-        and evt.ppq >= startPPQ and evt.ppq <= endPPQ then
-        util:add(pas, evt)
-      end
-    end
-    return pas
-  end
+  ----- Note geometry  (shared by editing, adjust*, nudge, quantizeKeepRealised)
 
   local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
     local off  = allowOverlap and cm:get('overlapOffset') * resolution or 0
@@ -330,152 +341,191 @@ function newViewManager(tm, cm, cmgr)
     return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
   end
 
-  local function editEvent(col, evt, stop, char, half)
-    if not col then return end
-    local type = col.type
-    local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
+  ----- Editing
 
-    local function commit(auditionPitch, auditionVel)
-      tm:flush()
-      moveRow(advanceBy)
-      if auditionPitch then audition(auditionPitch, auditionVel or 100, col.midiChan) end
+  local addNoteEvent do
+    local hexDigit = {}
+    for i = 0, 9 do hexDigit[string.byte(tostring(i))] = i end
+    for i = 0, 5 do
+      hexDigit[string.byte('a') + i] = 10 + i
+      hexDigit[string.byte('A') + i] = 10 + i
     end
 
-    -- Off-grid write snaps intent to the cursor row
-    local function snap(update)
-      if not evt or evt.ppq == cursorPPQ then return update end
-      update.ppq = cursorPPQ
-      if evt.endppq then update.endppq = cursorPPQ + (evt.endppq - evt.ppq) end
-      return update
+    function addNoteEvent(col, update)
+      update.frame = currentFrame(update.chan)
+      tm:addEvent('note', update)
     end
 
-    if type == 'note' then
+    local function placeNewNote(col, update)
+      local last = util:seek(col.events, 'before', update.ppq, util.isNote)
+      local next = util:seek(col.events, 'after',  update.ppq, util.isNote)
+      if last and last.endppq >= update.ppq then
+        tm:assignEvent('note', last, { endppq = update.ppq })
+      end
+      update.vel    = last and last.vel or cm:get('defaultVelocity')
+      update.endppq = next and next.ppq or length
+      update.lane   = col.lane
+      addNoteEvent(col, update)
+    end
 
-      if stop == 1 then
-        local nk = cmgr:noteChars(char); if not nk then return end
-        local pitch = util:clamp((currentOctave + 1 + nk[2]) * 12 + nk[1], 0, 127)
-        local detune = 0
-        local tuning = ctx:activeTuning()
-        if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
-
-        -- Existing note → repitch, snapping intent time to the cursor row.
-        -- tm clears same-(chan, pitch) overlaps at the write boundary.
-        if util.isNote(evt) then
-          tm:assignEvent('note', evt, snap({ pitch = pitch, detune = detune }))
-          return commit(pitch, evt.vel)
+    local function notePAEvents(col, pitch, startPPQ, endPPQ)
+      local pas = {}
+      for _, evt in ipairs(col.events) do
+        if evt.type == 'pa' and evt.pitch == pitch
+          and evt.ppq >= startPPQ and evt.ppq <= endPPQ then
+          util:add(pas, evt)
         end
+      end
+      return pas
+    end
 
-        -- PA cell → wipe host's PA tail, then fall through
-        if evt and evt.type == 'pa' then
-          local host = util:seek(col.events, 'before', evt.ppq, util.isNote)
-          if host and host.endppq > evt.ppq then
-            for _, pa in ipairs(notePAEvents(col, host.pitch, evt.ppq, host.endppq)) do
-              tm:deleteEvent('pa', pa)
-            end
-          else
-            tm:deleteEvent('pa', evt)
+    function vm:editEvent(col, evt, stop, char, half)
+      if not col then return end
+      local type = col.type
+      local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
+
+      local function commit(auditionPitch, auditionVel)
+        tm:flush()
+        moveRow(advanceBy)
+        if auditionPitch then audition(auditionPitch, auditionVel or 100, col.midiChan) end
+      end
+
+      -- Off-grid write snaps intent to the cursor row
+      local function snap(update)
+        if not evt or evt.ppq == cursorPPQ then return update end
+        update.ppq = cursorPPQ
+        if evt.endppq then update.endppq = cursorPPQ + (evt.endppq - evt.ppq) end
+        return update
+      end
+
+      if type == 'note' then
+
+        if stop == 1 then
+          local nk = cmgr:noteChars(char); if not nk then return end
+          local pitch = util:clamp((currentOctave + 1 + nk[2]) * 12 + nk[1], 0, 127)
+          local detune = 0
+          local tuning = ctx:activeTuning()
+          if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
+
+          -- Existing note → repitch, snapping intent time to the cursor row.
+          -- tm clears same-(chan, pitch) overlaps at the write boundary.
+          if util.isNote(evt) then
+            tm:assignEvent('note', evt, snap({ pitch = pitch, detune = detune }))
+            return commit(pitch, evt.vel)
           end
-        end
 
-        local new = { pitch = pitch, detune = detune, ppq = cursorPPQ, chan = col.midiChan }
-        placeNewNote(col, new)
-        return commit(pitch, new.vel)
+          -- PA cell → wipe host's PA tail, then fall through
+          if evt and evt.type == 'pa' then
+            local host = util:seek(col.events, 'before', evt.ppq, util.isNote)
+            if host and host.endppq > evt.ppq then
+              for _, pa in ipairs(notePAEvents(col, host.pitch, evt.ppq, host.endppq)) do
+                tm:deleteEvent('pa', pa)
+              end
+            else
+              tm:deleteEvent('pa', evt)
+            end
+          end
 
-      elseif stop == 2 then
-        if not util.isNote(evt) then return end
-        local oct
-        if char == string.byte('-') then oct = -1
+          local new = { pitch = pitch, detune = detune, ppq = cursorPPQ, chan = col.midiChan }
+          placeNewNote(col, new)
+          return commit(pitch, new.vel)
+
+        elseif stop == 2 then
+          if not util.isNote(evt) then return end
+          local oct
+          if char == string.byte('-') then oct = -1
+          else
+            local d = char - string.byte('0')
+            if d < 0 or d > 9 then return end
+            oct = d
+          end
+          local pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
+          tm:assignEvent('note', evt, { pitch = pitch })
+          return commit(pitch, evt.vel)
+
+        -- delay: signed decimal milli-QN, 3 digits, ±999
+        elseif stop == 5 or stop == 6 or stop == 7 then
+          if not util.isNote(evt) then return end
+          local old = evt.delay
+
+          local newDelay
+          if char == string.byte('-') then
+            if old == 0 then return end
+            newDelay = -old
+          else
+            local d = char - string.byte('0')
+            if d < 0 or d > 9 then return end
+            local sign = old < 0 and -1 or 1
+            local mag  = util:clamp(util:setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
+            newDelay = sign * mag
+          end
+
+          local minD, maxD = delayRange(col, evt)
+          newDelay = util:clamp(newDelay, math.ceil(minD), math.floor(maxD))
+          tm:assignEvent('note', evt, { delay = newDelay })
+          return commit()
+
+        -- velocity nibble (on note) or PA value
         else
-          local d = char - string.byte('0')
-          if d < 0 or d > 9 then return end
-          oct = d
+          local d = hexDigit[char]; if not d then return end
+          local function newVel(old)
+            return util:clamp(util:setDigit(old, d, 4 - stop, 16, half), 1, 127)
+          end
+
+          if evt and evt.type == 'pa' then
+            tm:assignEvent('pa', evt, snap({ val = newVel(evt.val) }))
+            return commit()
+          end
+
+          if evt then
+            tm:assignEvent('note', evt, { vel = newVel(evt.vel) })
+            return commit()
+          end
+
+          if cm:get('polyAftertouch') then
+            local note = util:seek(col.events, 'before', cursorPPQ, util.isNote)
+            if note and note.endppq > cursorPPQ then
+              local val = newVel(0)
+              tm:addEvent('pa', {
+                ppq = cursorPPQ, chan = col.midiChan,
+                pitch = note.pitch, val = val
+              })
+              return commit()
+            end
+          end
+          return
         end
-        local pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
-        tm:assignEvent('note', evt, { pitch = pitch })
-        return commit(pitch, evt.vel)
+      end
 
-      -- delay: signed decimal milli-QN, 3 digits, ±999
-      elseif stop == 5 or stop == 6 or stop == 7 then
-        if not util.isNote(evt) then return end
-        local old = evt.delay
-
-        local newDelay
+      -- non-note columns
+      local update
+      if util:oneOf('cc at pc', type) then
+        local d = hexDigit[char]; if not d then return end
+        update = { val = util:clamp(util:setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
+      elseif type == 'pb' then
+        local old = evt and evt.val or 0
         if char == string.byte('-') then
           if old == 0 then return end
-          newDelay = -old
+          update = { val = -old }
         else
           local d = char - string.byte('0')
           if d < 0 or d > 9 then return end
           local sign = old < 0 and -1 or 1
-          local mag  = util:clamp(util:setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
-          newDelay = sign * mag
+          update = { val = sign * util:setDigit(math.abs(old), d, 4 - stop, 10, half) }
         end
-
-        local minD, maxD = delayRange(col, evt)
-        newDelay = util:clamp(newDelay, math.ceil(minD), math.floor(maxD))
-        tm:assignEvent('note', evt, { delay = newDelay })
-        return commit()
-
-      -- velocity nibble (on note) or PA value
       else
-        local d = hexDigit[char]; if not d then return end
-        local function newVel(old)
-          return util:clamp(util:setDigit(old, d, 4 - stop, 16, half), 1, 127)
-        end
-
-        if evt and evt.type == 'pa' then
-          tm:assignEvent('pa', evt, snap({ val = newVel(evt.val) }))
-          return commit()
-        end
-
-        if evt then
-          tm:assignEvent('note', evt, { vel = newVel(evt.vel) })
-          return commit()
-        end
-
-        if cm:get('polyAftertouch') then
-          local note = util:seek(col.events, 'before', cursorPPQ, util.isNote)
-          if note and note.endppq > cursorPPQ then
-            local val = newVel(0)
-            tm:addEvent('pa', {
-              ppq = cursorPPQ, chan = col.midiChan,
-              pitch = note.pitch, val = val
-            })
-            return commit()
-          end
-        end
         return
       end
-    end
 
-    -- non-note columns
-    local update
-    if util:oneOf('cc at pc', type) then
-      local d = hexDigit[char]; if not d then return end
-      update = { val = util:clamp(util:setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
-    elseif type == 'pb' then
-      local old = evt and evt.val or 0
-      if char == string.byte('-') then
-        if old == 0 then return end
-        update = { val = -old }
+      if evt then
+        tm:assignEvent(type, evt, snap(update))
       else
-        local d = char - string.byte('0')
-        if d < 0 or d > 9 then return end
-        local sign = old < 0 and -1 or 1
-        update = { val = sign * util:setDigit(math.abs(old), d, 4 - stop, 10, half) }
+        if type == 'cc' then util:assign(update, { cc = col.cc }) end
+        util:assign(update, { ppq = cursorPPQ, chan = col.midiChan })
+        tm:addEvent(type, update)
       end
-    else
-      return
+      commit()
     end
-    
-    if evt then
-      tm:assignEvent(type, evt, snap(update))
-    else
-      if type == 'cc' then util:assign(update, { cc = col.cc }) end
-      util:assign(update, { ppq = cursorPPQ, chan = col.midiChan })
-      tm:addEvent(type, update)
-    end
-    commit()
   end
 
   ----- Deletion
@@ -768,6 +818,8 @@ function newViewManager(tm, cm, cmgr)
     tm:flush()
   end
 
+  ----- Reswing / quantize
+
   -- Every column, every event, as a groups list (for *-all variants).
   local function allGroups()
     local groups = {}
@@ -1027,7 +1079,9 @@ function newViewManager(tm, cm, cmgr)
     function deleteRow() forEachRowOp(deleteRowCore, function() clipboard:copy() end) end
   end
 
-  local applyNudge do
+  ----- Nudge
+
+  local nudge do
     local function pitchStep(coarse)
       if not coarse then return 1 end
       local t = ctx:activeTuning()
@@ -1078,62 +1132,62 @@ function newViewManager(tm, cm, cmgr)
       if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
     end
 
-    function applyNudge(col, evt, kind, dir, coarse, audible)
+    local function applyNudge(col, evt, kind, dir, coarse, audible)
       if     kind == 'val'   then nudgeValue(col, evt, dir, coarse)
       elseif kind == 'vel'   then nudgeVel(evt, dir, coarse)
       elseif kind == 'delay' then nudgeDelay(col, evt, dir, coarse)
       elseif kind == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
     end
-  end
 
-  -- First event in col that starts anywhere in the cursor row. For note
-  -- columns, PAs are skipped.
-  local function cursorRowEvent(col)
-    if not col then return end
-    local r = ec:row()
-    local lo, hi = ctx:rowToPPQ(r, col.midiChan), ctx:rowToPPQ(r + 1, col.midiChan)
-    local pred = col.type == 'note' and util.isNote or nil
-    local evt = util:seek(col.events, 'at-or-after', lo, pred)
-    if evt and evt.ppq < hi then return evt end
-  end
+    -- First event in col that starts anywhere in the cursor row. For note
+    -- columns, PAs are skipped.
+    local function cursorRowEvent(col)
+      if not col then return end
+      local r = ec:row()
+      local lo, hi = ctx:rowToPPQ(r, col.midiChan), ctx:rowToPPQ(r + 1, col.midiChan)
+      local pred = col.type == 'note' and util.isNote or nil
+      local evt = util:seek(col.events, 'at-or-after', lo, pred)
+      if evt and evt.ppq < hi then return evt end
+    end
 
-  -- Column-typed nudge. Selection rule: if any note event is selected,
-  -- transpose / velocity- / delay-nudge the notes and leave value events
-  -- alone; otherwise nudge val on every value event. Solo cursor: first
-  -- event in the cursor row, column- and kind-typed.
-  local function nudge(dir, coarse)
-    if ec:hasSelection() then
-      local groups = eventsByCol()
+    -- Column-typed nudge. Selection rule: if any note event is selected,
+    -- transpose / velocity- / delay-nudge the notes and leave value events
+    -- alone; otherwise nudge val on every value event. Solo cursor: first
+    -- event in the cursor row, column- and kind-typed.
+    function nudge(dir, coarse)
+      if ec:hasSelection() then
+        local groups = eventsByCol()
 
-      local anyNote = false
-      for _, g in ipairs(groups) do
-        if g.col.type == 'note' then
-          for _, e in pairs(g.locs) do
-            if util.isNote(e) then anyNote = true; break end
+        local anyNote = false
+        for _, g in ipairs(groups) do
+          if g.col.type == 'note' then
+            for _, e in pairs(g.locs) do
+              if util.isNote(e) then anyNote = true; break end
+            end
+            if anyNote then break end
           end
-          if anyNote then break end
         end
-      end
 
-      for _, g in ipairs(groups) do
-        local skip = g.kind == 'val' and anyNote
-        if not skip then
-          for _, e in pairs(g.locs) do
-            if g.kind == 'val' or util.isNote(e) then
-              applyNudge(g.col, e, g.kind, dir, coarse, false)
+        for _, g in ipairs(groups) do
+          local skip = g.kind == 'val' and anyNote
+          if not skip then
+            for _, e in pairs(g.locs) do
+              if g.kind == 'val' or util.isNote(e) then
+                applyNudge(g.col, e, g.kind, dir, coarse, false)
+              end
             end
           end
         end
+        tm:flush()
+        return
       end
-      tm:flush()
-      return
-    end
 
-    local col = grid.cols[ec:col()]
-    local evt = cursorRowEvent(col)
-    if not evt then return end
-    applyNudge(col, evt, ec:cursorKind(), dir, coarse, true)
-    tm:flush()
+      local col = grid.cols[ec:col()]
+      local evt = cursorRowEvent(col)
+      if not evt then return end
+      applyNudge(col, evt, ec:cursorKind(), dir, coarse, true)
+      tm:flush()
+    end
   end
 
   local deleteSelection do
@@ -1244,10 +1298,6 @@ function newViewManager(tm, cm, cmgr)
 
   ---------- PUBLIC
 
-  local vm = {}
-
-  vm.grid = grid  -- live handle for rm; mutated in place on rebuild
-
   function vm:ec()        return ec end
   function vm:clipboard() return clipboard end
   function vm:scroll()    return scrollRow, scrollCol end
@@ -1272,8 +1322,6 @@ function newViewManager(tm, cm, cmgr)
     return ts.num, ts.denom
   end
 
-  function vm:lastVisibleFrom(startCol) return lastVisibleFrom(startCol) end
-
   function vm:setGridSize(w, h)
     gridWidth, gridHeight = w, h
   end
@@ -1283,37 +1331,6 @@ function newViewManager(tm, cm, cmgr)
     if n == rowPerBeat then return end
     ec:rescaleRow(rowPerBeat, n)
     cm:set('track', 'rowPerBeat', n)
-  end
-
-  function vm:isChannelMuted(chan)            return cm:get('mutedChannels')[chan]  == true end
-  function vm:isChannelSoloed(chan)           return cm:get('soloedChannels')[chan] == true end
-  function vm:isChannelEffectivelyMuted(chan) return effectiveMuted[chan] == true end
-  function vm:toggleChannelMute(chan)         toggleChannelFlag('mutedChannels',  chan) end
-  function vm:toggleChannelSolo(chan)         toggleChannelFlag('soloedChannels', chan) end
-
-  function vm:editEvent(col, evt, stop, char, half)
-    editEvent(col, evt, stop, char, half)
-  end
-
-  function vm:tick()
-    if auditionNote and reaper.time_precise() - auditionTime > AUDITION_TIMEOUT then
-      killAudition()
-    end
-  end
-
-  -- Parses "cc74", "pb", "at", "pc", "dly". Selection/cursor fallback is
-  -- resolved inside the vm methods.
-  local function addTypedColFromString(typeStr)
-    local type, idStr = typeStr:lower():match('^(%a+)(%d*)$')
-    if not type then return end
-    local id = idStr ~= '' and tonumber(idStr) or nil
-
-    if type == 'dly' then
-      vm:showDelay()
-    elseif util:oneOf('cc pb at pc', type) then
-      if type == 'cc' and (not id or id < 0 or id > 127) then return end
-      vm:addExtraCol(type, id)
-    end
   end
 
   ----- Command helpers
@@ -1328,14 +1345,6 @@ function newViewManager(tm, cm, cmgr)
     tm:playFrom(ctx:rowToPPQ(ec:row(), col and col.midiChan))
   end
 
-  local function addTypedColModal()
-    return 'modal', {
-      title    = 'Add Column',
-      prompt   = 'cc0-127, pb, at, pc, dly',
-      callback = addTypedColFromString,
-    }
-  end
-
   local function setRPBModal()
     return 'modal', {
       title    = 'Rows per beat',
@@ -1345,28 +1354,6 @@ function newViewManager(tm, cm, cmgr)
         if n then vm:setRowPerBeat(n) end
       end,
     }
-  end
-
-  -- Toggle: snap grid to cursor event's frame, or release if already overriding.
-  -- RPB change rescales ec so the cursor stays visually put.
-  local function matchGridToCursor()
-    local oldRPB = rowPerBeat
-    if frameOverride then
-      frameOverride = nil
-    else
-      local col = grid.cols[ec:col()]
-      local evt = col and col.type == 'note' and col.cells and col.cells[ec:row()]
-      if not (evt and evt.frame) then return end
-      frameOverride = {
-        swing = evt.frame.swing,
-        col   = evt.frame.colSwing,
-        chan  = col.midiChan,
-        rpb   = evt.frame.rpb,
-      }
-    end
-    local newRPB = effectiveRPB()
-    if newRPB ~= oldRPB then ec:rescaleRow(oldRPB, newRPB) end
-    vm:rebuild({ data = true })
   end
 
   local function cycleTuning()
@@ -1530,6 +1517,31 @@ function newViewManager(tm, cm, cmgr)
 
   for i = 0, 9 do
     cmgr:register('advBy' .. i, function() cm:set('take', 'advanceBy', i) end)
+  end
+
+  ----- Columns
+
+  -- Parses "cc74", "pb", "at", "pc", "dly". Selection/cursor fallback is
+  -- resolved inside the vm methods.
+  local function addTypedColFromString(typeStr)
+    local type, idStr = typeStr:lower():match('^(%a+)(%d*)$')
+    if not type then return end
+    local id = idStr ~= '' and tonumber(idStr) or nil
+
+    if type == 'dly' then
+      vm:showDelay()
+    elseif util:oneOf('cc pb at pc', type) then
+      if type == 'cc' and (not id or id < 0 or id > 127) then return end
+      vm:addExtraCol(type, id)
+    end
+  end
+
+  local function addTypedColModal()
+    return 'modal', {
+      title    = 'Add Column',
+      prompt   = 'cc0-127, pb, at, pc, dly',
+      callback = addTypedColFromString,
+    }
   end
 
   -- Applies to every unique channel in the active selection; with no
