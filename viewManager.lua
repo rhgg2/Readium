@@ -157,9 +157,8 @@ function newViewManager(tm, cm, cmgr)
     }
   end
 
-  -- Drop the transient frame override (if any) and re-align ec to the
-  -- rpb that surfaces from underneath. Returns true if a frame was
-  -- released, false otherwise.
+  -- Drop the transient frame override (if any). Returns true if a
+  -- frame was released, false otherwise.
   local function releaseTransientFrame()
     local releasing = false
     for k in pairs(FRAME_KEYS) do
@@ -1256,11 +1255,6 @@ function newViewManager(tm, cm, cmgr)
   end
 
 
-  -- Duplicate the current selection (or cursor row) to the adjacent block in
-  -- the given direction (dir=1 below, dir=-1 above), overwriting what's there.
-  -- The selection follows so repeated invocations stack. Going up past row 0
-  -- trims the top of the clip — the start of the block is cut off, not the end.
-  -- Preserves the user's clipboard.
   local function duplicate(dir)
     local clip = clipboard:collect()
     if not clip then return end
@@ -1320,9 +1314,6 @@ function newViewManager(tm, cm, cmgr)
   function vm:setRowPerBeat(n)
     n = util:clamp(n, 1, 32)
     if n == rowPerBeat then return end
-    -- Release any active transient frame override first so configCallback
-    -- doesn't see a non-transient frame-key write and try to release-and-
-    -- rescale on top of our own pre-cm:set rescale (double-rescaling ec).
     releaseTransientFrame()
     ec:rescaleRow(rowPerBeat, n)
     cm:set('track', 'rowPerBeat', n)
@@ -1399,123 +1390,8 @@ function newViewManager(tm, cm, cmgr)
     reswingPresetChange(name, oldComp, newComp)
   end
 
-  -- Command table — rm binds keys to these names via cmgr.
-  cmgr:registerAll{
-    cursorDown     = function() moveRow(1) end,
-    cursorUp       = function() moveRow(-1) end,
-    pageDown       = function() moveRow(rowPerBar) end,
-    pageUp         = function() moveRow(-rowPerBar) end,
-    goTop          = function() moveRow(-ec:row()) end,
-    goBottom       = function() moveRow((grid.numRows or 1) - ec:row()) end,
-    goLeft         = function() moveCol(-ec:col()) end,
-    goRight        = function() moveCol(#grid.cols - ec:col()) end,
-    cursorRight    = function() moveStop(1) end,
-    cursorLeft     = function() moveStop(-1) end,
-    selectDown     = function() moveRow(1, true) end,
-    selectUp       = function() moveRow(-1, true) end,
-    selectRight    = function() moveStop(1, true) end,
-    selectLeft     = function() moveStop(-1, true) end,
-    selectClear    = function() ec:selClear() end,
-    colRight       = function() moveCol(1) end,
-    colLeft        = function() moveCol(-1) end,
-    channelRight   = function() moveChannel(1) end,
-    channelLeft    = function() moveChannel(-1) end,
-    cycleBlock     = function() ec:cycleHBlock() end,
-    cycleVBlock    = function() ec:cycleVBlock() end,
-    swapBlockEnds  = function() ec:swapEnds() end,
-    delete         = deleteOrBackspace,
-    interpolate    = function() interpolate() end,
-    deleteSel      = function() deleteSelection() end,
-    copy           = function() clipboard:copy(); ec:selClear() end,
-    cut            = function() clipboard:copy(); deleteSelection() end,
-    paste          = function() clipboard:paste() end,
-    duplicateDown  = function() duplicate( 1) end,
-    duplicateUp    = function() duplicate(-1) end,
-    inputOctaveUp   = function() cm:set('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
-    inputOctaveDown = function() cm:set('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
-    noteOff        = noteOff,
-    growNote       = function() adjustDuration(1) end,
-    shrinkNote     = function() adjustDuration(-1) end,
-    nudgeBack      = function() adjustPosition(-1) end,
-    nudgeForward   = function() adjustPosition(1) end,
-    insertRow      = function() insertRow() end,
-    deleteRow      = function() deleteRow() end,
-    nudgeCoarseUp   = function() nudge( 1, true)  end,
-    nudgeCoarseDown = function() nudge(-1, true)  end,
-    nudgeFineUp     = function() nudge( 1, false) end,
-    nudgeFineDown   = function() nudge(-1, false) end,
-    play           = function() tm:play() end,
-    playPause      = function() tm:playPause() end,
-    playFromTop    = function() tm:playFrom(0) end,
-    playFromCursor = playFromCursor,
-    stop           = function() tm:stop() end,
-    addNoteCol     = function() vm:addExtraCol('note') end,
-    addTypedCol    = addTypedColModal,
-    hideExtraCol   = function() vm:hideExtraCol() end,
-    doubleRPB      = function() vm:setRowPerBeat(rowPerBeat * 2) end,
-    halveRPB       = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
-    matchGridToCursor = matchGridToCursor,
-    setRPB         = setRPBModal,
-    cycleTuning    = cycleTuning,
-    reswing                 = function() return reswing() end,
-    reswingAll              = function() reswingAll() end,
-    quantize                = function() return quantize() end,
-    quantizeAll             = function() quantizeAll() end,
-    quantizeKeepRealised    = function() return quantizeKeepRealised() end,
-    quantizeKeepRealisedAll = function() quantizeKeepRealisedAll() end,
-    cycleSwing        = cycleSwing,
-    setSwingComposite = setSwingComposite,
-    setSwingSlot      = setSwingSlot,
-    reswingPreset     = reswingPreset,
-    openSwingEditor   = function() return 'swingEditor' end,
-    quit              = function() return 'quit' end,
-  }
-
-  -- In mark mode, paste's first press is swallowed as a cancel: it pastes at
-  -- cursor (not over selection), so we want an explicit second press.
-  cmgr:wrap('paste', function(orig)
-    return function()
-      if ec:isSticky() then ec:selClear() else return orig() end
-    end
-  end)
-
-  -- These commands operate on the current selection when sticky, then drop the
-  -- sticky flags so the edited region stays visible but doesn't extend on move.
-  for _, name in ipairs({
-    'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
-    'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward',
-    'duplicateDown', 'duplicateUp', 'interpolate', 'insertRow', 'deleteRow', 'noteOff',
-    'reswing', 'reswingAll',
-    'quantize', 'quantizeAll',
-    'quantizeKeepRealised', 'quantizeKeepRealisedAll',
-  }) do
-    cmgr:wrap(name, function(orig)
-      return function()
-        local r, s = orig()
-        ec:unstick()
-        return r, s
-      end
-    end)
-  end
-
-  -- After these, the affected events are gone; an empty sel rect isn't useful
-  -- feedback, so clear the selection entirely.
-  for _, name in ipairs({ 'delete', 'deleteSel', 'cut' }) do
-    cmgr:wrap(name, function(orig)
-      return function()
-        local r, s = orig()
-        ec:selClear()
-        return r, s
-      end
-    end)
-  end
-
-  for i = 0, 9 do
-    cmgr:register('advBy' .. i, function() cm:set('take', 'advanceBy', i) end)
-  end
-
   ----- Columns
-
+  
   -- Parses "cc74", "pb", "at", "pc", "dly". Selection/cursor fallback is
   -- resolved inside the vm methods.
   local function addTypedColFromString(typeStr)
@@ -1662,6 +1538,115 @@ function newViewManager(tm, cm, cmgr)
       if col then apply(col) end
     end
     if changed then cm:set('take', 'noteDelay', nd) end
+  end
+
+  ----- Command table
+
+    -- Command table — rm binds keys to these names via cmgr.
+  cmgr:registerAll{
+    cursorDown     = function() moveRow(1) end,
+    cursorUp       = function() moveRow(-1) end,
+    pageDown       = function() moveRow(rowPerBar) end,
+    pageUp         = function() moveRow(-rowPerBar) end,
+    goTop          = function() moveRow(-ec:row()) end,
+    goBottom       = function() moveRow((grid.numRows or 1) - ec:row()) end,
+    goLeft         = function() moveCol(-ec:col()) end,
+    goRight        = function() moveCol(#grid.cols - ec:col()) end,
+    cursorRight    = function() moveStop(1) end,
+    cursorLeft     = function() moveStop(-1) end,
+    selectDown     = function() moveRow(1, true) end,
+    selectUp       = function() moveRow(-1, true) end,
+    selectRight    = function() moveStop(1, true) end,
+    selectLeft     = function() moveStop(-1, true) end,
+    selectClear    = function() ec:selClear() end,
+    colRight       = function() moveCol(1) end,
+    colLeft        = function() moveCol(-1) end,
+    channelRight   = function() moveChannel(1) end,
+    channelLeft    = function() moveChannel(-1) end,
+    cycleBlock     = function() ec:cycleHBlock() end,
+    cycleVBlock    = function() ec:cycleVBlock() end,
+    swapBlockEnds  = function() ec:swapEnds() end,
+    delete         = deleteOrBackspace,
+    interpolate    = function() interpolate() end,
+    deleteSel      = function() deleteSelection() end,
+    copy           = function() clipboard:copy(); ec:selClear() end,
+    cut            = function() clipboard:copy(); deleteSelection() end,
+    paste          = function() if ec:isSticky() then ec:selClear() else clipboard:paste() end end,
+    duplicateDown  = function() duplicate( 1) end,
+    duplicateUp    = function() duplicate(-1) end,
+    inputOctaveUp   = function() cm:set('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
+    inputOctaveDown = function() cm:set('take', 'currentOctave', util:clamp(currentOctave-1, -1, 9)) end,
+    noteOff        = noteOff,
+    growNote       = function() adjustDuration(1) end,
+    shrinkNote     = function() adjustDuration(-1) end,
+    nudgeBack      = function() adjustPosition(-1) end,
+    nudgeForward   = function() adjustPosition(1) end,
+    insertRow      = function() insertRow() end,
+    deleteRow      = function() deleteRow() end,
+    nudgeCoarseUp   = function() nudge( 1, true)  end,
+    nudgeCoarseDown = function() nudge(-1, true)  end,
+    nudgeFineUp     = function() nudge( 1, false) end,
+    nudgeFineDown   = function() nudge(-1, false) end,
+    play           = function() tm:play() end,
+    playPause      = function() tm:playPause() end,
+    playFromTop    = function() tm:playFrom(0) end,
+    playFromCursor = playFromCursor,
+    stop           = function() tm:stop() end,
+    addNoteCol     = function() vm:addExtraCol('note') end,
+    addTypedCol    = addTypedColModal,
+    hideExtraCol   = function() vm:hideExtraCol() end,
+    doubleRPB      = function() vm:setRowPerBeat(rowPerBeat * 2) end,
+    halveRPB       = function() vm:setRowPerBeat(math.floor(rowPerBeat / 2)) end,
+    matchGridToCursor = matchGridToCursor,
+    setRPB         = setRPBModal,
+    cycleTuning    = cycleTuning,
+    reswing                 = function() return reswing() end,
+    reswingAll              = function() reswingAll() end,
+    quantize                = function() return quantize() end,
+    quantizeAll             = function() quantizeAll() end,
+    quantizeKeepRealised    = function() return quantizeKeepRealised() end,
+    quantizeKeepRealisedAll = function() quantizeKeepRealisedAll() end,
+    cycleSwing        = cycleSwing,
+    setSwingComposite = setSwingComposite,
+    setSwingSlot      = setSwingSlot,
+    reswingPreset     = reswingPreset,
+    openSwingEditor   = function() return 'swingEditor' end,
+    quit              = function() return 'quit' end,
+  }
+
+  for i = 0, 9 do
+    cmgr:register('advBy' .. i, function() cm:set('take', 'advanceBy', i) end)
+  end
+
+  -- These commands make a sticky selection unsticky, so it doesn't
+  -- extend on further move.
+  for _, name in ipairs({
+    'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
+    'growNote', 'shrinkNote', 'nudgeBack', 'nudgeForward',
+    'duplicateDown', 'duplicateUp', 'interpolate',
+    'insertRow', 'deleteRow', 'noteOff',
+    'reswing', 'reswingAll',
+    'quantize', 'quantizeAll',
+    'quantizeKeepRealised', 'quantizeKeepRealisedAll',
+  }) do
+    cmgr:wrap(name, function(orig)
+      return function()
+        local r, s = orig()
+        ec:unstick()
+        return r, s
+      end
+    end)
+  end
+
+  -- Clear selection after these commands
+  for _, name in ipairs({ 'delete', 'deleteSel', 'cut' }) do
+    cmgr:wrap(name, function(orig)
+      return function()
+        local r, s = orig()
+        ec:selClear()
+        return r, s
+      end
+    end)
   end
 
   ----- Rebuild
