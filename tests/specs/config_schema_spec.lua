@@ -191,4 +191,54 @@ return {
       t.eq(h.cm:get('pbRange'), 2, 'after project remove, schema default is effective')
     end,
   },
+
+  --------------------------------------------------------------------
+  -- transient tier: most-specific, never persisted
+  --------------------------------------------------------------------
+  {
+    name = 'transient is the most-specific level (overrides take)',
+    run = function(harness)
+      local h = harness.mk{
+        config = {
+          take      = { pbRange = 5 },
+          transient = { pbRange = 7 },
+        },
+      }
+      t.eq(h.cm:get('pbRange'), 7, 'transient overrides take')
+      h.cm:remove('transient', 'pbRange')
+      t.eq(h.cm:get('pbRange'), 5, 'after transient remove, take value is effective')
+    end,
+  },
+  {
+    name = 'transient writes do not persist across cm reconstruction',
+    run = function(harness)
+      local h = harness.mk{
+        config = { take = { pbRange = 5 } },
+      }
+      h.cm:set('transient', 'pbRange', 9)
+      t.eq(h.cm:get('pbRange'), 9, 'transient write is visible on this cm')
+      -- Rebuild a cm against the same take: persisted tiers reload from
+      -- ext-state, transient must come up empty.
+      local cm2 = newConfigManager()
+      cm2:setContext('take1')
+      t.eq(cm2:get('pbRange'), 5, 'fresh cm sees take but no transient leak')
+      t.eq(cm2:getAt('transient', 'pbRange'), nil, 'transient cache is empty on reload')
+    end,
+  },
+  {
+    name = 'cm fires changes with their level on the broadcast',
+    run = function(harness)
+      local h = harness.mk()
+      local seen = {}
+      h.cm:addCallback(function(changed) table.insert(seen, changed) end)
+      h.cm:set('take', 'pbRange', 4)
+      h.cm:remove('take', 'pbRange')
+      h.cm:assign('transient', { pbRange = 3 })
+      t.eq(seen[1].level, 'take',      'set carries level=take')
+      t.eq(seen[1].key,   'pbRange',   'set carries key=pbRange')
+      t.eq(seen[2].level, 'take',      'remove carries level=take')
+      t.eq(seen[3].level, 'transient', 'assign carries level=transient')
+      t.eq(seen[3].key,   nil,         'assign has no key (keyless broadcast)')
+    end,
+  },
 }

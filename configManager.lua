@@ -87,13 +87,16 @@ function newConfigManager()
   local fire  -- installed below, once cm exists
 
   local cache = {
-    global  = nil,
-    project = nil,
-    track   = nil,
-    take    = nil,
+    global    = nil,
+    project   = nil,
+    track     = nil,
+    take      = nil,
+    transient = nil,
   }
 
-  local levels = { 'global', 'project', 'track', 'take' }
+  -- transient sits above take: most-specific, never persisted. Used for
+  -- view-layer overrides that should auto-vanish when the script reloads.
+  local levels = { 'global', 'project', 'track', 'take', 'transient' }
 
   local levelSet = {}
   for _, l in ipairs(levels) do levelSet[l] = true end
@@ -173,17 +176,19 @@ function newConfigManager()
   end
 
   local loaders = {
-    global  = loadGlobal,
-    project = loadProject,
-    track   = loadTrack,
-    take    = loadTake,
+    global    = loadGlobal,
+    project   = loadProject,
+    track     = loadTrack,
+    take      = loadTake,
+    transient = function() return {} end,
   }
 
   local savers = {
-    global  = saveGlobal,
-    project = saveProject,
-    track   = saveTrack,
-    take    = saveTake,
+    global    = saveGlobal,
+    project   = saveProject,
+    track     = saveTrack,
+    take      = saveTake,
+    transient = function() end,
   }
 
   ---------- CACHE MANAGEMENT
@@ -282,7 +287,7 @@ function newConfigManager()
     cache[level] = cache[level] or {}
     cache[level][key] = copy(value)
     savers[level](cache[level])
-    fire({ config = true, key = key }, cm)
+    fire({ config = true, key = key, level = level }, cm)
   end
 
   function cm:remove(level, key)
@@ -293,7 +298,7 @@ function newConfigManager()
     if cache[level] then
       cache[level][key] = nil
       savers[level](cache[level])
-      fire({ config = true, key = key }, cm)
+      fire({ config = true, key = key, level = level }, cm)
     end
   end
 
@@ -309,7 +314,7 @@ function newConfigManager()
       else                     cache[level][k] = copy(v) end
     end
     savers[level](cache[level])
-    fire({ config = true }, cm)
+    fire({ config = true, level = level }, cm)
   end
 
   return cm

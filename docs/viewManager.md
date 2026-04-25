@@ -124,12 +124,17 @@ and runs through the move hook.
 ## Frames
 
 Two halves of one mechanism: authoring frames stamped on notes at
-write time, and a view-layer override that replaces cfg when active.
+write time, and a view-layer override that pushes a frame onto cm's
+`transient` tier when active.
 
 **Per-note stamp.** Every new note gets `evt.frame = currentFrame(chan)`
 on write — snapshotting the authoring swing + rpb so later reswings
-can undo it. For events that don't carry a frame of their own (CC /
-PB / AT / PC / PA), `frameOwner(col, e)` inherits one:
+can undo it. `currentFrame` reads merged cm, so a transient override
+is naturally inherited: notes authored under the override stamp the
+override's frame, not the underlying cfg's.
+
+For events that don't carry a frame of their own (CC / PB / AT / PC /
+PA), `frameOwner(col, e)` inherits one:
 
 - **notes** own themselves;
 - **PA** inherits from the lane-1 note whose pitch and interval
@@ -142,22 +147,25 @@ reswing. Legacy notes without a frame pass identity — `auth=nil` in
 `reswingCore` means no authoring unapply.
 
 **View-layer override.** `matchGridToCursor` (Ctrl-G) reads the
-authoring frame off the note under the cursor and installs it:
+authoring frame off the note under the cursor and writes it to cm's
+`transient` tier as a unit (`swing`, `colSwing`, `rowPerBeat`).
+Because `transient` is most-specific in the merge, every reader of
+those keys — including `tm:swingSnapshot()` and the rebuild itself —
+sees the override values without any vm-side lensing. Toggling the
+command again drops the three keys via `cm:assign('transient', ...)`
+with `util.REMOVE` sentinels.
 
-```
-frameOverride = { swing, col, chan, rpb }   -- col applies only to chan
-```
+`FRAME_KEYS = { swing, colSwing, rowPerBeat }` is the unit of override.
+`frameTransientActive()` checks whether any of them currently sit at
+the transient tier. `releaseTransientFrame()` peels them and rescales
+ec if rpb changes underneath.
 
-`effectiveSwing` / `effectiveColSwing(chan)` / `effectiveRPB` read
-from the override when present, else from cfg. `swingOverrideArg`
-packages the override for `tm:swingSnapshot`, substituting only the
-override's channel so other channels fall through to cfg. Any cfg
-change to `swing` / `colSwing` / `rowPerBeat` invalidates the override
-(see `frameKeys` in the cm callback).
-
-`currentFrame(chan)` is the glue: it reads the effective values (so
-new notes authored under an override inherit the override's frame)
-and produces the snapshot that gets stamped.
+The configCallback releases the override automatically when a real
+edit lands: any non-`transient` write to a frame key (e.g. the toolbar
+calling `cm:set('track', 'rowPerBeat', n)`) triggers
+`releaseTransientFrame()` so the user's input is visible. The check
+hinges on `changed.level ~= 'transient'`, so vm's own transient-tier
+writes don't recursively self-release.
 
 ## Rebuild & callbacks
 
@@ -165,9 +173,10 @@ Triggers:
 
 - `tm` callback when `changed.data` or `changed.take` fires;
 - `cm` callback on any config change **except** `mutedChannels` /
-  `soloedChannels` (which only push mute), plus the side-effect that
-  `swing` / `colSwing` / `rowPerBeat` changes nuke `frameOverride`
-  before the rebuild.
+  `soloedChannels` (which only push mute). Non-`transient` writes to
+  any `FRAME_KEYS` member while a transient override is active are
+  short-circuited into `releaseTransientFrame`, whose recursive
+  `cm:assign` fires the rebuild.
 
 Reentrancy-guarded by `rebuilding`. `changed.take` resets cursor /
 selection and re-reads `resolution`, `length`, `timeSigs` from tm;

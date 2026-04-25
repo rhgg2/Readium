@@ -1,6 +1,6 @@
 # configManager
 
-Four-tier config store. Reads merge all tiers (most-specific wins); writes
+Five-tier config store. Reads merge all tiers (most-specific wins); writes
 target a single tier. cm is the sole source of truth for valid keys and
 owns every table it hands out.
 
@@ -34,8 +34,8 @@ effect on cm.
 ## Levels & merge
 
 ```
-global  → project → track → take
-less specific ────────────→ more specific
+global  → project → track → take → transient
+less specific ──────────────────→ more specific
 ```
 
 The merged view is built by starting from schema defaults, then layering
@@ -47,17 +47,24 @@ defining the key, or nil.
 `take` and `track` levels require a take context (see below). Without
 one they contribute nothing to the merge.
 
+`transient` is the most-specific tier and never persists. It is reserved
+for view-layer overrides that should auto-vanish when the script
+reloads (e.g. `viewManager`'s match-grid-to-cursor frame override). On
+`setContext` the transient cache reloads to empty along with the rest.
+
 ## Storage backends
 
-| level   | backend                                            |
-|---------|----------------------------------------------------|
-| global  | Lua file at `<script-dir>/rdm_cfg.txt`             |
-| project | `SetProjExtState(0, 'rdm', 'config', …)`           |
-| track   | track `P_EXT:rdm_config`                           |
-| take    | take `P_EXT:rdm_config`                            |
+| level     | backend                                            |
+|-----------|----------------------------------------------------|
+| global    | Lua file at `<script-dir>/rdm_cfg.txt`             |
+| project   | `SetProjExtState(0, 'rdm', 'config', …)`           |
+| track     | track `P_EXT:rdm_config`                           |
+| take      | take `P_EXT:rdm_config`                            |
+| transient | none — in-memory only, reset to `{}` on reload     |
 
-All four backends use `util:serialise` / `util:unserialise` (the shared
-escaped format). Parse failures fall through to an empty table.
+The four persisted backends use `util:serialise` / `util:unserialise`
+(the shared escaped format). Parse failures fall through to an empty
+table.
 
 ## Context
 
@@ -72,11 +79,14 @@ table or nil values.
 `fire` is installed via `util:installHooks(cm)`. Callbacks run as
 `fn(changed, cm)`, where `changed` is:
 
-- `{ config = true, key = <name> }` — targeted writes (`set`, `remove`).
-  Consumers can filter on the keys they actually depend on.
-- `{ config = true }` — bulk paths (`setContext`, `assign`). Keyless
-  fires mean "any key may have changed"; consumers that care must treat
-  them as wildcards.
+- `{ config = true, key = <name>, level = <level> }` — targeted writes
+  (`set`, `remove`). Consumers can filter on the keys they actually
+  depend on, and on `level` to distinguish their own writes from
+  others' (`viewManager` uses this to skip self-release on its own
+  transient-tier writes).
+- `{ config = true, level = <level> }` — bulk `assign` (keyless).
+- `{ config = true }` — `setContext` reload. No `level`; treat as
+  "any key may have changed".
 
 ## Conventions
 
@@ -114,14 +124,14 @@ cm:getAt(level)        -> full cache table at that level (deep copy)
 cm:getLevel(key)       -> level name currently defining key, or nil
 ```
 
-`level` ∈ `{ 'global', 'project', 'track', 'take' }`.
+`level` ∈ `{ 'global', 'project', 'track', 'take', 'transient' }`.
 
 ### Writing
 
 ```
-cm:set(level, key, value)       -- fires { config=true, key }
-cm:remove(level, key)           -- fires { config=true, key } if present
-cm:assign(level, updates)       -- fires { config=true } (keyless)
+cm:set(level, key, value)       -- fires { config=true, key, level }
+cm:remove(level, key)           -- fires { config=true, key, level } if present
+cm:assign(level, updates)       -- fires { config=true, level } (keyless)
 ```
 
 `updates` is a `{ key = value }` table; a value of `util.REMOVE` deletes

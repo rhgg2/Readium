@@ -25,6 +25,7 @@ local specs = {
   'view_context_spec',
   'edit_cursor_spec',
   'clipboard_spec',
+  'vm_transient_frame_spec',
 }
 
 local pass, fail, failures = 0, 0, {}
