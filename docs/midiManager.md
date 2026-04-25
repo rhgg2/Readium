@@ -14,7 +14,7 @@ which shift as events are inserted/deleted.
 Per-note metadata (anything beyond the standard event fields) is persisted to
 the take's **extension data** under two key families:
 - `P_EXT:rdm_keys` — comma-separated list of all UUID texts. Loader's entry point.
-- `P_EXT:rdm_<uuidTxt>` — `util:serialise`d field table per note.
+- `P_EXT:rdm_<uuidTxt>` — `util.serialise`d field table per note.
 
 Stale keys (present in `rdm_keys` but no longer in `uuidTbl`) are cleared by
 writing an empty string to their extension slot — REAPER treats this as
@@ -42,7 +42,7 @@ annotations that don't alter the MIDI stream.
 
 ## Callbacks & reload
 
-`fire` is installed via `util:installHooks(mm)`, exposing `addCallback` /
+`fire` is installed via `util.installHooks(mm)`, exposing `addCallback` /
 `removeCallback`. On every reload, callbacks run as `fn(changed, mm)` with
 `changed = { take = bool, data = bool }`. `data` is always true on reload;
 `take` is true only when `load` received a different take than the current one.

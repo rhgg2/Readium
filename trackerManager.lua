@@ -5,7 +5,7 @@ loadModule('midiManager')
 loadModule('timing')
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
 function newTrackerManager(mm, cm)
@@ -23,12 +23,12 @@ function newTrackerManager(mm, cm)
 
   local function centsToRaw(cents)
     local lim = cm:get('pbRange') * 100
-    return util:clamp(util:round(cents * 8192 / lim), -8192, 8191)
+    return util.clamp(util.round(cents * 8192 / lim), -8192, 8191)
   end
 
   local function rawToCents(raw)
     local lim = cm:get('pbRange') * 100
-    return util:round(raw / 8192 * lim)
+    return util.round(raw / 8192 * lim)
   end
 
   local function delayToPPQ(d) return timing.delayToPPQ(d, mm:resolution()) end
@@ -62,31 +62,31 @@ function newTrackerManager(mm, cm)
     ----- Accessors
 
     local function owner(chan, P)
-      return util:seek(chans[chan].notes, 'at-or-before', P, function(n) return n.endppq > P end)
+      return util.seek(chans[chan].notes, 'at-or-before', P, function(n) return n.endppq > P end)
     end
 
     local function detuneAt(chan, P)
-      local n = util:seek(chans[chan].notes, 'at-or-before', P)
+      local n = util.seek(chans[chan].notes, 'at-or-before', P)
       return (n and n.detune) or 0
     end
 
     local function detuneBefore(chan, P)
-      local n = util:seek(chans[chan].notes, 'before', P)
+      local n = util.seek(chans[chan].notes, 'before', P)
       return (n and n.detune) or 0
     end
 
     local function rawAt(chan, P)
-      local pb = util:seek(chans[chan].pbs, 'at-or-before', P)
+      local pb = util.seek(chans[chan].pbs, 'at-or-before', P)
       return pb and pb.val or 0
     end
 
     local function rawBefore(chan, P)
-      local pb = util:seek(chans[chan].pbs, 'before', P)
+      local pb = util.seek(chans[chan].pbs, 'before', P)
       return pb and pb.val or 0
     end
 
     local function pbAt(chan, P)
-      local pb = util:seek(chans[chan].pbs, 'at-or-before', P)
+      local pb = util.seek(chans[chan].pbs, 'at-or-before', P)
       return pb and pb.ppq == P and pb or nil
     end
 
@@ -100,17 +100,17 @@ function newTrackerManager(mm, cm)
 
     local function nextLogicalChange(chan, P)
       local currentLogical = logicalAt(chan, P)
-      local pb = util:seek(chans[chan].pbs, 'after', P, function(e) return logicalAt(chan, e.ppq) ~= currentLogical end)
+      local pb = util.seek(chans[chan].pbs, 'after', P, function(e) return logicalAt(chan, e.ppq) ~= currentLogical end)
       return (pb and pb.ppq) or math.huge
     end
 
     local function nextRealChange(chan, P)
-      local pb = util:seek(chans[chan].pbs, 'after', P, function(e) return not e.fake end)
+      local pb = util.seek(chans[chan].pbs, 'after', P, function(e) return not e.fake end)
       return (pb and pb.ppq) or math.huge
     end
 
     local function nextNotePPQ(chan, P)
-      local n = util:seek(chans[chan].notes, 'after', P)
+      local n = util.seek(chans[chan].notes, 'after', P)
       return (n and n.ppq) or math.huge
     end
 
@@ -130,30 +130,30 @@ function newTrackerManager(mm, cm)
         local col1 = evt.lane == 1
         if col1 then
           local tbl = chans[evt.chan].notes
-          util:add(tbl, evt)
+          util.add(tbl, evt)
           sortByPPQ(tbl)
         end
       elseif evtType == 'pb' then
         local tbl = chans[evt.chan].pbs
         evt.msgType = 'pb'
-        util:add(tbl, evt)
+        util.add(tbl, evt)
         sortByPPQ(tbl)
       else
         evt.msgType = evtType
       end
-      util:add(adds, { type = evtType, evt = evt })
+      util.add(adds, { type = evtType, evt = evt })
     end
 
     local function assignLowlevel(evtType, evt, update)
-      util:assign(evt, update)
+      util.assign(evt, update)
       if not evt.loc then return end
       for _, e in ipairs(assigns) do
         if e.loc == evt.loc and e.type == evtType then
-          util:assign(e.update, update)
+          util.assign(e.update, update)
           return
         end
       end
-      util:add(assigns, { type = evtType, loc = evt.loc, update = update })
+      util.add(assigns, { type = evtType, loc = evt.loc, update = update })
     end
 
     local function deleteLowlevel(evtType, evt)
@@ -179,7 +179,7 @@ function newTrackerManager(mm, cm)
 
       if loc then
         locTbl[loc] = nil
-        util:add(deletes, { type = evtType, loc = loc })
+        util.add(deletes, { type = evtType, loc = loc })
         for j = #assigns, 1, -1 do
           local e = assigns[j]
           if e.loc == loc and e.type == evtType then table.remove(assigns, j) end
@@ -254,7 +254,7 @@ function newTrackerManager(mm, cm)
         unmarkFake(chan, P)
         retuneLowlevel(chan, P, nextRealChange(chan, P), delta)
       end
-      local rest = util:clone(update, { val = true, ppq = true })
+      local rest = util.clone(update, { val = true, ppq = true })
       if next(rest) then assignLowlevel('pb', pb, rest) end
     end
 
@@ -266,7 +266,7 @@ function newTrackerManager(mm, cm)
         if D ~= C and forcePb(n.chan, n.ppq) then markFake(n) end
         retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D - C)
       end
-      addLowlevel('note', util:assign(n, { detune = D }))
+      addLowlevel('note', util.assign(n, { detune = D }))
     end
 
     local function deleteNote(n, keepPAs)
@@ -362,8 +362,8 @@ function newTrackerManager(mm, cm)
       for _, n in pairs(notesByLoc) do
         if n ~= selfEvt and n.chan == chan and n.pitch == pitch then
           if n.ppq <= P and n.endppq > P then
-            if n.ppq == P then util:add(toDelete, n)
-            else util:add(toTruncate, n) end
+            if n.ppq == P then util.add(toDelete, n)
+            else util.add(toTruncate, n) end
           elseif clampEnd and n.ppq > P and n.ppq < clampEnd then
             clampEnd = n.ppq
           end
@@ -502,19 +502,19 @@ function newTrackerManager(mm, cm)
         if cc.msgType == 'pb' then
           evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc,
                   shape = cc.shape, tension = cc.tension }
-          util:add(chans[evt.chan].pbs, evt)
+          util.add(chans[evt.chan].pbs, evt)
         else
-          evt = util:assign(cc, { loc = loc })
+          evt = util.assign(cc, { loc = loc })
         end
         ccsByLoc[loc] = evt
       end
       for i = 1, 16 do sortByPPQ(chans[i].pbs) end
 
       for loc, n in mm:notes() do
-        local evt = util:assign(n, { loc = loc })
+        local evt = util.assign(n, { loc = loc })
         notesByLoc[loc] = evt
         if n.lane == 1 then
-          util:add(chans[n.chan].notes, evt)
+          util.add(chans[n.chan].notes, evt)
           if n.fakePb then
             local pb = pbAt(n.chan, n.ppq)
             if pb then pb.fake = true end
@@ -532,7 +532,7 @@ function newTrackerManager(mm, cm)
 
   local function pushNoteCol(channel)
     local notes = channel.columns.notes
-    return util:add(notes, { events = {} }), #notes
+    return util.add(notes, { events = {} }), #notes
   end
 
   local function noteColumnAccepts(col, notePpq, noteEndPpq)
@@ -590,7 +590,7 @@ function newTrackerManager(mm, cm)
   ---------- PUBLIC
 
   local tm = {}
-  fire = util:installHooks(tm)
+  fire = util.installHooks(tm)
 
   ----- Rebuild
 
@@ -617,13 +617,13 @@ function newTrackerManager(mm, cm)
         end
         local key = note.chan .. '|' .. note.pitch
         groups[key] = groups[key] or {}
-        util:add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
+        util.add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
       end
       for _, group in pairs(groups) do
         sortByPPQ(group)
         for i = 1, #group - 1 do
           if group[i].endppq > group[i + 1].ppq then
-            util:add(work, { loc = group[i].loc, endppq = group[i + 1].ppq })
+            util.add(work, { loc = group[i].loc, endppq = group[i + 1].ppq })
           end
         end
       end
@@ -641,8 +641,8 @@ function newTrackerManager(mm, cm)
       if note.lane ~= lane then
         mm:assignNote(loc, { lane = lane })
       end
-      util:assign(note, { loc = loc, chan = util.REMOVE, lane = util.REMOVE })
-      util:add(col.events, note)
+      util.assign(note, { loc = loc, chan = util.REMOVE, lane = util.REMOVE })
+      util.add(col.events, note)
     end
 
     -- 3) Single CC walk: pb, pa, cc, at, pc distribution. Pb accumulates
@@ -670,10 +670,10 @@ function newTrackerManager(mm, cm)
           local pb = pbByChan[cc.chan] or { events = {}, anyVisible = false }
           pbByChan[cc.chan] = pb
           pb.anyVisible = pb.anyVisible or not hidden
-          util:add(pb.events, {
+          util.add(pb.events, {
             loc     = loc,
             ppq     = cc.ppq,
-            val     = util:round(rawToCents(cc.val) - detune),
+            val     = util.round(rawToCents(cc.val) - detune),
             detune  = detune,
             hidden  = hidden,
             shape   = cc.shape,
@@ -685,7 +685,7 @@ function newTrackerManager(mm, cm)
         elseif cc.msgType == 'pa' then
           local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
           if noteCol then
-            util:add(noteCol.events, {
+            util.add(noteCol.events, {
               ppq = cc.ppq, type = 'pa', pitch = cc.pitch, vel = cc.val, loc = loc
             })
           end
@@ -693,12 +693,12 @@ function newTrackerManager(mm, cm)
         elseif cc.msgType == 'cc' then
           local col = channel.columns.ccs[cc.cc] or { cc = cc.cc, events = {} }
           channel.columns.ccs[cc.cc] = col
-          util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
+          util.add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
 
         elseif cc.msgType == 'at' or cc.msgType == 'pc' then
           local col = channel.columns[cc.msgType] or { events = {} }
           channel.columns[cc.msgType] = col
-          util:add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
+          util.add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
         end
       end
 
@@ -852,7 +852,7 @@ function newTrackerManager(mm, cm)
   ----- Mute
 
   function tm:setMutedChannels(set)
-    lastMuteSet = util:clone(set or {})
+    lastMuteSet = util.clone(set or {})
     if not um then return end
     for _, ch in ipairs(channels) do
       local want = lastMuteSet[ch.chan] == true

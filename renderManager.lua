@@ -4,7 +4,7 @@ loadModule('util')
 loadModule('timing')
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
 if not reaper.ImGui_GetBuiltinPath then
@@ -191,7 +191,7 @@ function newRenderManager(vm, cm, cmgr)
     local btnW  = ImGui.GetFrameHeight(ctx)
     ImGui.SetNextItemWidth(ctx, textW + btnW * 2 + 16)
     local changed, n = ImGui.InputInt(ctx, '##rpb', rowPerBeat, 1, 4)
-    if changed then vm:setRowPerBeat(util:clamp(n, 1, 32)) end
+    if changed then vm:setRowPerBeat(util.clamp(n, 1, 32)) end
 
     ImGui.Separator(ctx)
   end
@@ -231,7 +231,7 @@ function newRenderManager(vm, cm, cmgr)
       local chan = col.midiChan
       if chanX[chan] == nil then
         chanX[chan] = cx
-        util:add(chanOrder, chan)
+        util.add(chanOrder, chan)
       end
       chanW[chan] = (cx + col.width) - chanX[chan]
       cx = cx + col.width + 1
@@ -371,7 +371,7 @@ function newRenderManager(vm, cm, cmgr)
               local _, gap, halfGap = vm:noteProjection(evt)
               if gap and gap ~= 0 and halfGap > 0 then
                 local yTop = gridOriginY + y * gridY + 1
-                local offset = util:clamp(gap / halfGap, -1, 1) * halfW
+                local offset = util.clamp(gap / halfGap, -1, 1) * halfW
                 ImGui.DrawList_AddLine(drawList, x0, yTop, x1, yTop, barCol, 1)
                 local tickX = cx + offset
                 ImGui.DrawList_AddLine(drawList, tickX, yTop - 1, tickX, yTop + 2, barCol, 1)
@@ -540,14 +540,14 @@ function newRenderManager(vm, cm, cmgr)
     if ImGui.IsWindowHovered(ctx) then
       local wheel,wheelH  = ImGui.GetMouseWheel(ctx)
       if wheel ~= 0 then
-        local n = util:round(math.abs(wheel) / 2)
+        local n = util.round(math.abs(wheel) / 2)
         if n > 0 then
           local cmd = wheel > 0 and cmgr.commands.cursorUp or cmgr.commands.cursorDown
           for _ = 1, n do cmd() end
         end
       end
       if wheelH ~= 0 then
-        local n = util:round(math.abs(wheelH))
+        local n = util.round(math.abs(wheelH))
         if n > 0 then
           local cmd = wheelH > 0 and cmgr.commands.cursorLeft or cmgr.commands.cursorRight
           for _ = 1, n do cmd() end
@@ -705,7 +705,7 @@ function newRenderManager(vm, cm, cmgr)
         if not type then return end
         local id = idStr ~= '' and tonumber(idStr) or nil
         if type == 'dly' then vm:showDelay()
-        elseif util:oneOf('cc pb at pc', type) then
+        elseif util.oneOf('cc pb at pc', type) then
           if type == 'cc' and (not id or id < 0 or id > 127) then return end
           vm:addExtraCol(type, id)
         end
@@ -781,7 +781,7 @@ function newRenderManager(vm, cm, cmgr)
     local i = periodPresetIndex(period)
     if i > 0 then return PERIOD_PRESETS[i].label end
     local qn = timing.periodQN(period)
-    if math.abs(qn - util:round(qn)) < 1e-9 then return string.format('%d qn', qn) end
+    if math.abs(qn - util.round(qn)) < 1e-9 then return string.format('%d qn', qn) end
     return string.format('%.3f qn', qn)
   end
 
@@ -906,27 +906,27 @@ function newRenderManager(vm, cm, cmgr)
   end
 
   local function swingWrite(composite)
-    local old = util:deepClone(swingRead()) or {}
+    local old = util.deepClone(swingRead()) or {}
     if compositesEqual(old, composite) then return end
     vm:setSwingComposite(swingEditor.name, composite)
     vm:reswingPreset(swingEditor.name, old, composite)
   end
 
   local function patchFactor(i, patch)
-    local new = util:deepClone(swingRead()) or {}
+    local new = util.deepClone(swingRead()) or {}
     if not new[i] then return end
-    util:assign(new[i], patch)
+    util.assign(new[i], patch)
     swingWrite(new)
   end
 
   local function addFactor()
-    local new = util:deepClone(swingRead()) or {}
+    local new = util.deepClone(swingRead()) or {}
     new[#new+1] = { atom = 'id', amount = 0, period = 1 }
     swingWrite(new)
   end
 
   local function removeFactor(i)
-    local new = util:deepClone(swingRead()) or {}
+    local new = util.deepClone(swingRead()) or {}
     table.remove(new, i)
     swingWrite(new)
   end
@@ -935,7 +935,7 @@ function newRenderManager(vm, cm, cmgr)
     local src = swingRead() or {}
     local j = i + dir
     if j < 1 or j > #src then return end
-    local new = util:deepClone(src)
+    local new = util.deepClone(src)
     new[i], new[j] = new[j], new[i]
     swingWrite(new)
   end
@@ -971,10 +971,10 @@ function newRenderManager(vm, cm, cmgr)
     -- tick. Stash the pre-drag composite on press, preview-write during
     -- the drag, commit the reswing (old→now) once on release.
     if ImGui.IsItemActivated(ctx) then
-      swingEditor.dragOld = util:deepClone(swingRead()) or {}
+      swingEditor.dragOld = util.deepClone(swingRead()) or {}
     end
     if rvA then
-      local new = util:deepClone(swingRead()) or {}
+      local new = util.deepClone(swingRead()) or {}
       if new[i] then new[i].amount = newAmt; swingPreview(new) end
     end
     if ImGui.IsItemDeactivatedAfterEdit(ctx) and swingEditor.dragOld then
@@ -1091,7 +1091,7 @@ function newRenderManager(vm, cm, cmgr)
         ImGui.SameLine(ctx)
         local dirty = not compositesEqual(composite, swingEditor.snapshot)
         if not dirty then ImGui.BeginDisabled(ctx) end
-        if ImGui.Button(ctx, 'Reset') then swingWrite(util:deepClone(swingEditor.snapshot) or {}) end
+        if ImGui.Button(ctx, 'Reset') then swingWrite(util.deepClone(swingEditor.snapshot) or {}) end
         if not dirty then ImGui.EndDisabled(ctx) end
 
         ImGui.Separator(ctx)

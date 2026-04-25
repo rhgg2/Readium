@@ -2,7 +2,7 @@
 
 util = {}
 
-function util:print(...)
+function util.print(...)
   if not ... then
     reaper.ShowConsoleMsg('nil value\n')
     return
@@ -11,10 +11,10 @@ function util:print(...)
 end
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
-function util:print_r(root)
+function util.print_r(root)
   local cache = {  [root] = '.' }
   local function _dump(t,space,name)
     local temp = {}
@@ -37,7 +37,7 @@ end
 
 util.REMOVE = { }
 
-function util:assign(t1,t2)
+function util.assign(t1,t2)
   if t2 then
     for k, v in pairs(t2) do
       if v == util.REMOVE then
@@ -50,12 +50,12 @@ function util:assign(t1,t2)
   return t1
 end
 
-function util:add(tbl, val)
+function util.add(tbl, val)
   tbl[#tbl+1] = val
   return val
 end
 
-function util:seek(items, mode, key, filter, keyFn)
+function util.seek(items, mode, key, filter, keyFn)
   keyFn = keyFn or function(x) return x.ppq end
   local before = mode == 'before' or mode == 'at-or-before'
   local cmp
@@ -78,18 +78,18 @@ function util:seek(items, mode, key, filter, keyFn)
   return hit
 end
 
-function util:clone(src, exclude, deep)
+function util.clone(src, exclude, deep)
   if not src then return end
   local dst = {}
   for k, v in pairs(src) do
     if not (exclude and exclude[k]) then
-      dst[k] = (deep and type(v) == 'table') and util:clone(v, nil, true) or v
+      dst[k] = (deep and type(v) == 'table') and util.clone(v, nil, true) or v
     end
   end
   return dst
 end
 
-function util:deepClone(src) return util:clone(src, nil, true) end
+function util.deepClone(src) return util.clone(src, nil, true) end
 
 local function escape_string(s)
   return (s:gsub('[\\{},=]', function(c)
@@ -97,7 +97,7 @@ local function escape_string(s)
   end))
 end
 
-function util:installHooks(owner)
+function util.installHooks(owner)
   local listeners = {}
   function owner:addCallback(fn)    listeners[fn] = true end
   function owner:removeCallback(fn) listeners[fn] = nil  end
@@ -106,7 +106,6 @@ function util:installHooks(owner)
   end
 end
 
--- Dot-defined so these compose as filter/predicate args to util:seek etc.
 function util.isNote(e) return e and e.endppq end
 
 function util.between(events, lo, hi, filter)
@@ -122,7 +121,7 @@ function util.between(events, lo, hi, filter)
   end
 end
 
-function util:clamp(val,min,max)
+function util.clamp(val,min,max)
   if val < min then
     return min
   elseif val > max then
@@ -132,30 +131,30 @@ function util:clamp(val,min,max)
   end
 end
 
-function util:setDigit(val, d, pos, base, half)
+function util.setDigit(val, d, pos, base, half)
   local place = base ^ pos // 1
   local above = val - (val % (place * base))
   return above + d * place + (half and place // 2 or 0)
 end
 
-function util:snapTo(v, dir, interval)
+function util.snapTo(v, dir, interval)
   if dir > 0 then return (math.floor(v / interval) + 1) * interval end
   return (math.ceil(v / interval) - 1) * interval
 end
 
-function util:nudgedScalar(v, lo, hi, dir, interval)
-  local target = interval and self:snapTo(v, dir, interval) or (v + dir)
-  return self:clamp(target, lo, hi)
+function util.nudgedScalar(v, lo, hi, dir, interval)
+  local target = interval and util.snapTo(v, dir, interval) or (v + dir)
+  return util.clamp(target, lo, hi)
 end
 
-function util:oneOf(choices, txt)
+function util.oneOf(choices, txt)
   for k in choices:gmatch('%S+') do
     if txt == k then return true end
   end
   return false
 end
 
-function util:round(n, to)
+function util.round(n, to)
   if to then
     return math.floor(n / to + 0.5) * to
   else
@@ -163,7 +162,7 @@ function util:round(n, to)
   end
 end
 
-function util:dotimes(n, v)
+function util.dotimes(n, v)
   if type(v) == 'function' then
     for _ = 1, n do v() end
     return
@@ -173,7 +172,7 @@ function util:dotimes(n, v)
   return rv
 end
 
-function util:serialise(value, exclude, seen)
+function util.serialise(value, exclude, seen)
   exclude = exclude or { } 
   local t = type(value)
 
@@ -193,8 +192,8 @@ function util:serialise(value, exclude, seen)
     local parts = {}
     for k, v in pairs(value) do
       if not exclude[k] then
-        local key_str = util:serialise(k, nil, seen)
-        local val_str = util:serialise(v, nil, seen)
+        local key_str = util.serialise(k, nil, seen)
+        local val_str = util.serialise(v, nil, seen)
         parts[#parts+1] = key_str .. '=' .. val_str
       end
     end
@@ -207,7 +206,7 @@ function util:serialise(value, exclude, seen)
   end
 end
 
-function util:unserialise(input)
+function util.unserialise(input)
   local pos = 1
   local len = #input
 

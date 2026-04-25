@@ -16,7 +16,7 @@ loadModule('viewManager')
 loadModule('renderManager')
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
 local function err_handler(err)

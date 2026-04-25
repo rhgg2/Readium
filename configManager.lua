@@ -3,7 +3,7 @@
 loadModule('util')
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
 -- Array-of-pairs lets nil defaults (declared-but-null) coexist with
@@ -70,7 +70,7 @@ for _, pair in ipairs(declarations) do
 end
 
 local function copy(v)
-  if type(v) == 'table' then return util:deepClone(v) end
+  if type(v) == 'table' then return util.deepClone(v) end
   return v
 end
 
@@ -132,7 +132,7 @@ function newConfigManager()
       print('Error! Could not write global config to ' .. CONFIG_GLOBAL_PATH)
       return
     end
-    f:write(util:serialise(tbl))
+    f:write(util.serialise(tbl))
     f:close()
   end
 
@@ -142,7 +142,7 @@ function newConfigManager()
   end
 
   local function saveProject(tbl)
-    reaper.SetProjExtState(0, 'rdm', 'config', util:serialise(tbl))
+    reaper.SetProjExtState(0, 'rdm', 'config', util.serialise(tbl))
   end
 
   local function loadTrack()
@@ -158,7 +158,7 @@ function newConfigManager()
       return
     end
     reaper.GetSetMediaTrackInfo_String(
-      track, 'P_EXT:' .. CONFIG_PREFIX .. 'config', util:serialise(tbl), true)
+      track, 'P_EXT:' .. CONFIG_PREFIX .. 'config', util.serialise(tbl), true)
   end
 
   local function loadTake()
@@ -172,7 +172,7 @@ function newConfigManager()
       print('Error! No take context for config storage')
       return
     end
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', util:serialise(tbl), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', util.serialise(tbl), true)
   end
 
   local loaders = {
@@ -209,7 +209,7 @@ function newConfigManager()
     for k, v in pairs(defaults) do merged[k] = v end
     for _, level in ipairs(levels) do
       if cache[level] then
-        util:assign(merged, cache[level])
+        util.assign(merged, cache[level])
       end
     end
     return merged
@@ -230,7 +230,7 @@ function newConfigManager()
   ---------- PUBLIC INTERFACE
 
   local cm = {}
-  fire = util:installHooks(cm)
+  fire = util.installHooks(cm)
 
   function cm:setContext(newTake)
     take = newTake
@@ -262,7 +262,7 @@ function newConfigManager()
       checkKey(key)
       return copy(tbl[key])
     end
-    return util:deepClone(tbl)
+    return util.deepClone(tbl)
   end
 
   function cm:getLevel(key)

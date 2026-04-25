@@ -18,7 +18,7 @@ util → configManager → midiManager → trackerManager
      → commandManager → viewManager → renderManager
 ```
 
-`util` comes first because everything else calls `util:installHooks`
+`util` comes first because everything else calls `util.installHooks`
 during construction. `commandManager` loads before `viewManager`
 because vm, ec and clipboard populate the command registry at
 construction time. `editCursor` loads before `viewManager` because vm

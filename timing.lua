@@ -178,7 +178,7 @@ end
 -- Round at source so the map is an integer bijection on ℤ; every
 -- intent ± delayToPPQ(d) stays in ℤ and round-trips are algebraic.
 function M.delayToPPQ(d, res)
-  return util:round(res * (d or 0) / 1000)
+  return util.round(res * (d or 0) / 1000)
 end
 
 function M.ppqToDelay(p, res)

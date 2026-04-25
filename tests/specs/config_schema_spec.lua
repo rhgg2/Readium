@@ -103,7 +103,7 @@ return {
       local h = harness.mk()
       -- Reach directly at the fake reaper's take ext-state to plant a
       -- stale key alongside a valid one.
-      local serialised = util:serialise({ pbRange = 5, legacyKey = 'oops' })
+      local serialised = util.serialise({ pbRange = 5, legacyKey = 'oops' })
       local take = 'take1'
       h.reaper._state.takeExt[take .. '/P_EXT:rdm_config'] = serialised
 

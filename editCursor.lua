@@ -63,9 +63,9 @@ function newEditCursor(deps)
   local function isSticky() return hBlockScope > 0 or vBlockScope > 0 end
   local function clampPos()
     local maxRow = math.max(0, (grid.numRows or 1) - 1)
-    cursorRow = util:clamp(cursorRow, 0, maxRow)
-    cursorCol  = util:clamp(cursorCol, 1, #grid.cols)
-    cursorStop = util:clamp(cursorStop, 1, #grid.cols[cursorCol].stopPos)
+    cursorRow = util.clamp(cursorRow, 0, maxRow)
+    cursorCol  = util.clamp(cursorCol, 1, #grid.cols)
+    cursorStop = util.clamp(cursorStop, 1, #grid.cols[cursorCol].stopPos)
   end
 
   local function selStart()
@@ -308,9 +308,9 @@ function newEditCursor(deps)
 
   function ec:shiftSelection(rowDelta)
     local maxRow = grid.numRows - 1
-    sel.row1      = util:clamp(sel.row1      + rowDelta, 0, maxRow)
-    sel.row2      = util:clamp(sel.row2      + rowDelta, 0, maxRow)
-    selAnchor.row = util:clamp(selAnchor.row + rowDelta, 0, maxRow)
+    sel.row1      = util.clamp(sel.row1      + rowDelta, 0, maxRow)
+    sel.row2      = util.clamp(sel.row2      + rowDelta, 0, maxRow)
+    selAnchor.row = util.clamp(selAnchor.row + rowDelta, 0, maxRow)
     cursorRow     = cursorRow + rowDelta
     clampPos(); moveHook()
   end
@@ -465,13 +465,13 @@ function newClipboard(deps)
   local getLength    = deps.getLength
 
   local function save(clip)
-    reaper.SetExtState('rdm', 'clipboard', util:serialise(clip, { loc = true, sourceIdx = true }), false)
+    reaper.SetExtState('rdm', 'clipboard', util.serialise(clip, { loc = true, sourceIdx = true }), false)
   end
 
   local function load()
     local raw = reaper.GetExtState('rdm', 'clipboard')
     if raw == '' then return end
-    return util:unserialise(raw)
+    return util.unserialise(raw)
   end
 
   local function collect()
@@ -515,7 +515,7 @@ function newClipboard(deps)
         clipType, emit = '7bit', function(e) return scalarEvent(col, e, e.val) end
       end
       for evt in util.between(col.events, startPPQ, endPPQ) do
-        util:add(events, emit(evt))
+        util.add(events, emit(evt))
       end
 
       if #events == 0 then return end
@@ -549,12 +549,12 @@ function newClipboard(deps)
       local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
       for evt in util.between(col.events, startPPQ, endPPQ) do
         if col.type == 'note' then
-          util:add(entry.events, noteEvent(col, evt, endPPQ))
+          util.add(entry.events, noteEvent(col, evt, endPPQ))
         else
-          util:add(entry.events, scalarEvent(col, evt, evt.val))
+          util.add(entry.events, scalarEvent(col, evt, evt.val))
         end
       end
-      util:add(cols, entry)
+      util.add(cols, entry)
     end
 
     if #cols == 0 then return end
@@ -562,7 +562,7 @@ function newClipboard(deps)
   end
 
   local function pasteVelocities(events, dstCol, startPPQ, endPPQ)
-    local last = util:seek(dstCol.events, 'before', startPPQ)
+    local last = util.seek(dstCol.events, 'before', startPPQ)
     local currentVel = last and last.vel or cm:get('defaultVelocity')
 
     -- Delete existing PA events in the paste region
@@ -576,7 +576,7 @@ function newClipboard(deps)
       if evt.pitch then
         while ci <= #events and events[ci].ppq <= evt.ppq do
           if events[ci].val > 0 then
-            currentVel = util:clamp(events[ci].val, 1, 127)
+            currentVel = util.clamp(events[ci].val, 1, 127)
           end
           ci = ci + 1
         end
@@ -587,12 +587,12 @@ function newClipboard(deps)
     -- Pass 2: create PA events for clipboard values landing on sustain rows
     if cm:get('polyAftertouch') then
       for _, ce in ipairs(events) do
-        local note = util:seek(dstCol.events, 'before', ce.ppq, util.isNote)
+        local note = util.seek(dstCol.events, 'before', ce.ppq, util.isNote)
         if note and note.endppq > ce.ppq
           and note.ppq ~= ce.ppq then
           tm:addEvent('pa', {
             ppq = ce.ppq, chan = dstCol.midiChan,
-            pitch = note.pitch, val = util:clamp(ce.val, 1, 127)
+            pitch = note.pitch, val = util.clamp(ce.val, 1, 127)
           })
         end
       end
@@ -616,11 +616,11 @@ function newClipboard(deps)
     for _, ce in ipairs(clip.events) do
       local ppq = ctx:rowToPPQ(r + ce.row, chan)
       if ppq >= endPPQ then goto nextCe end
-      local e = util:assign({ ppq = ppq }, ce)
+      local e = util.assign({ ppq = ppq }, ce)
       if ce.endRow then
         e.endppq = math.min(ctx:rowToPPQ(r + ce.endRow, chan), endPPQ)
       end
-      util:add(events, e)
+      util.add(events, e)
       ::nextCe::
     end
     table.sort(events, function(a, b) return a.ppq < b.ppq end)
@@ -629,14 +629,14 @@ function newClipboard(deps)
       local velList = {}
       for evt in util.between(dstCol.events, startPPQ, endPPQ) do
         if evt.pitch and evt.vel > 0 then
-          util:add(velList, { ppq = evt.ppq, val = evt.vel })
+          util.add(velList, { ppq = evt.ppq, val = evt.vel })
         end
       end
-      local last = util:seek(dstCol.events, 'before', startPPQ)
+      local last = util.seek(dstCol.events, 'before', startPPQ)
       local currentVel = last and last.vel or cm:get('defaultVelocity')
 
-      local lastNote = util:seek(dstCol.events, 'before', startPPQ, util.isNote)
-      local nextNote = util:seek(dstCol.events, 'at-or-after', endPPQ, util.isNote)
+      local lastNote = util.seek(dstCol.events, 'before', startPPQ, util.isNote)
+      local nextNote = util.seek(dstCol.events, 'at-or-after', endPPQ, util.isNote)
       local nextNotePPQ = nextNote and nextNote.ppq or getLength()
       local lane = dstCol.lane
 
@@ -653,7 +653,7 @@ function newClipboard(deps)
       local vi = 1
       for _, ce in ipairs(events) do
         while vi <= #velList and velList[vi].ppq <= ce.ppq do
-          currentVel = util:clamp(velList[vi].val, 1, 127)
+          currentVel = util.clamp(velList[vi].val, 1, 127)
           vi = vi + 1
         end
         addNoteEvent(dstCol, {
@@ -756,11 +756,11 @@ function newClipboard(deps)
       for _, ce in ipairs(clipCol.events) do
         local ppq = ctx:rowToPPQ(cRow + ce.row, r.chan)
         if ppq < endPPQ then
-          local e = util:assign({ ppq = ppq }, ce)
+          local e = util.assign({ ppq = ppq }, ce)
           if ce.endRow then
             e.endppq = math.min(ctx:rowToPPQ(cRow + ce.endRow, r.chan), endPPQ)
           end
-          util:add(events, e)
+          util.add(events, e)
         end
       end
       table.sort(events, function(a, b) return a.ppq < b.ppq end)
@@ -772,7 +772,7 @@ function newClipboard(deps)
       -- Attached PAs cascade-delete with their host note.
       if dst then
         if r.type == 'note' then
-          local last = util:seek(dst.events, 'before', startPPQ, util.isNote)
+          local last = util.seek(dst.events, 'before', startPPQ, util.isNote)
           if last and events[1] and last.endppq > events[1].ppq then
             tm:assignEvent('note', last, { endppq = events[1].ppq })
           end
@@ -789,7 +789,7 @@ function newClipboard(deps)
       -- End cap for pasted notes that lack an explicit endppq.
       local capPPQ = endPPQ
       if r.type == 'note' and dst then
-        local nn = util:seek(dst.events, 'at-or-after', endPPQ, util.isNote)
+        local nn = util.seek(dst.events, 'at-or-after', endPPQ, util.isNote)
         if nn then capPPQ = math.min(capPPQ, nn.ppq) end
       end
 

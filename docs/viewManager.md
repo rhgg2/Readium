@@ -248,7 +248,7 @@ via `vm:clipboard()`. Public surface: `collect`, `copy`, `paste`,
 by `duplicate`), `trimTop(clip, n)`.
 
 The persistent store is REAPER ExtState under `rdm.clipboard`,
-serialised via `util:serialise` with `loc` / `sourceIdx` stripped.
+serialised via `util.serialise` with `loc` / `sourceIdx` stripped.
 
 Clip events encode rows in the **source column's** own swing frame;
 paste decodes them into the **destination column's** frame via

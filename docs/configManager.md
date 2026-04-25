@@ -62,7 +62,7 @@ reloads (e.g. `viewManager`'s match-grid-to-cursor frame override). On
 | take      | take `P_EXT:rdm_config`                            |
 | transient | none — in-memory only, reset to `{}` on reload     |
 
-The four persisted backends use `util:serialise` / `util:unserialise`
+The four persisted backends use `util.serialise` / `util.unserialise`
 (the shared escaped format). Parse failures fall through to an empty
 table.
 
@@ -76,7 +76,7 @@ table or nil values.
 
 ## Callbacks
 
-`fire` is installed via `util:installHooks(cm)`. Callbacks run as
+`fire` is installed via `util.installHooks(cm)`. Callbacks run as
 `fn(changed, cm)`, where `changed` is:
 
 - `{ config = true, key = <name>, level = <level> }` — targeted writes

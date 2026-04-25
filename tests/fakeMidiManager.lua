@@ -50,7 +50,7 @@ function newMidiManager(opts)
   local fire
 
   local mm = {}
-  fire = util:installHooks(mm)
+  fire = util.installHooks(mm)
 
   local function assertLock()
     assert(lock, 'Error! You must call modification functions via modify()!')
@@ -88,9 +88,9 @@ function newMidiManager(opts)
     if seed.resolution then resolution = seed.resolution end
     if seed.length     then length     = seed.length     end
     if seed.timeSigs   then timeSigs   = seed.timeSigs   end
-    for _, n in ipairs(seed.notes   or {}) do noteList[#noteList + 1]   = util:clone(n) end
-    for _, c in ipairs(seed.ccs     or {}) do ccList[#ccList + 1]       = util:clone(c) end
-    for _, s in ipairs(seed.sysexes or {}) do sysexList[#sysexList + 1] = util:clone(s) end
+    for _, n in ipairs(seed.notes   or {}) do noteList[#noteList + 1]   = util.clone(n) end
+    for _, c in ipairs(seed.ccs     or {}) do ccList[#ccList + 1]       = util.clone(c) end
+    for _, s in ipairs(seed.sysexes or {}) do sysexList[#sysexList + 1] = util.clone(s) end
     reindex()
     fire({ take = true, data = true }, mm)
   end
@@ -98,7 +98,7 @@ function newMidiManager(opts)
   function mm:dump()
     local function each(list)
       local out = {}
-      for i, e in ipairs(list) do out[i] = util:clone(e) end
+      for i, e in ipairs(list) do out[i] = util.clone(e) end
       return out
     end
     return { notes = each(noteList), ccs = each(ccList), sysexes = each(sysexList) }
@@ -133,7 +133,7 @@ function newMidiManager(opts)
     assertLock()
     assert(t.ppq and t.endppq and t.chan and t.pitch and t.vel,
       'Error! Underspecified new note')
-    local n = util:clone(t)
+    local n = util.clone(t)
     if not n.muted then n.muted = nil end
     noteList[#noteList + 1] = n
     return #noteList  -- imprecise until reindex; tm discards it
@@ -155,13 +155,13 @@ function newMidiManager(opts)
     if not structural then
       local n = noteByLoc[loc]
       if not n then return end
-      util:assign(n, t)
+      util.assign(n, t)
       return
     end
     assertLock()
     local n = noteByLoc[loc]
     if not n then return end
-    util:assign(n, t)
+    util.assign(n, t)
     if n.muted == false then n.muted = nil end
   end
 
@@ -182,7 +182,7 @@ function newMidiManager(opts)
     assertLock()
     if t.msgType == nil then t.msgType = 'cc' end
     assert(t.ppq and t.chan and t.val, 'Error! Underspecified new cc event')
-    local c = util:clone(t)
+    local c = util.clone(t)
     if not c.muted then c.muted = nil end
     if c.shape ~= 'bezier' then c.tension = nil end
     ccList[#ccList + 1] = c
@@ -203,7 +203,7 @@ function newMidiManager(opts)
     assertLock()
     local c = ccByLoc[loc]
     if not c then return end
-    util:assign(c, t)
+    util.assign(c, t)
     if c.muted == false then c.muted = nil end
     if c.msgType ~= 'cc' then c.cc    = nil end
     if c.msgType ~= 'pa' then c.pitch = nil end
@@ -226,7 +226,7 @@ function newMidiManager(opts)
   function mm:addSysex(t)
     assertLock()
     assert(t.ppq and t.msgType and t.val, 'Error! Underspecified new sysex/text event')
-    sysexList[#sysexList + 1] = util:clone(t)
+    sysexList[#sysexList + 1] = util.clone(t)
     return #sysexList
   end
 
@@ -244,7 +244,7 @@ function newMidiManager(opts)
     assertLock()
     local s = sysexByLoc[loc]
     if not s then return end
-    util:assign(s, t)
+    util.assign(s, t)
   end
 
   -- TAKE DATA
@@ -252,7 +252,7 @@ function newMidiManager(opts)
   function mm:take()       return take end
   function mm:resolution() return resolution end
   function mm:length()     return length end
-  function mm:timeSigs()   return util:clone(timeSigs, nil, true) or {} end
+  function mm:timeSigs()   return util.clone(timeSigs, nil, true) or {} end
 
   -- Curve semantics mirror midiManager.lua (kept in sync by hand; the real
   -- module isn't loaded under the test harness).
@@ -267,7 +267,7 @@ function newMidiManager(opts)
   local function bezierSample(tau, t)
     if t <= 0 then return 0 end
     if t >= 1 then return 1 end
-    local fi = util:clamp(math.abs(tau), 0, 1) * 10
+    local fi = util.clamp(math.abs(tau), 0, 1) * 10
     local i = math.min(math.floor(fi), 9)
     local f = fi - i
     local r0, r1 = BEZIER[i+1], BEZIER[i+2]

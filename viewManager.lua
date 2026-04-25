@@ -8,7 +8,7 @@ loadModule('commandManager')
 loadModule('editCursor')
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
 function newViewContext(args)
@@ -67,7 +67,7 @@ function newViewContext(args)
     return math.floor(swing.apply(chan, rowStart + frac * (rowEnd - rowStart)) + 0.5)
   end
 
-  function ctx:snapRow(ppq, chan) return util:round(self:ppqToRow(ppq, chan)) end
+  function ctx:snapRow(ppq, chan) return util.round(self:ppqToRow(ppq, chan)) end
 
   do -- exports ctx:rowBeatInfo, ctx:barBeatSub
     local function timeSigAt(ppq)
@@ -146,8 +146,8 @@ function newViewManager(tm, cm, cmgr)
     local pred = excludeEvt
       and function(e) return util.isNote(e) and e ~= excludeEvt end
       or util.isNote
-    local prev = util:seek(col.events, 'before', ppq, pred)
-    local next = util:seek(col.events, 'after',  ppq, pred)
+    local prev = util.seek(col.events, 'before', ppq, pred)
+    local next = util.seek(col.events, 'after',  ppq, pred)
     local minStart = prev and (prev.endppq + timing.delayToPPQ(prev.delay, resolution) - off) or 0
     local maxEnd   = next and (next.ppq    + timing.delayToPPQ(next.delay, resolution) + off) or length
     return minStart, maxEnd
@@ -179,7 +179,7 @@ function newViewManager(tm, cm, cmgr)
       end
 
       local kind = col.type == 'note' and (singleNoteKind or 'pitch') or 'val'
-      util:add(result, { col = col, locs = locs, kind = kind })
+      util.add(result, { col = col, locs = locs, kind = kind })
       ::nextCol::
     end
     return result
@@ -244,7 +244,7 @@ function newViewManager(tm, cm, cmgr)
   end
 
   function vm:setRowPerBeat(n)
-    n = util:clamp(n, 1, 32)
+    n = util.clamp(n, 1, 32)
     if n == cm:get('rowPerBeat') then return end
     -- Release before cm:set: otherwise configCallback sees a non-transient
     -- frame-key write and rescales ec on top of our own rescaleRow below.
@@ -278,7 +278,7 @@ function newViewManager(tm, cm, cmgr)
       end
       cm:set('take', 'swing', next)
     end
-    util:print('swing: ' .. next)
+    util.print('swing: ' .. next)
   end
 
   local function cycleTuning()
@@ -376,12 +376,12 @@ function newViewManager(tm, cm, cmgr)
       -- Row follow (skip before gridHeight is set to avoid inverted bounds)
       if gridHeight > 0 then
         local maxScroll = math.max(0, maxRow - gridHeight + 1)
-        scrollRow = util:clamp(scrollRow,
+        scrollRow = util.clamp(scrollRow,
                                math.max(0, cRow - gridHeight + 1),
                                math.min(cRow, maxScroll))
       end
 
-      scrollCol = util:clamp(scrollCol, 1, #grid.cols)
+      scrollCol = util.clamp(scrollCol, 1, #grid.cols)
       if cCol < scrollCol then
         scrollCol = cCol
       elseif cCol > lastVisibleFrom(scrollCol) then
@@ -413,8 +413,8 @@ function newViewManager(tm, cm, cmgr)
     end
 
     local function placeNewNote(col, update)
-      local last = util:seek(col.events, 'before', update.ppq, util.isNote)
-      local next = util:seek(col.events, 'after',  update.ppq, util.isNote)
+      local last = util.seek(col.events, 'before', update.ppq, util.isNote)
+      local next = util.seek(col.events, 'after',  update.ppq, util.isNote)
       if last and last.endppq >= update.ppq then
         tm:assignEvent('note', last, { endppq = update.ppq })
       end
@@ -429,7 +429,7 @@ function newViewManager(tm, cm, cmgr)
       for _, evt in ipairs(col.events) do
         if evt.type == 'pa' and evt.pitch == pitch
           and evt.ppq >= startPPQ and evt.ppq <= endPPQ then
-          util:add(pas, evt)
+          util.add(pas, evt)
         end
       end
       return pas
@@ -459,7 +459,7 @@ function newViewManager(tm, cm, cmgr)
 
         if stop == 1 then
           local nk = cmgr:noteChars(char); if not nk then return end
-          local pitch = util:clamp((cm:get('currentOctave') + 1 + nk[2]) * 12 + nk[1], 0, 127)
+          local pitch = util.clamp((cm:get('currentOctave') + 1 + nk[2]) * 12 + nk[1], 0, 127)
           local detune = 0
           local tuning = ctx:activeTuning()
           if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
@@ -473,7 +473,7 @@ function newViewManager(tm, cm, cmgr)
 
           -- PA cell → wipe host's PA tail, then fall through
           if evt and evt.type == 'pa' then
-            local host = util:seek(col.events, 'before', evt.ppq, util.isNote)
+            local host = util.seek(col.events, 'before', evt.ppq, util.isNote)
             if host and host.endppq > evt.ppq then
               for _, pa in ipairs(notePAEvents(col, host.pitch, evt.ppq, host.endppq)) do
                 tm:deleteEvent('pa', pa)
@@ -496,7 +496,7 @@ function newViewManager(tm, cm, cmgr)
             if d < 0 or d > 9 then return end
             oct = d
           end
-          local pitch = util:clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
+          local pitch = util.clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
           tm:assignEvent('note', evt, { pitch = pitch })
           return commit(pitch, evt.vel)
 
@@ -513,12 +513,12 @@ function newViewManager(tm, cm, cmgr)
             local d = char - string.byte('0')
             if d < 0 or d > 9 then return end
             local sign = old < 0 and -1 or 1
-            local mag  = util:clamp(util:setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
+            local mag  = util.clamp(util.setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
             newDelay = sign * mag
           end
 
           local minD, maxD = delayRange(col, evt)
-          newDelay = util:clamp(newDelay, math.ceil(minD), math.floor(maxD))
+          newDelay = util.clamp(newDelay, math.ceil(minD), math.floor(maxD))
           tm:assignEvent('note', evt, { delay = newDelay })
           return commit()
 
@@ -526,7 +526,7 @@ function newViewManager(tm, cm, cmgr)
         else
           local d = hexDigit[char]; if not d then return end
           local function newVel(old)
-            return util:clamp(util:setDigit(old, d, 4 - stop, 16, half), 1, 127)
+            return util.clamp(util.setDigit(old, d, 4 - stop, 16, half), 1, 127)
           end
 
           if evt and evt.type == 'pa' then
@@ -540,7 +540,7 @@ function newViewManager(tm, cm, cmgr)
           end
 
           if cm:get('polyAftertouch') then
-            local note = util:seek(col.events, 'before', cursorPPQ, util.isNote)
+            local note = util.seek(col.events, 'before', cursorPPQ, util.isNote)
             if note and note.endppq > cursorPPQ then
               local val = newVel(0)
               tm:addEvent('pa', {
@@ -556,9 +556,9 @@ function newViewManager(tm, cm, cmgr)
 
       -- non-note columns
       local update
-      if util:oneOf('cc at pc', type) then
+      if util.oneOf('cc at pc', type) then
         local d = hexDigit[char]; if not d then return end
-        update = { val = util:clamp(util:setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
+        update = { val = util.clamp(util.setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
       elseif type == 'pb' then
         local old = evt and evt.val or 0
         if char == string.byte('-') then
@@ -568,7 +568,7 @@ function newViewManager(tm, cm, cmgr)
           local d = char - string.byte('0')
           if d < 0 or d > 9 then return end
           local sign = old < 0 and -1 or 1
-          update = { val = sign * util:setDigit(math.abs(old), d, 4 - stop, 10, half) }
+          update = { val = sign * util.setDigit(math.abs(old), d, 4 - stop, 10, half) }
         end
       else
         return
@@ -577,8 +577,8 @@ function newViewManager(tm, cm, cmgr)
       if evt then
         tm:assignEvent(type, evt, snap(update))
       else
-        if type == 'cc' then util:assign(update, { cc = col.cc }) end
-        util:assign(update, { ppq = cursorPPQ, chan = col.midiChan })
+        if type == 'cc' then util.assign(update, { cc = col.cc }) end
+        util.assign(update, { ppq = cursorPPQ, chan = col.midiChan })
         tm:addEvent(type, update)
       end
       commit()
@@ -626,7 +626,7 @@ function newViewManager(tm, cm, cmgr)
       local ghost = col.ghosts and col.ghosts[r]
       local A = ghost and ghost.fromEvt
         or (col.cells and col.cells[r])
-        or util:seek(col.events, 'before', ctx:rowToPPQ(r + 1, col.midiChan))
+        or util.seek(col.events, 'before', ctx:rowToPPQ(r + 1, col.midiChan))
       if A then cycleShape(col, A); tm:flush() end
     end
 
@@ -641,10 +641,10 @@ function newViewManager(tm, cm, cmgr)
         if A.shape and A.shape ~= 'step' then
           local rA = ctx:ppqToRow(A.ppq, chan)
           local rB = ctx:ppqToRow(B.ppq, chan)
-          for y = util:round(rA) + 1, util:round(rB) - 1 do
+          for y = util.round(rA) + 1, util.round(rB) - 1 do
             if y >= 0 and y < grid.numRows and not (occupied and occupied[y]) then
               local val = tm:interpolate(A, B, ctx:rowToPPQ(y, chan))
-              ghosts[y] = { val = util:round(val), fromEvt = A, toEvt = B }
+              ghosts[y] = { val = util.round(val), fromEvt = A, toEvt = B }
             end
           end
         end
@@ -660,18 +660,18 @@ function newViewManager(tm, cm, cmgr)
       local col = grid.cols[ec:col()]
       if not (col and col.type == 'note') then return end
       local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
-      return col, util:seek(col.events, 'at-or-before', cursorPPQ, util.isNote)
+      return col, util.seek(col.events, 'at-or-before', cursorPPQ, util.isNote)
     end
 
     local function applyNoteOff(col, last, targetPPQ, undo)
       if undo then
-        local next = util:seek(col.events, 'at-or-after', targetPPQ, util.isNote)
+        local next = util.seek(col.events, 'at-or-after', targetPPQ, util.isNote)
         tm:assignEvent('note', last, { endppq = next and next.ppq or length })
       elseif last.ppq >= targetPPQ then
         tm:deleteEvent('note', last)
       else
         local _, maxEnd = overlapBounds(col, last.ppq, last, true)
-        tm:assignEvent('note', last, { endppq = util:clamp(targetPPQ, last.ppq + 1, maxEnd) })
+        tm:assignEvent('note', last, { endppq = util.clamp(targetPPQ, last.ppq + 1, maxEnd) })
       end
     end
 
@@ -684,8 +684,8 @@ function newViewManager(tm, cm, cmgr)
             local chan = col.midiChan
             local targetPPQ = ctx:rowToPPQ(r1, chan)
             local nextPPQ   = ctx:rowToPPQ(r1 + 1, chan)
-            local last = util:seek(col.events, 'before', nextPPQ, util.isNote)
-            if last then util:add(hits, { col = col, note = last, targetPPQ = targetPPQ }) end
+            local last = util.seek(col.events, 'before', nextPPQ, util.isNote)
+            if last then util.add(hits, { col = col, note = last, targetPPQ = targetPPQ }) end
           end
         end
         if #hits == 0 then return end
@@ -706,7 +706,7 @@ function newViewManager(tm, cm, cmgr)
       local cursorPPQ     = ctx:rowToPPQ(r,     col.midiChan)
       local nextCursorPPQ = ctx:rowToPPQ(r + 1, col.midiChan)
 
-      local last = util:seek(col.events, 'before', nextCursorPPQ, util.isNote)
+      local last = util.seek(col.events, 'before', nextCursorPPQ, util.isNote)
       if not last then return end
       applyNoteOff(col, last, cursorPPQ, last.endppq == cursorPPQ)
       tm:flush()
@@ -714,11 +714,11 @@ function newViewManager(tm, cm, cmgr)
 
     local function adjustDurationCore(col, note, rowDelta)
       local chan = col.midiChan
-      local newRow = util:clamp(ctx:ppqToRow(note.endppq, chan) + rowDelta, 0, grid.numRows)
+      local newRow = util.clamp(ctx:ppqToRow(note.endppq, chan) + rowDelta, 0, grid.numRows)
             newRow = math.floor(newRow / rowDelta) * rowDelta
       local minPPQ = math.min(note.endppq, ctx:rowToPPQ(ctx:snapRow(note.ppq, chan) + 1, chan))
       local _, maxPPQ = overlapBounds(col, note.ppq, note, true)
-      local newPPQ = util:clamp(ctx:rowToPPQ(newRow, chan), minPPQ, maxPPQ)
+      local newPPQ = util.clamp(ctx:rowToPPQ(newRow, chan), minPPQ, maxPPQ)
       tm:assignEvent('note', note, { endppq = newPPQ })
     end
 
@@ -745,7 +745,7 @@ function newViewManager(tm, cm, cmgr)
         if g.col.type == 'note' then
           local chan = g.col.midiChan
           local ns = {}
-          for _, n in pairs(g.locs) do util:add(ns, n) end
+          for _, n in pairs(g.locs) do util.add(ns, n) end
           if #ns > 0 then
             table.sort(ns, function(a, b) return a.ppq < b.ppq end)
             if rowDelta > 0 then
@@ -757,7 +757,7 @@ function newViewManager(tm, cm, cmgr)
               local room = math.ceil(ctx:ppqToRow(minStart, chan) - ctx:snapRow(ns[1].ppq, chan))
               if room > rowDelta then return end
             end
-            util:add(runs, { col = g.col, notes = ns })
+            util.add(runs, { col = g.col, notes = ns })
           end
         end
       end
@@ -835,7 +835,7 @@ function newViewManager(tm, cm, cmgr)
       for _, col in ipairs(grid.cols) do
         local locs = {}
         for _, e in ipairs(col.events) do locs[e.loc] = e end
-        util:add(groups, { col = col, locs = locs })
+        util.add(groups, { col = col, locs = locs })
       end
       return groups
     end
@@ -856,7 +856,7 @@ function newViewManager(tm, cm, cmgr)
         end
         return
       end
-      return util:seek(n1.events, 'at-or-before', e.ppq, util.isNote)
+      return util.seek(n1.events, 'at-or-before', e.ppq, util.isNote)
     end
 
     -- opts: { include?, auth, target, restamp? }. auth nil means identity
@@ -873,14 +873,14 @@ function newViewManager(tm, cm, cmgr)
             local auth   = opts.auth(owner.frame, chan)
             local tgt    = opts.target(owner.frame, chan)
             local uPPQ   = auth and auth.unapply(chan, e.ppq) or e.ppq
-            local newPPQ = util:round(tgt.apply(chan, uPPQ))
+            local newPPQ = util.round(tgt.apply(chan, uPPQ))
             local entry  = { col = col, e = e, newPPQ = newPPQ }
             if util.isNote(e) then
               local uEnd      = auth and auth.unapply(chan, e.endppq) or e.endppq
-              entry.newEndPPQ = util:round(tgt.apply(chan, uEnd))
+              entry.newEndPPQ = util.round(tgt.apply(chan, uEnd))
               if opts.restamp then entry.newFrame = opts.restamp(chan) end
             end
-            util:add(plans, entry)
+            util.add(plans, entry)
           end
         end
       end
@@ -947,11 +947,11 @@ function newViewManager(tm, cm, cmgr)
         local col, chan = g.col, g.col.midiChan
         for _, e in pairs(g.locs) do
           local sRow   = ctx:ppqToRow(e.ppq, chan)
-          local newRow = util:round(sRow)
+          local newRow = util.round(sRow)
           local newPPQ = ctx:rowToPPQ(newRow, chan)
           if util.isNote(e) then
             local eRow      = ctx:ppqToRow(e.endppq, chan)
-            local newEndRow = newRow + util:round((eRow - sRow))
+            local newEndRow = newRow + util.round((eRow - sRow))
             local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
             if newPPQ ~= e.ppq or newEndPPQ ~= e.endppq then
               tm:assignEvent('note', e, { ppq = newPPQ, endppq = newEndPPQ })
@@ -977,8 +977,8 @@ function newViewManager(tm, cm, cmgr)
             if targetPPQ ~= e.ppq then
               local wantDelay  = e.delay + timing.ppqToDelay(e.ppq - targetPPQ, resolution)
               local dMin, dMax = delayRange(col, e)
-              local newDelay   = util:clamp(wantDelay, dMin, dMax)
-              local newPPQ     = util:round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
+              local newDelay   = util.clamp(wantDelay, dMin, dMax)
+              local newPPQ     = util.round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
               if newPPQ ~= e.ppq or newDelay ~= e.delay then
                 if newDelay ~= wantDelay then clamped = clamped + 1 end
                 local newEnd = newPPQ + (e.endppq - e.ppq)
@@ -1019,7 +1019,7 @@ function newViewManager(tm, cm, cmgr)
       local R = ctx:rowToPPQ(topRow + numRows, chan) - C
 
       local shifted = {}
-      for e in util.between(col.events, C, length) do util:add(shifted, e) end
+      for e in util.between(col.events, C, length) do util.add(shifted, e) end
       for i = #shifted, 1, -1 do
         local e = shifted[i]
         local newPpq = e.ppq + R
@@ -1033,7 +1033,7 @@ function newViewManager(tm, cm, cmgr)
       end
 
       if col.type == 'note' then
-        local spanning = util:seek(col.events, 'before', C, util.isNote)
+        local spanning = util.seek(col.events, 'before', C, util.isNote)
         if spanning and spanning.endppq > C then
           tm:assignEvent('note', spanning, { endppq = math.min(spanning.endppq + R, length) })
         end
@@ -1047,7 +1047,7 @@ function newViewManager(tm, cm, cmgr)
       local R = D - C
 
       if col.type == 'note' then
-        local spanning = util:seek(col.events, 'before', C, util.isNote)
+        local spanning = util.seek(col.events, 'before', C, util.isNote)
         if spanning and spanning.endppq > C then
           local newEnd = spanning.endppq > D and spanning.endppq - R or C
           tm:assignEvent('note', spanning, { endppq = newEnd })
@@ -1055,7 +1055,7 @@ function newViewManager(tm, cm, cmgr)
       end
 
       local touched = {}
-      for e in util.between(col.events, C, length) do util:add(touched, e) end
+      for e in util.between(col.events, C, length) do util.add(touched, e) end
       for _, e in ipairs(touched) do
         if e.ppq < D then
           tm:deleteEvent(col.type, e)
@@ -1110,7 +1110,7 @@ function newViewManager(tm, cm, cmgr)
       if tuning then
         pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune, delta)
       else
-        pitch, detune = util:clamp(note.pitch + delta, 0, 127), note.detune
+        pitch, detune = util.clamp(note.pitch + delta, 0, 127), note.detune
       end
       if pitch == note.pitch and detune == note.detune then return end
       tm:assignEvent('note', note, { pitch = pitch, detune = detune })
@@ -1118,20 +1118,20 @@ function newViewManager(tm, cm, cmgr)
     end
 
     local function nudgeVel(note, dir, coarse)
-      local newVel = util:nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
+      local newVel = util.nudgedScalar(note.vel, 1, 127, dir, coarse and 8 or nil)
       if newVel ~= note.vel then tm:assignEvent('note', note, { vel = newVel }) end
     end
 
     local function nudgeDelay(col, note, dir, coarse)
       local minD, maxD = delayRange(col, note)
       local old = note.delay
-      local new = util:nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
+      local new = util.nudgedScalar(old, math.ceil(minD), math.floor(maxD), dir, coarse and 10 or nil)
       if new ~= old then tm:assignEvent('note', note, { delay = new }) end
     end
 
     local function nudgeValue(col, evt, dir, coarse)
       local lo, hi   = valueBounds(col)
-      local newVal   = util:nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
+      local newVal   = util.nudgedScalar(evt.val, lo, hi, dir, coarse and valueInterval(col) or nil)
       if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
     end
 
@@ -1149,7 +1149,7 @@ function newViewManager(tm, cm, cmgr)
       local r = ec:row()
       local lo, hi = ctx:rowToPPQ(r, col.midiChan), ctx:rowToPPQ(r + 1, col.midiChan)
       local pred = col.type == 'note' and util.isNote or nil
-      local evt = util:seek(col.events, 'at-or-after', lo, pred)
+      local evt = util.seek(col.events, 'at-or-after', lo, pred)
       if evt and evt.ppq < hi then return evt end
     end
 
@@ -1211,7 +1211,7 @@ function newViewManager(tm, cm, cmgr)
             end
           else
             if pendingFixup then
-              util:add(fixups, { evt = lastSurvivor, endppq = evt.ppq })
+              util.add(fixups, { evt = lastSurvivor, endppq = evt.ppq })
             end
             pendingFixup = false
             lastSurvivor = evt
@@ -1219,7 +1219,7 @@ function newViewManager(tm, cm, cmgr)
         end
       end
       if pendingFixup then
-        util:add(fixups, { evt = lastSurvivor, endppq = length })
+        util.add(fixups, { evt = lastSurvivor, endppq = length })
       end
 
       for _, evt in pairs(locs) do
@@ -1411,7 +1411,7 @@ function newViewManager(tm, cm, cmgr)
       local noteCols = {}
       for ci = grid.chanFirstCol[chan], grid.chanLastCol[chan] do
         local c = grid.cols[ci]
-        if c.type == 'note' then util:add(noteCols, c) end
+        if c.type == 'note' then util.add(noteCols, c) end
       end
       if #noteCols <= 1 then return end
       local k = col.lane
@@ -1481,8 +1481,8 @@ function newViewManager(tm, cm, cmgr)
     deleteSel               = function() deleteSelection() end,
     duplicateDown           = function() duplicate( 1) end,
     duplicateUp             = function() duplicate(-1) end,
-    inputOctaveUp           = function() cm:set('take', 'currentOctave', util:clamp(cm:get('currentOctave')+1, -1, 9)) end,
-    inputOctaveDown         = function() cm:set('take', 'currentOctave', util:clamp(cm:get('currentOctave')-1, -1, 9)) end,
+    inputOctaveUp           = function() cm:set('take', 'currentOctave', util.clamp(cm:get('currentOctave')+1, -1, 9)) end,
+    inputOctaveDown         = function() cm:set('take', 'currentOctave', util.clamp(cm:get('currentOctave')-1, -1, 9)) end,
     noteOff                 = noteOff,
     growNote                = function() adjustDuration(1) end,
     shrinkNote              = function() adjustDuration(-1) end,
@@ -1570,7 +1570,7 @@ function newViewManager(tm, cm, cmgr)
           cells     = {},
         }
         ec:decorateCol(gridCol)
-        util:add(grid.cols, gridCol)
+        util.add(grid.cols, gridCol)
         grid.chanFirstCol[chan] = grid.chanFirstCol[chan] or #grid.cols
         grid.chanLastCol[chan]  = #grid.cols
         if type == 'note' and key == 1 then grid.lane1Col[chan] = gridCol end
@@ -1583,7 +1583,7 @@ function newViewManager(tm, cm, cmgr)
         for lane, col in ipairs(c.notes) do addGridCol(chan, 'note', lane, col.events) end
         if c.at then addGridCol(chan, 'at', nil,  c.at.events) end
         local ccNums = {}
-        for n in pairs(c.ccs) do util:add(ccNums, n) end
+        for n in pairs(c.ccs) do util.add(ccNums, n) end
         table.sort(ccNums)
         for _, n in ipairs(ccNums) do addGridCol(chan, 'cc', n, c.ccs[n].events) end
       end
@@ -1591,7 +1591,7 @@ function newViewManager(tm, cm, cmgr)
       rowPPQs = {}
       local r = 0
       while true do
-        local ppq = util:round(r * ppqPerRow)
+        local ppq = util.round(r * ppqPerRow)
         if ppq >= length and r > 0 then break end
         rowPPQs[r] = ppq
         r = r + 1
@@ -1620,7 +1620,7 @@ function newViewManager(tm, cm, cmgr)
         local chan = gridCol.midiChan
         for _, evt in ipairs(gridCol.events) do
           local exact = ctx:ppqToRow(evt.ppq or 0, chan)
-          local y     = util:round(exact)
+          local y     = util.round(exact)
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
               gridCol.overflow[y] = true
@@ -1630,7 +1630,7 @@ function newViewManager(tm, cm, cmgr)
             end
           end
           if evt.endppq then
-            util:add(gridCol.tails, {
+            util.add(gridCol.tails, {
               startRow = exact,
               endRow   = ctx:ppqToRow(evt.endppq, chan),
             })

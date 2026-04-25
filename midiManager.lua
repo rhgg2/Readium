@@ -3,7 +3,7 @@
 loadModule('util')
 
 local function print(...)
-  return util:print(...)
+  return util.print(...)
 end
 
 function newMidiManager(take)
@@ -51,7 +51,7 @@ function newMidiManager(take)
   local function bezierSample(tau, t)
     if t <= 0 then return 0 end
     if t >= 1 then return 1 end
-    local fi = util:clamp(math.abs(tau), 0, 1) * 10
+    local fi = util.clamp(math.abs(tau), 0, 1) * 10
     local i = math.min(math.floor(fi), 9)
     local f = fi - i
     local r0, r1 = BEZIER[i+1], BEZIER[i+2]
@@ -130,7 +130,7 @@ function newMidiManager(take)
 
       local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, '', false)
       if entryOk and fields then
-        tbl[uuid] = util:unserialise(fields)
+        tbl[uuid] = util.unserialise(fields)
       end
     end
     return tbl
@@ -153,7 +153,7 @@ function newMidiManager(take)
       return
     end
 
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util:serialise(data, noteEventFields), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util.serialise(data, noteEventFields), true)
 
     -- Ensure this UUID is in the keys list so loadMetadata() finds it on reload
     local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
@@ -171,7 +171,7 @@ function newMidiManager(take)
     for uuid in pairs(uuidTbl) do
       local uuidTxt = toBase36(uuid)
       newKeys[uuidTxt] = true
-      util:add(keyList, uuidTxt)
+      util.add(keyList, uuidTxt)
       saveMetadatum(uuid)
     end
 
@@ -206,10 +206,10 @@ function newMidiManager(take)
         if notesSeen[tag] then
           local last = notesSeen[tag]
           if endppq > last.endppq then
-            util:add(notesToDelete, last.idx)
+            util.add(notesToDelete, last.idx)
             notesSeen[tag] = { idx = i, endppq = endppq }
           else
-            util:add(notesToDelete, i)
+            util.add(notesToDelete, i)
           end
         else
           notesSeen[tag] = { idx = i, endppq = endppq }
@@ -238,7 +238,7 @@ function newMidiManager(take)
   ---------- PUBLIC
 
   local mm = {}
-  fire = util:installHooks(mm)
+  fire = util.installHooks(mm)
 
   ----- Load
 
@@ -282,7 +282,7 @@ function newMidiManager(take)
           vel    = vel,
         }
         if muted then entry.muted = true end
-        notesLUT[tag] = util:add(noteTbl, entry)
+        notesLUT[tag] = util.add(noteTbl, entry)
       end
     end
 
@@ -318,7 +318,7 @@ function newMidiManager(take)
         entry.shape = shapeNames[shape] or 'step'
         if entry.shape == 'bezier' then entry.tension = tension end
 
-        util:add(ccTbl, entry)
+        util.add(ccTbl, entry)
       end
     end
 
@@ -358,7 +358,7 @@ function newMidiManager(take)
         local newUUID = assignNewUUID(note)
         UUIDCount[oldUUID] = UUIDCount[oldUUID] - 1
         UUIDCount[newUUID] = 1
-        metadata[newUUID] = util:clone(metadata[oldUUID]) or {}
+        metadata[newUUID] = util.clone(metadata[oldUUID]) or {}
         reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, toBase36(newUUID)), false)
       elseif not uuid then
         local newUUID = assignNewUUID(note)
@@ -382,7 +382,7 @@ function newMidiManager(take)
           end
         else
           -- some other notation event
-          util:add(sysexTbl, {
+          util.add(sysexTbl, {
             idx     = i,
             ppq     = ppq,
             msgType = 'notation',
@@ -390,7 +390,7 @@ function newMidiManager(take)
           })
         end
       elseif ok then
-        util:add(sysexTbl, {
+        util.add(sysexTbl, {
             idx     = i,
             ppq     = ppq,
             msgType = textMsgTypes[eventtype] or ('meta_' .. eventtype),
@@ -400,7 +400,7 @@ function newMidiManager(take)
     end
 
     for _, note in ipairs(noteTbl) do
-      util:assign(note, metadata[note.uuid])
+      util.assign(note, metadata[note.uuid])
       uuidTbl[note.uuid] = note
     end
 
@@ -438,7 +438,7 @@ function newMidiManager(take)
 
   function mm:getNote(loc)
     local note = noteTbl[loc]
-    return util:clone(note, INTERNALS)
+    return util.clone(note, INTERNALS)
   end
 
   function mm:notes()
@@ -447,7 +447,7 @@ function newMidiManager(take)
       i = i + 1
       local note = noteTbl[i]
       if note then
-        return i, util:clone(note, INTERNALS)
+        return i, util.clone(note, INTERNALS)
       end
     end
   end
@@ -473,7 +473,7 @@ function newMidiManager(take)
       local note = noteTbl[loc]
       if not note then return end
 
-      util:assign(note, t)
+      util.assign(note, t)
 
       saveMetadatum(note.uuid)
       return
@@ -489,7 +489,7 @@ function newMidiManager(take)
     -- nil args leave REAPER's value unchanged
     reaper.MIDI_SetNote(take, note.idx, nil, t.muted, t.ppq, t.endppq, chan, t.pitch, t.vel, true)
 
-    util:assign(note, t)
+    util.assign(note, t)
     if note.muted == false then note.muted = nil end
 
     -- notation event encodes (chan, pitch) at ppq, so keep it in sync
@@ -510,7 +510,7 @@ function newMidiManager(take)
 
     reaper.MIDI_InsertNote(take, false, t.muted or false, t.ppq, t.endppq, t.chan - 1, t.pitch, t.vel, true)
 
-    local note = util:clone(t)
+    local note = util.clone(t)
     if not note.muted then note.muted = nil end
     local uuid = assignNewUUID(note)
     reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, toBase36(note.uuid)), true)
@@ -518,7 +518,7 @@ function newMidiManager(take)
     local _, noteCount, _, sysexCount = reaper.MIDI_CountEvts(take)
     note.uuidIdx = sysexCount - 1
     note.idx = noteCount - 1
-    util:add(noteTbl, note)
+    util.add(noteTbl, note)
 
     saveMetadatum(note.uuid)
 
@@ -529,7 +529,7 @@ function newMidiManager(take)
 
   function mm:getCC(loc)
     local msg = ccTbl[loc]
-    return util:clone(msg, INTERNALS)
+    return util.clone(msg, INTERNALS)
   end
 
   function mm:ccs()
@@ -538,7 +538,7 @@ function newMidiManager(take)
       i = i + 1
       local msg = ccTbl[i]
       if msg then
-        return i, util:clone(msg, INTERNALS)
+        return i, util.clone(msg, INTERNALS)
       end
     end
   end
@@ -591,12 +591,12 @@ function newMidiManager(take)
       end
       msg2, msg3 = reconstruct(t)
     elseif t.val or t.cc or t.pitch then
-      msg2, msg3 = reconstruct(util:assign(util:clone(msg), t))
+      msg2, msg3 = reconstruct(util.assign(util.clone(msg), t))
     end
     local chan = t.chan and t.chan - 1
     reaper.MIDI_SetCC(take, msg.idx, nil, t.muted, t.ppq, chanmsg, chan, msg2, msg3, true)
 
-    util:assign(msg, t)
+    util.assign(msg, t)
     if msg.muted == false then msg.muted = nil end
     if msg.msgType ~= 'cc' then msg.cc = nil end
     if msg.msgType ~= 'pa' then msg.pitch = nil end
@@ -627,7 +627,7 @@ function newMidiManager(take)
 
     reaper.MIDI_InsertCC(take, false, t.muted or false, t.ppq, chanmsg, t.chan - 1, msg2, msg3)
 
-    local msg = util:clone(t)
+    local msg = util.clone(t)
     if not msg.muted then msg.muted = nil end
 
     local _, _, ccCount = reaper.MIDI_CountEvts(take)
@@ -638,7 +638,7 @@ function newMidiManager(take)
     end
     if msg.shape ~= 'bezier' then msg.tension = nil end
 
-    util:add(ccTbl, msg)
+    util.add(ccTbl, msg)
 
     return #ccTbl
   end
@@ -648,7 +648,7 @@ function newMidiManager(take)
 
   function mm:getSysex(loc)
     local sysex = sysexTbl[loc]
-    return util:clone(sysex, INTERNALS)
+    return util.clone(sysex, INTERNALS)
   end
 
   function mm:sysexes()
@@ -657,7 +657,7 @@ function newMidiManager(take)
       i = i + 1
       local sysex = sysexTbl[i]
       if sysex then
-        return i, util:clone(sysex, INTERNALS)
+        return i, util.clone(sysex, INTERNALS)
       end
     end
   end
@@ -682,7 +682,7 @@ function newMidiManager(take)
 
     reaper.MIDI_SetTextSysexEvt(take, sysex.idx, nil, nil, t.ppq, eventtype, t.val, true)
 
-    util:assign(sysex, t)
+    util.assign(sysex, t)
   end
 
   function mm:addSysex(t)
@@ -701,11 +701,11 @@ function newMidiManager(take)
 
     reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, eventtype, t.val)
 
-    local sysex = util:clone(t)
+    local sysex = util.clone(t)
 
     local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
     sysex.idx = sysexCount - 1
-    util:add(sysexTbl, sysex)
+    util.add(sysexTbl, sysex)
 
     return #sysexTbl
   end
@@ -773,7 +773,7 @@ function newMidiManager(take)
       local _, pos, _, _, _, num, denom, _ = reaper.GetTempoTimeSigMarker(0, i)
       if num > 0 and pos > startTime and pos < endTime then
         local ppq = reaper.MIDI_GetPPQPosFromProjTime(take, pos) - basePPQ
-        util:add(result, { ppq = ppq, num = num, denom = denom })
+        util.add(result, { ppq = ppq, num = num, denom = denom })
       end
     end
 
