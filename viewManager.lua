@@ -260,47 +260,48 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
-  ----- Navigation
+  ----- Viewport
 
-  local function lastVisibleFrom(startCol)
-    local used = 0
-    local last = startCol - 1
-    for i = startCol, #grid.cols do
-      local w = grid.cols[i].width + (i > startCol and 1 or 0)
-      if used + w > gridWidth then break end
-      used = used + w
-      last = i
-    end
-    return last
-  end
-
-  local function followViewport()
-    local maxRow = math.max(0, (grid.numRows or 1) - 1)
-    local cRow, cCol = ec:row(), ec:col()
-
-    -- Row follow (skip before gridHeight is set to avoid inverted bounds)
-    if gridHeight > 0 then
-      local maxScroll = math.max(0, maxRow - gridHeight + 1)
-      scrollRow = util:clamp(scrollRow,
-        math.max(0, cRow - gridHeight + 1),
-        math.min(cRow, maxScroll))
+  local followViewport do
+    local function lastVisibleFrom(startCol)
+      local used = 0
+      local last = startCol - 1
+      for i = startCol, #grid.cols do
+        local w = grid.cols[i].width + (i > startCol and 1 or 0)
+        if used + w > gridWidth then break end
+        used = used + w
+        last = i
+      end
+      return last
     end
 
-    scrollCol = util:clamp(scrollCol, 1, #grid.cols)
-    if cCol < scrollCol then
-      scrollCol = cCol
-    elseif cCol > lastVisibleFrom(scrollCol) then
-      while scrollCol < cCol do
-        scrollCol = scrollCol + 1
-        if cCol <= lastVisibleFrom(scrollCol) then break end
+    function followViewport()
+      local maxRow = math.max(0, (grid.numRows or 1) - 1)
+      local cRow, cCol = ec:row(), ec:col()
+
+      -- Row follow (skip before gridHeight is set to avoid inverted bounds)
+      if gridHeight > 0 then
+        local maxScroll = math.max(0, maxRow - gridHeight + 1)
+        scrollRow = util:clamp(scrollRow,
+                               math.max(0, cRow - gridHeight + 1),
+                               math.min(cRow, maxScroll))
+      end
+
+      scrollCol = util:clamp(scrollCol, 1, #grid.cols)
+      if cCol < scrollCol then
+        scrollCol = cCol
+      elseif cCol > lastVisibleFrom(scrollCol) then
+        while scrollCol < cCol do
+          scrollCol = scrollCol + 1
+          if cCol <= lastVisibleFrom(scrollCol) then break end
+        end
       end
     end
+    
+    function vm:scroll()
+      return scrollRow, scrollCol, lastVisibleFrom(scrollCol)
+    end
   end
-
-  local function moveRow(n, selecting)  killAudition(); ec:moveRow(n, selecting)  end
-  local function moveStop(n, selecting) killAudition(); ec:moveStop(n, selecting) end
-  local function moveCol(n)             killAudition(); ec:moveCol(n)             end
-  local function moveChannel(n)         killAudition(); ec:moveChannel(n)         end
 
   ----- Note geometry  (shared by editing, adjust*, nudge, quantizeKeepRealised)
 
@@ -366,7 +367,8 @@ function newViewManager(tm, cm, cmgr)
 
       local function commit(auditionPitch, auditionVel)
         tm:flush()
-        moveRow(advanceBy)
+        ec:moveRow(advanceBy)
+        killAudition()
         if auditionPitch then audition(auditionPitch, auditionVel or 100, col.midiChan) end
       end
 
@@ -1287,7 +1289,6 @@ function newViewManager(tm, cm, cmgr)
 
   function vm:ec()        return ec end
   function vm:clipboard() return clipboard end
-  function vm:scroll()    return scrollRow, scrollCol, lastVisibleFrom(scrollCol) end
 
   function vm:displayParams()
     return rowPerBeat, rowPerBar, resolution, currentOctave, advanceBy
@@ -1327,7 +1328,7 @@ function newViewManager(tm, cm, cmgr)
 
   local function deleteOrBackspace()
     if ec:isSticky() then deleteSelection()
-    else ec:selClear(); deleteEvent(); moveRow(advanceBy) end
+    else ec:selClear(); deleteEvent(); ec:moveRow(advanceBy) end
   end
 
   local function playFromCursor()
@@ -1547,36 +1548,34 @@ function newViewManager(tm, cm, cmgr)
   ----- Command table
 
   cmgr:registerAll{
-    cursorDown     = function() moveRow(1) end,
-    cursorUp       = function() moveRow(-1) end,
-    pageDown       = function() moveRow(rowPerBar) end,
-    pageUp         = function() moveRow(-rowPerBar) end,
-    goTop          = function() moveRow(-ec:row()) end,
-    goBottom       = function() moveRow((grid.numRows or 1) - ec:row()) end,
-    goLeft         = function() moveCol(-ec:col()) end,
-    goRight        = function() moveCol(#grid.cols - ec:col()) end,
-    cursorRight    = function() moveStop(1) end,
-    cursorLeft     = function() moveStop(-1) end,
-    selectDown     = function() moveRow(1, true) end,
-    selectUp       = function() moveRow(-1, true) end,
-    selectRight    = function() moveStop(1, true) end,
-    selectLeft     = function() moveStop(-1, true) end,
+    cursorDown     = function() ec:moveRow(1) end,
+    cursorUp       = function() ec:moveRow(-1) end,
+    pageDown       = function() ec:moveRow(rowPerBar) end,
+    pageUp         = function() ec:moveRow(-rowPerBar) end,
+    goTop          = function() ec:moveRow(-ec:row()) end,
+    goBottom       = function() ec:moveRow((grid.numRows or 1) - ec:row()) end,
+    goLeft         = function() ec:moveCol(-ec:col()) end,
+    goRight        = function() ec:moveCol(#grid.cols - ec:col()) end,
+    cursorRight    = function() ec:moveStop(1) end,
+    cursorLeft     = function() ec:moveStop(-1) end,
+    selectDown     = function() ec:moveRow(1, true) end,
+    selectUp       = function() ec:moveRow(-1, true) end,
+    selectRight    = function() ec:moveStop(1, true) end,
+    selectLeft     = function() ec:moveStop(-1, true) end,
     selectClear    = function() ec:selClear() end,
-    colRight       = function() moveCol(1) end,
-    colLeft        = function() moveCol(-1) end,
-    channelRight   = function() moveChannel(1) end,
-    channelLeft    = function() moveChannel(-1) end,
+    colRight       = function() ec:moveCol(1) end,
+    colLeft        = function() ec:moveCol(-1) end,
+    channelRight   = function() ec:moveChannel(1) end,
+    channelLeft    = function() ec:moveChannel(-1) end,
     cycleBlock     = function() ec:cycleHBlock() end,
     cycleVBlock    = function() ec:cycleVBlock() end,
     swapBlockEnds  = function() ec:swapEnds() end,
+    copy           = function() clipboard:copy(); ec:selClear() end,
+    cut            = function() clipboard:copy(); deleteSelection() end,
+    paste          = function() if ec:isSticky() then ec:selClear() else clipboard:paste() end end,
     delete         = deleteOrBackspace,
     interpolate    = function() interpolate() end,
     deleteSel      = function() deleteSelection() end,
-    copy           = function() clipboard:copy(); ec:selClear() end,
-    cut            = function() clipboard:copy(); deleteSelection() end,
-    -- In mark mode, the first press is swallowed as a cancel (it would
-    -- paste at cursor, not over the selection); a second press then pastes.
-    paste          = function() if ec:isSticky() then ec:selClear() else clipboard:paste() end end,
     duplicateDown  = function() duplicate( 1) end,
     duplicateUp    = function() duplicate(-1) end,
     inputOctaveUp   = function() cm:set('take', 'currentOctave', util:clamp(currentOctave+1, -1, 9)) end,
@@ -1626,15 +1625,11 @@ function newViewManager(tm, cm, cmgr)
   -- These commands make a sticky selection unsticky, so it doesn't
   -- extend on further move.
   for _, name in ipairs({
-    'nudgeCoarseUp', 'nudgeCoarseDown',
-    'nudgeFineUp', 'nudgeFineDown',
-    'nudgeBack', 'nudgeForward',
-    'growNote', 'shrinkNote',
-    'duplicateDown', 'duplicateUp', 'interpolate',
-    'insertRow', 'deleteRow', 'noteOff',
-    'reswing', 'reswingAll',
-    'quantize', 'quantizeAll',
-    'quantizeKeepRealised', 'quantizeKeepRealisedAll',
+    'nudgeCoarseUp', 'nudgeCoarseDown', 'nudgeFineUp', 'nudgeFineDown',
+    'nudgeBack', 'nudgeForward', 'growNote', 'shrinkNote',
+    'duplicateDown', 'duplicateUp', 'interpolate', 'insertRow',
+    'deleteRow', 'noteOff', 'reswing', 'reswingAll', 'quantize',
+    'quantizeAll', 'quantizeKeepRealised', 'quantizeKeepRealisedAll',
   }) do
     cmgr:doAfter(name, function() ec:unstick() end)
   end
@@ -1642,6 +1637,16 @@ function newViewManager(tm, cm, cmgr)
   -- Clear selection after these commands
   for _, name in ipairs({ 'delete', 'deleteSel', 'cut' }) do
     cmgr:doAfter(name, function() ec:selClear() end)
+  end
+
+  -- Kill audition before these commands
+  for _, name in ipairs({
+      'cursorDown', 'cursorUp', 'pageDown', 'pageUp',
+      'goTop', 'goBottom', 'goLeft', 'goRight',
+      'cursorRight', 'cursorLeft', 'selectDown', 'selectUp',
+      'selectRight', 'selectLeft', 'selectClear', 'colRight',
+      'colLeft', 'channelRight', 'channelLeft', 'delete'}) do
+    cmgr:doBefore(name, killAudition)
   end
 
   ----- Rebuild
