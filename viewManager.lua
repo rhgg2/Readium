@@ -78,7 +78,7 @@ function newViewContext(args)
       end
       return active
     end
-  
+
     local function tsRow(ts) return math.floor(ctx:ppqToRow(ts.ppq)) end
 
     function ctx:rowBeatInfo(row)
@@ -106,7 +106,7 @@ function newViewContext(args)
       return bar, 1, 1, timeSigs[1]
     end
   end
-  
+
   return ctx
 end
 
@@ -189,41 +189,46 @@ function newViewManager(tm, cm, cmgr)
 
   -- An authoring frame comprises swing slot, per-column swing map,
   -- and rowPerBeat.
-  local FRAME_KEYS = { swing = true, colSwing = true, rowPerBeat = true }
+  local isFrameChange, currentFrame, releaseTransientFrame do
+    local FRAME_KEYS = { swing = true, colSwing = true, rowPerBeat = true }
 
-  local function currentFrame(chan)
-    return {
-      swing    = cm:get('swing'),
-      colSwing = cm:get('colSwing')[chan],
-      rpb      = cm:get('rowPerBeat'),
-    }
+    function isFrameChange(change)
+      return FRAME_KEYS[change.key] and change.level ~= 'transient'
+    end
+
+    function currentFrame(chan)
+      return {
+        swing    = cm:get('swing'),
+        colSwing = cm:get('colSwing')[chan],
+        rpb      = cm:get('rowPerBeat'),
+      }
+    end
+
+    -- Drop the transient frame override (if any). Returns true if a
+    -- frame was released, false otherwise.
+    function releaseTransientFrame()
+      local releasing = false
+      for k in pairs(FRAME_KEYS) do
+        if cm:getAt('transient', k) ~= nil then releasing = true; break end
+      end
+      if not releasing then return false end
+
+      local oldRPB = cm:get('rowPerBeat')
+      cm:assign('transient', {
+                  swing      = util.REMOVE,
+                  colSwing   = util.REMOVE,
+                  rowPerBeat = util.REMOVE,
+      })
+      local newRPB = cm:get('rowPerBeat')
+      if newRPB ~= oldRPB then
+        ec:rescaleRow(oldRPB, newRPB)
+        vm:rebuild({ data = true })
+      end
+      return true
+    end
   end
 
-  -- Drop the transient frame override (if any). Returns true if a
-  -- frame was released, false otherwise.
-  local function releaseTransientFrame()
-    local releasing = false
-    for k in pairs(FRAME_KEYS) do
-      if cm:getAt('transient', k) ~= nil then releasing = true; break end
-    end
-    if not releasing then return false end
-
-    local oldRPB = cm:get('rowPerBeat')
-    cm:assign('transient', {
-      swing      = util.REMOVE,
-      colSwing   = util.REMOVE,
-      rowPerBeat = util.REMOVE,
-    })
-    local newRPB = cm:get('rowPerBeat')
-    if newRPB ~= oldRPB then
-      ec:rescaleRow(oldRPB, newRPB)
-      vm:rebuild({ data = true })
-    end
-    return true
-  end
-
-  -- Snap grid to the cursor event's authoring frame, or release if
-  -- already overriding.
+  -- Set grid to the cursor's frame, or release if already overriding.
   local function matchGridToCursor()
     if releaseTransientFrame() then return end
 
@@ -260,6 +265,13 @@ function newViewManager(tm, cm, cmgr)
     else cm:remove('take', 'swing') end
   end
 
+  function vm:setSwingComposite(name, composite)
+    if not name or name == '' then return end
+    local lib = cm:getAt('project', 'swings') or {}
+    lib[name] = composite
+    cm:set('project', 'swings', lib)
+  end
+
   local function cycleSwing()
     local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
     local cur = cm:get('swing') or 'off'
@@ -288,16 +300,9 @@ function newViewManager(tm, cm, cmgr)
     cm:set('track', 'tuning', names[(i + 1) % (#names + 1)])
   end
 
-  function vm:setSwingComposite(name, composite)
-    if not name or name == '' then return end
-    local lib = cm:getAt('project', 'swings') or {}
-    lib[name] = composite
-    cm:set('project', 'swings', lib)
-  end
-
   ----- Mute / solo
-  
-  local pushMute do  
+
+  local pushMute do
     local effectiveMuted = {}  -- cached for cheap per-cell render queries
 
     local function toggleChannelFlag(key, chan)
@@ -391,7 +396,7 @@ function newViewManager(tm, cm, cmgr)
         end
       end
     end
-    
+
     function vm:scroll()
       return scrollRow, scrollCol, lastVisibleFrom(scrollCol)
     end
@@ -407,7 +412,7 @@ function newViewManager(tm, cm, cmgr)
       hexDigit[string.byte('A') + i] = 10 + i
     end
 
-    function addNoteEvent(col, update)
+    function addNoteEvent(update)
       update.frame = currentFrame(update.chan)
       tm:addEvent('note', update)
     end
@@ -421,7 +426,7 @@ function newViewManager(tm, cm, cmgr)
       update.vel    = last and last.vel or cm:get('defaultVelocity')
       update.endppq = next and next.ppq or length
       update.lane   = col.lane
-      addNoteEvent(col, update)
+      addNoteEvent(update)
     end
 
     local function notePAEvents(col, pitch, startPPQ, endPPQ)
@@ -786,7 +791,7 @@ function newViewManager(tm, cm, cmgr)
       if ec:hasSelection() then return adjustPositionMulti(rowDelta) end
 
       local col, note = cursorNoteBefore()
-      if not note then return end
+      if not col or not note then return end
       local chan = col.midiChan
 
       local absDelta = math.abs(rowDelta)
@@ -933,7 +938,7 @@ function newViewManager(tm, cm, cmgr)
         return hit
       end
       reswingCore(allGroups(), {
-        include = function(owner, chan)
+        include = function(owner)
           local f = owner.frame
           return f and (f.swing == name or f.colSwing == name) or false
         end,
@@ -1231,6 +1236,7 @@ function newViewManager(tm, cm, cmgr)
     end
 
     -- Zero `delay` on each selected note. PAs have no delay.
+    ---@diagnostic disable-next-line: unused-local
     local function queueResetDelays(col, locs)
       for _, evt in pairs(locs) do
         if evt.type ~= 'pa' and evt.delay ~= 0 then
@@ -1374,6 +1380,7 @@ function newViewManager(tm, cm, cmgr)
           want.ccs = want.ccs or {}
           want.ccs[cc] = true
         else
+          ---@diagnostic disable-next-line: assign-type-mismatch
           want[type] = true
         end
       end
@@ -1652,7 +1659,7 @@ function newViewManager(tm, cm, cmgr)
   ----- Lifecycle
 
   do
-    local callback = function(changed, _tm)
+    local callback = function(changed)
       if changed.data or changed.take then
         vm:rebuild(changed)
       end
@@ -1661,11 +1668,12 @@ function newViewManager(tm, cm, cmgr)
     -- Mute/solo changes don't affect grid shape, so skip rebuild.
     local muteKeys = { mutedChannels = true, soloedChannels = true }
 
-    local configCallback = function(changed, _cm)
-      if not changed.config then return end
-      -- The callback fired by releaseTransientFrame handles rebuild.
-      if FRAME_KEYS[changed.key] and changed.level ~= 'transient' and releaseTransientFrame() then return end
-      if muteKeys[changed.key] then pushMute(); return end
+    local configCallback = function(change)
+      if not change.config then return end
+      -- The callback fired by releaseTransientFrame handles rebuild,
+      -- so we return early to prevent double-dipping.
+      if isFrameChange(change) and releaseTransientFrame() then return end
+      if muteKeys[change.key] then pushMute(); return end
       vm:rebuild({ take = false, data = true })
     end
 

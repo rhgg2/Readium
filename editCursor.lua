@@ -12,8 +12,19 @@ function newEditCursor(deps)
   local moveHook = deps.moveHook or function () end
 
   local cursorRow, cursorCol, cursorStop = 0, 1, 1
-  local sel, selAnchor                   = nil, nil
   local hBlockScope, vBlockScope         = 0, 0
+  local sel, selAnchor
+
+  ----- Position
+
+  local function clampPos()
+    local maxRow = math.max(0, (grid.numRows or 1) - 1)
+    cursorRow = util.clamp(cursorRow, 0, maxRow)
+    cursorCol  = util.clamp(cursorCol, 1, #grid.cols)
+    cursorStop = util.clamp(cursorStop, 1, #grid.cols[cursorCol].stopPos)
+  end
+
+  ----- Kinds
 
   local function selGrpAt(col, stop)
     local c = grid.cols[col]
@@ -47,11 +58,7 @@ function newEditCursor(deps)
     return NOTE_KIND_BY_SELGRP[g] or 'pitch'
   end
 
-  local function kindAt(col, stop)
-    return kindFromSelGrp(col, selGrpAt(col, stop))
-  end
-
-  local function cursorKind() return kindAt(cursorCol, cursorStop) end
+  local function cursorKind() return kindFromSelGrp(cursorCol, selGrpAt(cursorCol, cursorStop)) end
 
   local function firstStopForKind(col, kind)
     if not isNoteCol(col) then return 1 end
@@ -61,12 +68,6 @@ function newEditCursor(deps)
   ----- Selection
 
   local function isSticky() return hBlockScope > 0 or vBlockScope > 0 end
-  local function clampPos()
-    local maxRow = math.max(0, (grid.numRows or 1) - 1)
-    cursorRow = util.clamp(cursorRow, 0, maxRow)
-    cursorCol  = util.clamp(cursorCol, 1, #grid.cols)
-    cursorStop = util.clamp(cursorStop, 1, #grid.cols[cursorCol].stopPos)
-  end
 
   local function selStart()
     selAnchor = { row = cursorRow, col = cursorCol, stop = cursorStop }
@@ -76,6 +77,7 @@ function newEditCursor(deps)
 
   local function selUpdate()
     local a = selAnchor
+    if not a then return end
     local numRows = grid.numRows or 1
 
     local r1, r2
@@ -145,6 +147,8 @@ function newEditCursor(deps)
     clampPos(); moveHook()
     selUpdate()
   end
+
+  ----- Movement
 
   local function moveRow(n, selecting)
     if selecting or isSticky() then
@@ -257,11 +261,58 @@ function newEditCursor(deps)
 
   local ec = {}
 
+  ----- Position
+
   function ec:row()           return cursorRow  end
   function ec:col()           return cursorCol  end
   function ec:pos()           return cursorRow, cursorCol, cursorStop end
+
+  function ec:setPos(row, col, stop)
+    if row  then cursorRow  = row  end
+    if col  then cursorCol  = col  end
+    if stop then cursorStop = stop end
+    clampPos(); moveHook()
+  end
+
+  function ec:clampPos()      clampPos() end
+
+  function ec:rescaleRow(oldRPB, newRPB)
+    cursorRow = math.floor(cursorRow * newRPB / oldRPB)
+  end
+
+  function ec:reset()
+    cursorRow, cursorCol, cursorStop = 0, 1, 1
+    selClear()
+  end
+
+  ----- Kind & Region
+
+  function ec:cursorKind()    return cursorKind() end
   function ec:hasSelection()  return sel ~= nil end
   function ec:isSticky()      return isSticky() end
+
+  -- The rect to operate on, kind-typed. Internal sel stores selgrp
+  -- (selUpdate / selectionStopSpan need the numeric handle); the public
+  -- boundary speaks kinds. Degenerates to 1x1 at cursor when no selection
+  -- — `hasSelection()` is the bit when that distinction matters.
+  function ec:region()
+    if sel then
+      return sel.row1, sel.row2, sel.col1, sel.col2,
+             kindFromSelGrp(sel.col1, sel.selgrp1),
+             kindFromSelGrp(sel.col2, sel.selgrp2)
+    end
+    local k = cursorKind()
+    return cursorRow, cursorRow, cursorCol, cursorCol, k, k
+  end
+
+  -- (col, stop) of the region's top-left corner. Returns a pair so callers
+  -- can splat directly into setPos: `ec:setPos(row, ec:regionStart())`.
+  -- Degenerates to the cursor's col/stop when no selection.
+  function ec:regionStart()
+    if not sel then return cursorCol, cursorStop end
+    return sel.col1,
+           firstStopForKind(sel.col1, kindFromSelGrp(sel.col1, sel.selgrp1))
+  end
 
   -- Iterator over the cols an op should target: the selection's cols if
   -- a selection is active, otherwise just the cursor's col (or nothing if
@@ -286,58 +337,6 @@ function newEditCursor(deps)
         ci = ci + 1
       end
     end
-  end
-
-  function ec:clampPos()      clampPos() end
-
-  function ec:setPos(row, col, stop)
-    if row  then cursorRow  = row  end
-    if col  then cursorCol  = col  end
-    if stop then cursorStop = stop end
-    clampPos(); moveHook()
-  end
-
-  function ec:rescaleRow(oldRPB, newRPB)
-    cursorRow = math.floor(cursorRow * newRPB / oldRPB)
-  end
-
-  function ec:reset()
-    cursorRow, cursorCol, cursorStop = 0, 1, 1
-    selClear()
-  end
-
-  function ec:shiftSelection(rowDelta)
-    local maxRow = grid.numRows - 1
-    sel.row1      = util.clamp(sel.row1      + rowDelta, 0, maxRow)
-    sel.row2      = util.clamp(sel.row2      + rowDelta, 0, maxRow)
-    selAnchor.row = util.clamp(selAnchor.row + rowDelta, 0, maxRow)
-    cursorRow     = cursorRow + rowDelta
-    clampPos(); moveHook()
-  end
-
-  function ec:cursorKind()                return cursorKind() end
-
-  -- The rect to operate on, kind-typed. Internal sel stores selgrp
-  -- (selUpdate / selectionStopSpan need the numeric handle); the public
-  -- boundary speaks kinds. Degenerates to 1x1 at cursor when no selection
-  -- — `hasSelection()` is the bit when that distinction matters.
-  function ec:region()
-    if sel then
-      return sel.row1, sel.row2, sel.col1, sel.col2,
-             kindFromSelGrp(sel.col1, sel.selgrp1),
-             kindFromSelGrp(sel.col2, sel.selgrp2)
-    end
-    local k = cursorKind()
-    return cursorRow, cursorRow, cursorCol, cursorCol, k, k
-  end
-
-  -- (col, stop) of the region's top-left corner. Returns a pair so callers
-  -- can splat directly into setPos: `ec:setPos(row, ec:regionStart())`.
-  -- Degenerates to the cursor's col/stop when no selection.
-  function ec:regionStart()
-    if not sel then return cursorCol, cursorStop end
-    return sel.col1,
-           firstStopForKind(sel.col1, kindFromSelGrp(sel.col1, sel.selgrp1))
   end
 
   function ec:setSelection(r)
@@ -380,6 +379,17 @@ function newEditCursor(deps)
     selUpdate()
   end
 
+  function ec:shiftSelection(rowDelta)
+    local maxRow = grid.numRows - 1
+    sel.row1      = util.clamp(sel.row1      + rowDelta, 0, maxRow)
+    sel.row2      = util.clamp(sel.row2      + rowDelta, 0, maxRow)
+    selAnchor.row = util.clamp(selAnchor.row + rowDelta, 0, maxRow)
+    cursorRow     = cursorRow + rowDelta
+    clampPos(); moveHook()
+  end
+
+  ----- Motion
+
   function ec:advance() moveRow(cm:get('advanceBy')) end
 
   do
@@ -400,6 +410,8 @@ function newEditCursor(deps)
       if c then selectSpan(1, col, 1, #c.stopPos) end
     end
   end
+
+  ----- Commands
 
   function ec:registerCommands(cmgr)
     cmgr:registerAll{
@@ -428,6 +440,8 @@ function newEditCursor(deps)
     }
   end
 
+  ----- Decoration
+
   -- Stamp kind-shape fields onto a half-built grid column. ec owns both
   -- the shape tables and the field names; addGridCol never names them.
   do
@@ -455,7 +469,12 @@ function newEditCursor(deps)
   return ec
 end
 
+---------- CLIPBOARD
+
 function newClipboard(deps)
+
+  ---------- PRIVATE
+
   local ec           = deps.ec
   local grid         = deps.grid
   local tm           = deps.tm
@@ -656,12 +675,12 @@ function newClipboard(deps)
           currentVel = util.clamp(velList[vi].val, 1, 127)
           vi = vi + 1
         end
-        addNoteEvent(dstCol, {
+        addNoteEvent {
           ppq = ce.ppq,
           endppq = ce.endppq or nextNotePPQ,
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
           lane = lane,
-        })
+        }
       end
       tm:flush()
       return
@@ -796,11 +815,11 @@ function newClipboard(deps)
       -- Write clip events.
       for _, e in ipairs(events) do
         if r.type == 'note' then
-          addNoteEvent(dst, {
+          addNoteEvent {
             ppq = e.ppq, endppq = e.endppq or capPPQ,
             chan = r.chan, pitch = e.pitch, vel = e.vel,
             lane = r.lane,
-          })
+          }
         elseif r.type == 'cc' then
           tm:addEvent('cc', { ppq = e.ppq, chan = r.chan, cc = r.ccNum, val = e.val })
         else
@@ -838,6 +857,8 @@ function newClipboard(deps)
       for _, c in ipairs(clip.cols) do filter(c.events) end
     end
   end
+
+  ---------- PUBLIC
 
   local clipboard = {}
   function clipboard:collect()           return collect() end

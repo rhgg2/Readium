@@ -113,7 +113,7 @@ function newConfigManager()
 
   local function parse(text)
     if not text or text == '' then return {} end
-    local ok, result = pcall(util.unserialise, util, text)
+    local ok, result = pcall(util.unserialise, text)
     if ok and type(result) == 'table' then return pruneUnknown(result) end
     return {}
   end

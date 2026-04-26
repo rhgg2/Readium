@@ -109,7 +109,7 @@ end
 function util.isNote(e) return e and e.endppq end
 
 function util.between(events, lo, hi, filter)
-  filter = filter or function(e) return true end
+  filter = filter or function() return true end
   local i = 0
   return function()
     while true do
@@ -173,7 +173,7 @@ function util.dotimes(n, v)
 end
 
 function util.serialise(value, exclude, seen)
-  exclude = exclude or { } 
+  exclude = exclude or { }
   local t = type(value)
 
   if t == 'number' or t == 'boolean' then
@@ -310,4 +310,4 @@ function util.unserialise(input)
   end
 
   return result
-end 
+end
