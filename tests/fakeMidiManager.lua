@@ -29,19 +29,13 @@ local ccCmp = function(a, b)
   return (a.cc or a.pitch or 0) < (b.cc or b.pitch or 0)
 end
 
-local sysexCmp = function(a, b)
-  if a.ppq     ~= b.ppq     then return a.ppq     < b.ppq     end
-  if a.msgType ~= b.msgType then return (a.msgType or '') < (b.msgType or '') end
-  return (tostring(a.val) < tostring(b.val))
-end
-
 function newMidiManager(opts)
   opts = opts or {}
   -- Accept either a take token (real mm signature) or an options table.
   if type(opts) ~= 'table' then opts = { take = opts } end
 
-  local noteList, ccList, sysexList = {}, {}, {}
-  local noteByLoc, ccByLoc, sysexByLoc = {}, {}, {}
+  local noteList, ccList = {}, {}
+  local noteByLoc, ccByLoc = {}, {}
   local lock        = false
   local take        = opts.take or 'fake-take'
   local resolution  = opts.resolution or 240
@@ -66,13 +60,11 @@ function newMidiManager(opts)
   end
 
   local function reindex()
-    table.sort(noteList,  noteCmp)
-    table.sort(ccList,    ccCmp)
-    table.sort(sysexList, sysexCmp)
-    noteByLoc, ccByLoc, sysexByLoc = {}, {}, {}
-    for i, n in ipairs(noteList)  do noteByLoc[i]  = n; n.idx = i - 1 end
-    for i, c in ipairs(ccList)    do ccByLoc[i]    = c; c.idx = i - 1 end
-    for i, s in ipairs(sysexList) do sysexByLoc[i] = s; s.idx = i - 1 end
+    table.sort(noteList, noteCmp)
+    table.sort(ccList,   ccCmp)
+    noteByLoc, ccByLoc = {}, {}
+    for i, n in ipairs(noteList) do noteByLoc[i] = n; n.idx = i - 1 end
+    for i, c in ipairs(ccList)   do ccByLoc[i]   = c; c.idx = i - 1 end
   end
 
   -- LIFECYCLE
@@ -94,13 +86,12 @@ function newMidiManager(opts)
   -- TEST-ONLY HELPERS
 
   function mm:seed(seed)
-    noteList, ccList, sysexList = {}, {}, {}
+    noteList, ccList = {}, {}
     if seed.resolution then resolution = seed.resolution end
     if seed.length     then length     = seed.length     end
     if seed.timeSigs   then timeSigs   = seed.timeSigs   end
-    for _, n in ipairs(seed.notes   or {}) do noteList[#noteList + 1]   = util.clone(n) end
-    for _, c in ipairs(seed.ccs     or {}) do ccList[#ccList + 1]       = util.clone(c) end
-    for _, s in ipairs(seed.sysexes or {}) do sysexList[#sysexList + 1] = util.clone(s) end
+    for _, n in ipairs(seed.notes or {}) do noteList[#noteList + 1] = util.clone(n) end
+    for _, c in ipairs(seed.ccs   or {}) do ccList[#ccList + 1]     = util.clone(c) end
     -- Track the high-water uuid across pre-seeded notes/ccs so subsequent
     -- allocations don't collide.
     for _, e in ipairs(noteList) do if e.uuid and e.uuid > maxUuid then maxUuid = e.uuid end end
@@ -116,7 +107,7 @@ function newMidiManager(opts)
       for i, e in ipairs(list) do out[i] = util.clone(e) end
       return out
     end
-    return { notes = each(noteList), ccs = each(ccList), sysexes = each(sysexList) }
+    return { notes = each(noteList), ccs = each(ccList) }
   end
 
   -- LOCKING
@@ -245,43 +236,6 @@ function newMidiManager(opts)
       maxUuid = maxUuid + 1
       c.uuid  = maxUuid
     end
-  end
-
-  -- SYSEX / TEXT
-
-  function mm:getSysex(loc) return cloneShallow(sysexByLoc[loc], INTERNALS) end
-
-  function mm:sysexes()
-    local i = 0
-    return function()
-      i = i + 1
-      local s = sysexByLoc[i]
-      if s then return i, cloneShallow(s, INTERNALS) end
-    end
-  end
-
-  function mm:addSysex(t)
-    assertLock()
-    assert(t.ppq and t.msgType and t.val, 'Error! Underspecified new sysex/text event')
-    sysexList[#sysexList + 1] = util.clone(t)
-    return #sysexList
-  end
-
-  function mm:deleteSysex(loc)
-    assertLock()
-    local s = sysexByLoc[loc]
-    if not s then return end
-    for i, e in ipairs(sysexList) do
-      if e == s then table.remove(sysexList, i); break end
-    end
-    sysexByLoc[loc] = nil
-  end
-
-  function mm:assignSysex(loc, t)
-    assertLock()
-    local s = sysexByLoc[loc]
-    if not s then return end
-    util.assign(s, t)
   end
 
   -- TAKE DATA

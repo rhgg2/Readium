@@ -26,7 +26,7 @@ require('commandManager')
 require('viewManager')
 
 -- Build a fresh scenario. Keys:
---   seed      : seed payload for the fake mm (notes, ccs, sysexes, resolution, length, timeSigs)
+--   seed      : seed payload for the fake mm (notes, ccs, resolution, length, timeSigs)
 --   config    : { [level] = { key = value, ... } } written via cm:assign
 --   take      : override the opaque take token (default 'take1')
 function harness.mk(opts)

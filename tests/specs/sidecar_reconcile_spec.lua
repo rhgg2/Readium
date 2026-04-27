@@ -1,6 +1,6 @@
 -- Pin-tests for sr:reconcile — the unified sidecar↔cc binding pass. Bucket
 -- once by (msgType, chan, id) and run four stages within each bucket:
---   1. exact (ppq, val) match    → silent bind  (b.silent = true)
+--   1. exact (ppq, val) match    → silent bind  (b.silent = true; absent otherwise)
 --   2. same ppq, val differs     → valueRebound
 --   3. consensus offset          → consensusRebound (≥ 50% of bucket sidecars,
 --                                  min 2 voters)
@@ -114,7 +114,7 @@ return {
       local sc1 = sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 }
       local c1  = cc     { ppq = 100,           msgType = 'cc', chan = 1, cc = 7, val = 80 }
       local r = sr:reconcile({ sc1 }, { c1 })
-      t.deepEq(r.binds, { { sidecar = sc1, cc = c1, silent = false } })
+      t.deepEq(r.binds, { { sidecar = sc1, cc = c1 } })
       t.eq(#r.events, 1)
       local e = r.events[1]
       t.eq(e.kind, 'valueRebound')
@@ -173,7 +173,7 @@ return {
           cc{ ppq = 120, msgType = 'cc', chan = 1, cc = 7, val = 64 },
         })
       t.eq(#r.binds, 2)
-      for _, b in ipairs(r.binds) do t.eq(b.silent, false) end
+      for _, b in ipairs(r.binds) do t.falsy(b.silent) end
       for _, e in ipairs(r.events) do
         t.eq(e.kind, 'consensusRebound')
         t.eq(e.offset, 20)
@@ -282,7 +282,7 @@ return {
       local sc1 = sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 }
       local c1  = cc     { ppq = 130,           msgType = 'cc', chan = 1, cc = 7, val = 99 }
       local r = sr:reconcile({ sc1 }, { c1 })
-      t.deepEq(r.binds, { { sidecar = sc1, cc = c1, silent = false } })
+      t.deepEq(r.binds, { { sidecar = sc1, cc = c1 } })
       t.eq(#r.events, 1)
       local e = r.events[1]
       t.eq(e.kind, 'guessedRebound')
@@ -466,10 +466,10 @@ return {
       local kinds, silentByUuid = {}, {}
       for _, e in ipairs(r.events) do kinds[e.uuid] = e.kind end
       for _, b in ipairs(r.binds) do silentByUuid[b.sidecar.uuid] = b.silent end
-      t.eq(silentByUuid[1], true,  'sidecar 1 silent (exact match)')
-      t.eq(silentByUuid[2], false, 'sidecar 2 noisy (consensus)')
-      t.eq(silentByUuid[3], false, 'sidecar 3 noisy (consensus)')
-      t.eq(silentByUuid[4], false, 'sidecar 4 noisy (valueRebound)')
+      t.eq(silentByUuid[1], true, 'sidecar 1 silent (exact match)')
+      t.falsy(silentByUuid[2],    'sidecar 2 noisy (consensus)')
+      t.falsy(silentByUuid[3],    'sidecar 3 noisy (consensus)')
+      t.falsy(silentByUuid[4],    'sidecar 4 noisy (valueRebound)')
       t.eq(kinds[1], nil, 'silent rebind has no event')
       t.eq(kinds[2], 'consensusRebound')
       t.eq(kinds[3], 'consensusRebound')

@@ -36,8 +36,7 @@ function newMidiManager(take)
 
   local noteTbl    = {}
   local ccTbl      = {}
-  local sysexTbl   = {}
-  local sidecarTbl = {}     -- Readium-magic sysex events; not exposed via sysexes()
+  local sidecarTbl = {}     -- Readium-magic sysex events
   local uuidTbl    = {}
   local maxUUID    = 0
   local lock       = false
@@ -105,13 +104,6 @@ function newMidiManager(take)
     elseif shape == 'bezier'     then return bezierSample(tension or 0, t)
     end
   end
-
-  local eventTypeLUT = {
-    sysex = -1, text = 1, copyright = 2, trackname = 3,
-    instrument = 4, lyric = 5, marker = 6, cuepoint = 7, notation = 15,
-  }
-  local textMsgTypes = {}
-  for k, v in pairs(eventTypeLUT) do textMsgTypes[v] = k end
 
   -- matches only NOTE notation events tagged with our rdm_<uuid> marker
   local function parseUUIDNotation(msg)
@@ -266,7 +258,6 @@ function newMidiManager(take)
 
     noteTbl    = {}
     ccTbl      = {}
-    sysexTbl   = {}
     sidecarTbl = {}
     uuidTbl    = {}
     maxUUID    = 0
@@ -366,10 +357,9 @@ function newMidiManager(take)
     end
     reaper.MIDI_Sort(take)
 
-    -- Rebuilds sysexTbl + sidecarTbl after any mid-load mutation that
-    -- shifts text/sysex idxs. Refreshes note.uuidIdx via notesLUT.
+    -- Rebuilds sidecarTbl after any mid-load mutation that shifts text/sysex
+    -- idxs. Refreshes note.uuidIdx via notesLUT.
     local function scanText()
-      sysexTbl   = {}
       sidecarTbl = {}
       local _, _, _, textCount = reaper.MIDI_CountEvts(take)
       for i = 0, textCount-1 do
@@ -379,20 +369,14 @@ function newMidiManager(take)
           if uuidTxt then
             local note = notesLUT[ppq .. '|' .. chan .. '|' .. pitch]
             if note then note.uuidIdx = i end
-          else
-            util.add(sysexTbl, { idx = i, ppq = ppq, msgType = 'notation', val = msg })
           end
-        elseif ok then
-          local sidecar = eventtype == -1 and sr:decode(msg) or nil
+        elseif ok and eventtype == -1 then
+          local sidecar = sr:decode(msg)
           if sidecar then
             sidecar.idx  = i
             sidecar.ppq  = ppq
             sidecar.body = msg
             util.add(sidecarTbl, sidecar)
-          else
-            util.add(sysexTbl, { idx = i, ppq = ppq,
-                                 msgType = textMsgTypes[eventtype] or ('meta_' .. eventtype),
-                                 val = msg })
           end
         end
       end
@@ -805,72 +789,6 @@ function newMidiManager(take)
   end
 
 
-  ----- Sysex / text
-
-  function mm:getSysex(loc)
-    local sysex = sysexTbl[loc]
-    return util.clone(sysex, INTERNALS)
-  end
-
-  function mm:sysexes()
-    local i = 0
-    return function()
-      i = i + 1
-      local sysex = sysexTbl[i]
-      if sysex then
-        return i, util.clone(sysex, INTERNALS)
-      end
-    end
-  end
-
-  function mm:deleteSysex(loc)
-    if not (take and checkLock()) then return end
-
-    local sysex = sysexTbl[loc]
-    if not sysex then return end
-
-    reaper.MIDI_DeleteTextSysexEvt(take, sysex.idx)
-    sysexTbl[loc] = nil
-  end
-
-  function mm:assignSysex(loc, t)
-    if not (take and checkLock()) then return end
-
-    local sysex = sysexTbl[loc]
-    if not sysex then return end
-
-    local eventtype = t.msgType and eventTypeLUT[t.msgType] or eventTypeLUT[sysex.msgType]
-
-    reaper.MIDI_SetTextSysexEvt(take, sysex.idx, nil, nil, t.ppq, eventtype, t.val, true)
-
-    util.assign(sysex, t)
-  end
-
-  function mm:addSysex(t)
-    if not (take and checkLock()) then return end
-
-    local eventtype = t.msgType and eventTypeLUT[t.msgType]
-    if not eventtype then
-      print('Error! Unspecified message type')
-      return
-    end
-
-    if t.ppq == nil or t.msgType == nil or t.val == nil then
-      print('Error! Underspecified new sysex/text event')
-      return
-    end
-
-    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, eventtype, t.val)
-
-    local sysex = util.clone(t)
-
-    local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
-    sysex.idx = sysexCount - 1
-    util.add(sysexTbl, sysex)
-
-    return #sysexTbl
-  end
-
   ----- Take data
 
   function mm:take()
@@ -1026,7 +944,6 @@ function newSidecarReconciler()
     local binds, events = {}, {}
     local function bind(s, c, silent, evt)
       util.add(binds, { sidecar = s, cc = c, silent = silent })
-      if evt then util.add(events, evt) end
       removeFirst(sidecars, s); removeFirst(ccs, c)
     end
 
@@ -1050,7 +967,8 @@ function newSidecarReconciler()
       for _, s in ipairs(scs) do
         local c = cs[1]
         if c then
-          bind(s, c, false, payload('valueRebound', s, c, { oldVal = s.val, newVal = c.val }))
+          bind(s, c)
+          util.add(events, payload('valueRebound', s, c, { oldVal = s.val, newVal = c.val }))
           table.remove(cs, 1)
         end
       end
@@ -1087,7 +1005,8 @@ function newSidecarReconciler()
             if sidecarOffsets[s][bestOff] then
               for i, c in ipairs(cs) do
                 if c.ppq - s.ppq == bestOff then
-                  bind(s, c, false, payload('consensusRebound', s, c, { offset = bestOff }))
+                  bind(s, c)
+                  util.add(events, payload('consensusRebound', s, c, { offset = bestOff }))
                   table.remove(cs, i)
                   break
                 end
@@ -1108,7 +1027,8 @@ function newSidecarReconciler()
                              chan = s.chan, msgType = s.msgType,
                              cc = s.cc, pitch = s.pitch })
         elseif #cs == 1 then
-          bind(s, cs[1], false, payload('guessedRebound', s, cs[1]))
+          bind(s, cs[1])
+          util.add(events, payload('guessedRebound', s, cs[1]))
           table.remove(cs, 1)
         else
           local ppqs = {}

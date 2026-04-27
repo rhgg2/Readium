@@ -44,8 +44,9 @@ The carrier is a coincident sysex with a Readium magic prefix
 `(uuid, msgType, chan, [cc|pitch], val)` so the carrier can re-bind to its
 event at load time even after drift.
 
-Sidecars sit alongside ordinary sysex; mm filters them out of `sysexes()` by
-prefix the same way `rdm_<uuid>` notation events are filtered for notes.
+Sidecars sit alongside ordinary sysex but are routed to an internal
+`sidecarTbl` during load — Readium only surfaces notes and CCs to its
+upper layers, so plain sysex/text events have no public accessors.
 
 **Reconciliation (load-time).** Sidecars don't have a REAPER-side anchor to
 their target the way notation events have to notes, so matching has to handle
@@ -199,24 +200,22 @@ Shape codes follow REAPER's `MIDI_SetCCShape`: `step, linear, slow,
 fast-start, fast-end, bezier` → 0..5. `tension` is only meaningful for
 `bezier` and is cleared when the shape moves away from it.
 
-## Sysex / text events
+## Text / sysex events
 
-`eventTypeLUT` maps names to REAPER's event-type integer
-(`sysex=-1, text=1, …, notation=15`). Two filters keep Readium's identity
-machinery from leaking into `sysexes()`:
-- Notation events (type 15) matching the `rdm_<uuid>` pattern belong to their
-  note and are hidden.
-- Sysex events (type -1) whose body starts with the Readium magic
-  (`}RDM`, `7D 52 44 4D`) are cc sidecars and are hidden.
+Readium reads two text-event types and ignores the rest:
+- Notation events (REAPER type 15) matching the `rdm_<uuid>` pattern bind
+  to their note via `note.uuidIdx`.
+- Sysex events (REAPER type -1) whose body starts with the Readium magic
+  (`}RDM`, `7D 52 44 4D`) are cc sidecars and feed `sidecarTbl`.
 
-All other notation events surface as `msgType='notation'`; everything else
-keeps its `eventTypeLUT` name.
+Everything else passes through untouched — Readium neither surfaces nor
+mutates plain sysex/text events.
 
 ## LUT discipline
 
 Name→code LUTs are declared canonically; the inverse (`chanMsgTypes`,
-`shapeNames`, `textMsgTypes`) is derived in a loop so the two directions can't
-drift. `chanMsgLUT` and `BASE36`/`toBase36`/`fromBase36` are hoisted to module
+`shapeNames`) is derived in a loop so the two directions can't drift.
+`chanMsgLUT` and `BASE36`/`toBase36`/`fromBase36` are hoisted to module
 scope so `newMidiManager` and `newSidecarReconciler` share one source of truth.
 
 ---
@@ -280,19 +279,6 @@ mm:assignCC(loc, t)      -- merge t into CC
   any event-field change rewrites the sidecar fingerprint, and a ppq change
     moves the sidecar so next load is tier-1 clean
 mm:deleteCC(loc)         -- also removes the sidecar and clears the rdm_<uuid> slot
-```
-
-### Sysex / text — location-based
-
-```
-mm:getSysex(loc)         -> copy, or nil
-mm:sysexes()             -> iterator
-mm:addSysex(t)           -> new loc
-  t: { ppq, msgType, val }
-  msgType ∈ {sysex, text, copyright, trackname, instrument, lyric,
-             marker, cuepoint, notation}
-mm:assignSysex(loc, t)
-mm:deleteSysex(loc)
 ```
 
 ### Take data
