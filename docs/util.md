@@ -34,11 +34,22 @@ serialise side is strict.
 
 ## Callback installation
 
-`util.installHooks(owner)` is the shared fire-and-listener protocol. It
-installs `addCallback` / `removeCallback` on `owner` and returns a
-`fire(...)` closure the owner invokes on every notable event. mm, tm,
-vm, and cm all wire callbacks through this — the `changed, manager`
-argument shape is a convention between callers, not enforced here.
+`util.installHooks(owner)` is the shared signal-keyed listener protocol. It
+installs three methods on `owner` and returns a `fire(signal, data)` closure:
+
+```
+owner:subscribe(signal, fn)        register a listener
+owner:unsubscribe(signal, fn)      remove a listener
+owner:forward(signal, source)      subscribe on `source`, re-fire on owner
+                                   (source must also have installHooks)
+```
+
+Listeners are filtered by signal at registration: a callback registered for
+one signal name never fires for another. `forward` is sugar for the common
+"layer above passes a signal through unchanged" pattern.
+
+mm, tm, and cm all use this — see each manager's doc for the signals it
+emits.
 
 ## Event-list helpers
 
@@ -100,6 +111,8 @@ util.isNote(e)                   -- predicate: has endppq
 ```
 util.clamp(v, lo, hi)
 util.round(n, to)                -- to optional (snap multiple)
+util.gcd(a, b)                   -- non-negative integer gcd
+util.lcm(a, b)                   -- non-negative integer lcm
 util.snapTo(v, dir, interval)    -- next multiple of interval in dir, never no-op
 util.nudgedScalar(v, lo, hi, dir, interval)
                                  -- snapped or unit-stepped, clamped
@@ -123,6 +136,8 @@ outermost (and only the outermost — recursion does not inherit it) table.
 
 ```
 fire = util.installHooks(owner)
-  installs owner:addCallback(fn), owner:removeCallback(fn)
-  returns fire(...) — each listener runs with the forwarded args
+  installs owner:subscribe(signal, fn)
+           owner:unsubscribe(signal, fn)
+           owner:forward(signal, source)   -- source:subscribe → owner.fire
+  returns fire(signal, data) — only listeners on `signal` run, with `data`
 ```

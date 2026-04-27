@@ -230,7 +230,7 @@ return {
     run = function(harness)
       local h = harness.mk()
       local seen = {}
-      h.cm:addCallback(function(changed) table.insert(seen, changed) end)
+      h.cm:subscribe('configChanged', function(changed) table.insert(seen, changed) end)
       h.cm:set('take', 'pbRange', 4)
       h.cm:remove('take', 'pbRange')
       h.cm:assign('transient', { pbRange = 3 })

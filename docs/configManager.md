@@ -74,19 +74,16 @@ callback. Passing `nil` clears the take/track context — `global` and
 `project` remain available; `getAt('track'|'take', …)` returns an empty
 table or nil values.
 
-## Callbacks
+## Signals
 
-`fire` is installed via `util.installHooks(cm)`. Callbacks run as
-`fn(changed, cm)`, where `changed` is:
+cm fires one signal, `'configChanged'`. Payload shape varies by call site:
 
-- `{ config = true, key = <name>, level = <level> }` — targeted writes
-  (`set`, `remove`). Consumers can filter on the keys they actually
-  depend on, and on `level` to distinguish their own writes from
-  others' (`viewManager` uses this to skip self-release on its own
-  transient-tier writes).
-- `{ config = true, level = <level> }` — bulk `assign` (keyless).
-- `{ config = true }` — `setContext` reload. No `level`; treat as
-  "any key may have changed".
+- `{ key = <name>, level = <level> }` — targeted writes (`set`, `remove`).
+  Consumers can filter on the keys they depend on, and on `level` to
+  distinguish their own writes from others' (`viewManager` uses this to
+  skip self-release on its own transient-tier writes).
+- `{ level = <level> }` — bulk `assign` (keyless).
+- `{}` — `setContext` reload. No `level`; treat as "any key may have changed".
 
 ## Conventions
 
@@ -111,8 +108,8 @@ cm:setContext(take)             -- take may be nil to clear; fires callback
 ### Callbacks
 
 ```
-cm:addCallback(fn)              -- fn(changed, cm); see "Callbacks" above
-cm:removeCallback(fn)
+cm:subscribe('configChanged', fn)      -- fn(data); see "Signals" above
+cm:unsubscribe('configChanged', fn)
 ```
 
 ### Reading
@@ -129,9 +126,9 @@ cm:getLevel(key)       -> level name currently defining key, or nil
 ### Writing
 
 ```
-cm:set(level, key, value)       -- fires { config=true, key, level }
-cm:remove(level, key)           -- fires { config=true, key, level } if present
-cm:assign(level, updates)       -- fires { config=true, level } (keyless)
+cm:set(level, key, value)       -- fires 'configChanged' { key, level }
+cm:remove(level, key)           -- fires 'configChanged' { key, level } if present
+cm:assign(level, updates)       -- fires 'configChanged' { level } (keyless)
 ```
 
 `updates` is a `{ key = value }` table; a value of `util.REMOVE` deletes

@@ -110,9 +110,7 @@ function newRenderManager(vm, cm, cmgr)
     return colourCache[name]
   end
 
-  cm:addCallback(function(changed)
-    if changed.config then colourCache = {} end
-  end)
+  cm:subscribe('configChanged', function() colourCache = {} end)
 
   ----- Drawing
 
@@ -419,9 +417,8 @@ function newRenderManager(vm, cm, cmgr)
     local currentOctave = cm:get('currentOctave')
     local advanceBy     = cm:get('advanceBy')
     local col      = vm.grid.cols[cursorCol]
-    local bar, beat, sub, ts = vm:barBeatSub(cursorRow)
+    local bar, beat, sub = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
-    local tsLabel  = ts and string.format('%d/%d', ts.num, ts.denom) or '?'
 
     ImGui.Separator(ctx)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
@@ -563,8 +560,17 @@ function newRenderManager(vm, cm, cmgr)
     local ec = vm:ec()
     local cursorRow, cursorCol, cursorStop = ec:pos()
 
-    if ImGui.IsWindowFocused(ctx) then
-      local commandHeld = false
+    -- Tracker focus: full input (commands + raw char entry).
+    -- Aux window focus (e.g. swing editor) with no active item: forward
+    -- bound commands only — typing into a slider/InputText must not leak
+    -- through as cell edits or navigation.
+    local trackerFocused = ImGui.IsWindowFocused(ctx)
+    local fwdCommands    = swingEditor and not trackerFocused
+                           and ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_AnyWindow)
+                           and not ImGui.IsAnyItemActive(ctx)
+
+    local commandHeld = false
+    if trackerFocused or fwdCommands then
       for command, keys in pairs(cmgr.keymap) do
         for _, key in ipairs(keys) do
           local mods = ImGui.Mod_None
@@ -584,7 +590,9 @@ function newRenderManager(vm, cm, cmgr)
           end
         end
       end
+    end
 
+    if trackerFocused then
       -- Gate the char queue on commandHeld: IsKeyPressed and the char queue
       -- don't share auto-repeat timing, so a held command key would leak.
       if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_None then
@@ -724,6 +732,7 @@ function newRenderManager(vm, cm, cmgr)
         name      = name,
         snapshot  = name and lib[name] or nil,
         createBuf = '',
+        rpb       = 4,
       }
     end,
 
@@ -735,44 +744,50 @@ function newRenderManager(vm, cm, cmgr)
 
   ----- Swing editor
 
-  local SWING_ATOMS   = { 'id', 'classic', 'pocket', 'shuffle', 'drag', 'lilt' }
+  local SWING_ATOMS   = { 'id',
+                          'classic', 'drag',
+                          'arc', 'pocket', 'lilt', 'shuffle', 'tilt' }
   local SWING_ATOMS_Z = table.concat(SWING_ATOMS, '\0') .. '\0\0'
 
+  -- Plain narration uses the theme's text colour; the editor's outer
+  -- Col_Text push is white so controls (combos, sliders, buttons) render
+  -- their text white. Wrap a Text call in narrate() to opt back into
+  -- theme text for static labels.
+  local function narrate(s)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('text'))
+    ImGui.Text(ctx, s)
+    ImGui.PopStyleColor(ctx)
+  end
+
+  local RPB_CHOICES   = { 1, 2, 3, 4, 6, 8, 12, 16 }
+  local RPB_CHOICES_Z = (function()
+    local s = {}
+    for _, v in ipairs(RPB_CHOICES) do s[#s+1] = tostring(v) end
+    return table.concat(s, '\0') .. '\0\0'
+  end)()
+
+  -- Period presets in qn (the model's native unit), so the whole editor
+  -- row is qn-consistent: shift in qn → period in qn → annotation in qn.
   local PERIOD_PRESETS = {
-    { label = '1/16', num = 1, den = 16 },
-    { label = '1/8',  num = 1, den = 8  },
-    { label = '1/6',  num = 1, den = 6  },
-    { label = '1/4',  num = 1, den = 4  },
-    { label = '1/3',  num = 1, den = 3  },
-    { label = '1/2',  num = 1, den = 2  },
-    { label = '1',    num = 1, den = 1  },
-    { label = '2',    num = 2, den = 1  },
+    { label = '1/4 qn', period = {1, 4} },  -- 16th
+    { label = '1/3 qn', period = {1, 3} },  -- 8th triplet
+    { label = '1/2 qn', period = {1, 2} },  -- 8th
+    { label = '1 qn',   period = 1       }, -- quarter
+    { label = '2 qn',   period = 2       }, -- half
+    { label = '4 qn',   period = 4       }, -- whole
   }
 
-  local function gcd(a, b)
-    a, b = math.abs(a), math.abs(b)
-    while b ~= 0 do a, b = b, a % b end
-    return a
-  end
-
-  local function qnPerBar()
+  -- qn-per-beat (denom-derived) and qn-per-bar (num × beat).
+  local function meterQN()
     local num, denom = vm:timeSig()
-    return num * 4 / denom
-  end
-
-  local function barFracToPeriod(pnum, pden)
-    local num, denom = vm:timeSig()
-    local n, d = pnum * num * 4, pden * denom
-    local g = gcd(n, d)
-    n, d = n // g, d // g
-    if d == 1 then return n end
-    return { n, d }
+    local beat = 4 / denom
+    return beat, num * beat
   end
 
   local function periodPresetIndex(period)
-    local qn, qpb = timing.periodQN(period), qnPerBar()
+    local qn = timing.periodQN(period)
     for i, p in ipairs(PERIOD_PRESETS) do
-      if math.abs(qn - (p.num / p.den) * qpb) < 1e-9 then return i end
+      if math.abs(qn - timing.periodQN(p.period)) < 1e-9 then return i end
     end
     return 0
   end
@@ -781,101 +796,100 @@ function newRenderManager(vm, cm, cmgr)
     local i = periodPresetIndex(period)
     if i > 0 then return PERIOD_PRESETS[i].label end
     local qn = timing.periodQN(period)
-    if math.abs(qn - util.round(qn)) < 1e-9 then return string.format('%d qn', qn) end
-    return string.format('%.3f qn', qn)
+    return string.format(qn == math.floor(qn) and '%d qn' or '%.3g qn', qn)
   end
 
-  local SWING_BG    = 0x1a1a1aff
-  local SWING_DIAG  = 0x444444ff
-  local SWING_LINE  = 0xccccccff
-  local SWING_ERR   = 0xff6060ff
+  local SWING_ERR     = 0xff6060ff
+  local SWING_MARK    = 0x000000b0
+  -- Soft cap on |shift| in QN: musically usable ceiling regardless of
+  -- atom or period. Wild mode unlocks the per-atom mathematical max.
+  local SWING_SOFT_QN = 0.15
 
-  local function tickColour(i)
-    local s = math.min(0xaa, 0x44 + i * 0x12)
-    return (s << 24) | (s << 16) | (s << 8) | 0x90
+  -- Hard = T_tile · atomMeta.range (the monotonicity edge in QN).
+  -- Soft = min(SWING_SOFT_QN, hard); Wild bypasses the soft step.
+  local function shiftCap(factor, wild)
+    local hard = timing.atomTilePeriod(factor) * timing.atomMeta[factor.atom].range
+    return wild and hard or math.min(SWING_SOFT_QN, hard)
   end
 
-  local function drawPWLThumb(S, w, h)
-    local x0, y0 = ImGui.GetCursorScreenPos(ctx)
-    local dl = ImGui.GetWindowDrawList(ctx)
-    ImGui.DrawList_AddRectFilled(dl, x0, y0, x0+w, y0+h, SWING_BG)
-    ImGui.DrawList_AddLine(dl, x0, y0+h, x0+w, y0, SWING_DIAG)
-    for i = 1, #S - 1 do
-      local a, b = S[i], S[i+1]
-      ImGui.DrawList_AddLine(dl,
-        x0 + a[1]*w, y0 + (1 - a[2])*h,
-        x0 + b[1]*w, y0 + (1 - b[2])*h,
-        SWING_LINE, 1.5)
-    end
-    ImGui.Dummy(ctx, w, h)
-  end
-
-  -- Each tile is one period (= max(T_i)) of the composite in its own
-  -- local frame. Single-period composites make identical tiles;
-  -- mixed-period composites show visible drift.
-  local TARGET_TILE = 100
-  local function drawCompositeThumb(composite, availW)
-    local x0, y0 = ImGui.GetCursorScreenPos(ctx)
-    local dl = ImGui.GetWindowDrawList(ctx)
-
-    local nTiles   = math.max(1, math.floor(availW / TARGET_TILE))
-    local tileSize = availW / nTiles
-    local h = tileSize
-
-    ImGui.DrawList_AddRectFilled(dl, x0, y0, x0+availW, y0+h, SWING_BG)
-
-    local function drawTileFrame(t)
-      local tx = x0 + t * tileSize
-      if t > 0 then ImGui.DrawList_AddLine(dl, tx, y0, tx, y0+h, SWING_DIAG) end
-      ImGui.DrawList_AddLine(dl, tx, y0+h, tx+tileSize, y0, SWING_DIAG)
-    end
-
-    if timing.isIdentity(composite) then
-      for t = 0, nTiles - 1 do drawTileFrame(t) end
-      ImGui.Dummy(ctx, availW, h)
-      return
-    end
-
-    local factors, T_tile = {}, 0
+  local function materialise(composite)
+    local out = {}
     for i, f in ipairs(composite) do
-      local T = timing.periodQN(f.period)
-      factors[i] = { S = timing.atoms[f.atom](f.amount), T = T }
-      if T > T_tile then T_tile = T end
+      local T = timing.atomTilePeriod(f)
+      out[i] = { S = timing.atoms[f.atom](f.shift / T), T = T }
+    end
+    return out
+  end
+
+  -- Horizontal strip showing one period: cells are unswung subdivisions
+  -- (rpb per qn), Xs land at the swung position of each subdivision.
+  -- shadeMeter draws beat/bar cell backgrounds (used on the composite
+  -- preview, where the period is rounded up to a whole number of bars
+  -- so the meter actually means something); per-factor previews leave
+  -- it off because their period rarely aligns to bars.
+  local function drawSwingGrid(composite, periodQN, rpb, w, h, shadeMeter)
+    local x0, y0    = ImGui.GetCursorScreenPos(ctx)
+    local dl        = ImGui.GetWindowDrawList(ctx)
+    local beat, qpb = meterQN()
+    local N         = math.max(2, util.round(periodQN * rpb))
+    local cellW     = w / N
+    -- text colour with alpha dialled back a touch — pure black is too loud
+    -- against the cream bg, near-zero alpha disappears.
+    local line      = (colour('text') & 0xffffff00) | 0xb0
+
+    ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + w, y0 + h, colour('bg'))
+
+    -- Classify a tick at qn position p into 'bar' (downbeat),
+    -- 'midBar' (the bar's midpoint when it lands on a beat — true in
+    -- 4/4, 6/8; false in 3/4, 2/2), 'beat' (any other beat), or nil
+    -- (offbeat). Shading treats midBar as a beat; dot sizing promotes
+    -- it to bar tier.
+    local function isInt(x)   return math.abs(x - util.round(x)) < 1e-9 end
+    local midIsBeat           = shadeMeter and isInt((qpb/2) / beat)
+    local function classify(p)
+      if not isInt(p / beat) then return nil end
+      if isInt(p / qpb) then return 'bar' end
+      if midIsBeat and isInt((p - qpb/2) / qpb) then return 'midBar' end
+      return 'beat'
     end
 
-    for t = 0, nTiles - 1 do
-      local tx, tStart = x0 + t * tileSize, t * T_tile
-      drawTileFrame(t)
-
-      -- Sub-tile ticks for each factor with a period strictly shorter
-      -- than the tile (longer-period factors have no sub-tile structure).
-      for i, f in ipairs(factors) do
-        if f.T < T_tile - 1e-9 then
-          local col = tickColour(i)
-          local p = f.T
-          while p < T_tile - 1e-9 do
-            local sx = tx + (p / T_tile) * tileSize
-            ImGui.DrawList_AddLine(dl, sx, y0, sx, y0+h, col)
-            p = p + f.T
-          end
+    if shadeMeter then
+      local SHADE = { bar = 'rowBarStart', midBar = 'rowBeat', beat = 'rowBeat' }
+      for i = 0, N - 1 do
+        local key = SHADE[classify((i / N) * periodQN)]
+        if key then
+          local cx = x0 + i * cellW
+          ImGui.DrawList_AddRectFilled(dl, cx, y0, cx + cellW, y0 + h, colour(key))
         end
-      end
-
-      local N, prevX, prevY = 64, nil, nil
-      for k = 0, N do
-        local offset = (k / N) * T_tile
-        local e = tStart + offset
-        for _, f in ipairs(factors) do e = timing.tile(f.S, f.T, e) end
-        local sx = tx + (offset / T_tile) * tileSize
-        local sy = y0 + (1 - (e - tStart) / T_tile) * h
-        if prevX then
-          ImGui.DrawList_AddLine(dl, prevX, prevY, sx, sy, SWING_LINE, 1.5)
-        end
-        prevX, prevY = sx, sy
       end
     end
 
-    ImGui.Dummy(ctx, availW, h)
+    -- 1px vertical grid lines at every cell boundary.
+    for i = 0, N do
+      local gx = x0 + (i / N) * w
+      ImGui.DrawList_AddLine(dl, gx, y0, gx, y0 + h, line, 1)
+    end
+
+    -- Filled dots at the swung image of each unswung tick. Three sizes
+    -- so the meter reads at a glance: bar/mid-bar > beat > offbeat.
+    -- Atom preview (no shadeMeter) takes the middle size throughout.
+    local factors = materialise(composite)
+    local rBig    = math.max(2, h * 0.18)
+    local rMid    = math.max(2, h * 0.14)
+    local rSmall  = math.max(2, h * 0.10)
+    local cy      = y0 + h / 2
+    for i = 0, N - 1 do
+      local p  = (i / N) * periodQN
+      local pS = timing.applyFactors(factors, p)
+      local sx = x0 + (pS / periodQN) * w
+      local tier = shadeMeter and classify(p) or 'beat'
+      local r    = (tier == 'bar' or tier == 'midBar') and rBig
+                or  tier == 'beat'                     and rMid
+                or  rSmall
+      ImGui.DrawList_AddCircleFilled(dl, sx, cy, r, SWING_MARK)
+    end
+
+    ImGui.Dummy(ctx, w, h)
   end
 
   -- Each primitive produces a fresh composite and routes through the
@@ -891,18 +905,12 @@ function newRenderManager(vm, cm, cmgr)
     if #a ~= #b then return false end
     for i, fa in ipairs(a) do
       local fb = b[i]
-      if fa.atom ~= fb.atom or fa.amount ~= fb.amount
+      if fa.atom ~= fb.atom or fa.shift ~= fb.shift
          or math.abs(timing.periodQN(fa.period) - timing.periodQN(fb.period)) > 1e-12 then
         return false
       end
     end
     return true
-  end
-
-  -- Mid-drag write: composite changes but no reswing. The reswing is
-  -- committed once on slider release.
-  local function swingPreview(composite)
-    vm:setSwingComposite(swingEditor.name, composite)
   end
 
   local function swingWrite(composite)
@@ -921,7 +929,7 @@ function newRenderManager(vm, cm, cmgr)
 
   local function addFactor()
     local new = util.deepClone(swingRead()) or {}
-    new[#new+1] = { atom = 'id', amount = 0, period = 1 }
+    new[#new+1] = { atom = 'id', shift = 0, period = 1 }
     swingWrite(new)
   end
 
@@ -940,11 +948,11 @@ function newRenderManager(vm, cm, cmgr)
     swingWrite(new)
   end
 
-  local function drawFactorRow(i, f)
+  local function drawFactorRow(i, f, availW)
     ImGui.PushID(ctx, i)
 
     ImGui.AlignTextToFramePadding(ctx)
-    ImGui.Text(ctx, string.format('%d.', i))
+    narrate(string.format('%d.', i))
     ImGui.SameLine(ctx)
 
     local atomIdx = 0
@@ -952,45 +960,36 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.SetNextItemWidth(ctx, 90)
     local rv, newIdx = ImGui.Combo(ctx, '##atom', atomIdx, SWING_ATOMS_Z)
     if rv then
+      -- Drop-in atom swap: shift is in QN and atom-independent, so we
+      -- preserve it across the swap and only clamp to the new atom's cap.
       local newAtom = SWING_ATOMS[newIdx + 1]
-      local range   = timing.atomRange[newAtom] or 0
-      local amt     = f.amount or 0
-      if math.abs(amt) > range then amt = (amt < 0 and -1 or 1) * range * 0.999 end
-      patchFactor(i, { atom = newAtom, amount = amt })
+      local cap     = shiftCap({ atom = newAtom, period = f.period }, swingEditor.wild)
+      local shift   = f.shift or 0
+      if math.abs(shift) > cap then shift = (shift < 0 and -1 or 1) * cap * 0.999 end
+      patchFactor(i, { atom = newAtom, shift = shift })
     end
 
     ImGui.SameLine(ctx)
-    local range = timing.atomRange[f.atom] or 0
-    local frozen = range == 0
+    local cap    = shiftCap(f, swingEditor.wild)
+    local frozen = cap == 0
     if frozen then ImGui.BeginDisabled(ctx) end
     ImGui.SetNextItemWidth(ctx, 150)
-    local lo, hi = -range * 0.999, range * 0.999
-    local rvA, newAmt = ImGui.SliderDouble(ctx, '##amt', f.amount or 0, lo, hi, '%.3f')
-    -- Reswing on release only: the slider fires every frame during a
-    -- drag, which would reswing every event under this preset on every
-    -- tick. Stash the pre-drag composite on press, preview-write during
-    -- the drag, commit the reswing (old→now) once on release.
-    if ImGui.IsItemActivated(ctx) then
-      swingEditor.dragOld = util.deepClone(swingRead()) or {}
-    end
+    local lo, hi = -cap * 0.999, cap * 0.999
+    local rvA, newShift = ImGui.SliderDouble(ctx, '##shift', f.shift or 0, lo, hi, '%.3f qn')
+    -- Continuous reswing: swingWrite reads the stored composite as the
+    -- "old" side of the delta, so per-frame calls chain into the right
+    -- old→now transformation as the slider drags.
     if rvA then
       local new = util.deepClone(swingRead()) or {}
-      if new[i] then new[i].amount = newAmt; swingPreview(new) end
-    end
-    if ImGui.IsItemDeactivatedAfterEdit(ctx) and swingEditor.dragOld then
-      local old, cur = swingEditor.dragOld, swingRead() or {}
-      swingEditor.dragOld = nil
-      if not compositesEqual(old, cur) then
-        vm:reswingPreset(swingEditor.name, old, cur)
-      end
+      if new[i] then new[i].shift = newShift; swingWrite(new) end
     end
     if frozen then ImGui.EndDisabled(ctx) end
 
     ImGui.SameLine(ctx)
     ImGui.AlignTextToFramePadding(ctx)
-    ImGui.Text(ctx, 'per')
+    narrate('per')
     ImGui.SameLine(ctx)
-    ImGui.SetNextItemWidth(ctx, 80)
+    ImGui.SetNextItemWidth(ctx, 90)
     local pIdx = periodPresetIndex(f.period)
     local items = {}
     for _, p in ipairs(PERIOD_PRESETS) do items[#items+1] = p.label end
@@ -999,8 +998,16 @@ function newRenderManager(vm, cm, cmgr)
     local curIdx = pIdx > 0 and (pIdx - 1) or #PERIOD_PRESETS
     local rvP, newPIdx = ImGui.Combo(ctx, '##per', curIdx, itemsZ)
     if rvP and newPIdx + 1 <= #PERIOD_PRESETS then
-      local p = PERIOD_PRESETS[newPIdx + 1]
-      patchFactor(i, { period = barFracToPeriod(p.num, p.den) })
+      patchFactor(i, { period = PERIOD_PRESETS[newPIdx + 1].period })
+    end
+
+    -- pulsesPerCycle > 1 doubles the actual repeat. The combo speaks the
+    -- user period; this trailing chip surfaces the resulting tile length.
+    local mult = timing.atomMeta[f.atom].pulsesPerCycle
+    if mult > 1 then
+      ImGui.SameLine(ctx)
+      ImGui.AlignTextToFramePadding(ctx)
+      narrate(string.format('×%d → %.3g qn', mult, timing.atomTilePeriod(f)))
     end
 
     ImGui.SameLine(ctx)
@@ -1010,19 +1017,27 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.SameLine(ctx)
     if ImGui.Button(ctx, 'x')                         then removeFactor(i)  end
 
-    ImGui.SameLine(ctx)
-    drawPWLThumb(timing.atoms[f.atom](f.amount), 40, 40)
+    local _, qpb  = meterQN()
+    local nBars   = math.max(1, math.ceil(timing.atomTilePeriod(f) / qpb - 1e-9))
+    drawSwingGrid({ f }, nBars * qpb, swingEditor.rpb, availW, 28, true)
 
     ImGui.PopID(ctx)
   end
 
-  -- Loose estimate — ImGui pads widgets differently; a few px off is fine.
-  local function idealSwingHeight(nFactors, winW)
-    local nTiles   = math.max(1, math.floor((winW - 20) / TARGET_TILE))
-    local tileSize = (winW - 20) / nTiles
-    return 80          -- title row + separator + add button + padding
-         + tileSize    -- composite preview
-         + nFactors * 52
+  -- Generous estimate — better to show a few px of empty space than to
+  -- clip the add-factor button at the bottom.
+  local function idealSwingHeight(nFactors)
+    return 130         -- chrome: padding + title row + 2 separators + composite preview + add button
+         + nFactors * 72  -- controls row + factor preview + separator + spacing
+  end
+
+  -- The ×N chip on the controls row (when any factor has pulsesPerCycle > 1)
+  -- pushes the move/delete buttons off the right edge at the default width.
+  local function idealSwingWidth(composite)
+    for _, f in ipairs(composite) do
+      if timing.atomMeta[f.atom].pulsesPerCycle > 1 then return 660 end
+    end
+    return 560
   end
 
   local function drawSwingEditor()
@@ -1037,13 +1052,15 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.SetNextWindowSizeConstraints(ctx, 400, 120, 9999, vpH)
     ImGui.SetNextWindowSize(ctx, 560, 420, ImGui.Cond_FirstUseEver)
 
-    if swingEditor.lastCount ~= n then
-      local w = swingEditor.lastW or 560
-      local h = math.min(idealSwingHeight(n, w), vpH)
+    local idealW = idealSwingWidth(composite)
+    if swingEditor.lastCount ~= n or (swingEditor.lastW or 560) < idealW then
+      local w = math.max(swingEditor.lastW or 560, idealW)
+      local h = math.min(idealSwingHeight(n), vpH)
       ImGui.SetNextWindowSize(ctx, w, h, ImGui.Cond_Always)
       swingEditor.lastCount = n
     end
 
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xffffffff)
     local visible, open = ImGui.Begin(ctx, 'Swing', true,
       ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_NoDocking)
     if not open then swingEditor = nil end
@@ -1057,8 +1074,8 @@ function newRenderManager(vm, cm, cmgr)
 
       if swingEditor and not swingEditor.name then
         -- CREATE MODE
-        ImGui.Text(ctx, 'No swing slot is set.')
-        ImGui.Text(ctx, 'Name:')
+        narrate('No swing slot is set.')
+        narrate('Name:')
         ImGui.SameLine(ctx)
         ImGui.SetNextItemWidth(ctx, 240)
         local rv, buf = ImGui.InputText(ctx, '##newname', swingEditor.createBuf,
@@ -1087,28 +1104,46 @@ function newRenderManager(vm, cm, cmgr)
         end
       elseif swingEditor then
         -- EDIT MODE
-        ImGui.Text(ctx, 'Editing: ' .. swingEditor.name)
+        narrate('Editing: ' .. swingEditor.name)
         ImGui.SameLine(ctx)
         local dirty = not compositesEqual(composite, swingEditor.snapshot)
         if not dirty then ImGui.BeginDisabled(ctx) end
         if ImGui.Button(ctx, 'Reset') then swingWrite(util.deepClone(swingEditor.snapshot) or {}) end
         if not dirty then ImGui.EndDisabled(ctx) end
 
+        ImGui.SameLine(ctx)
+        ImGui.AlignTextToFramePadding(ctx)
+        narrate('Rows/qn:')
+        ImGui.SameLine(ctx)
+        ImGui.SetNextItemWidth(ctx, 60)
+        local rpbIdx = 0
+        for k, v in ipairs(RPB_CHOICES) do if v == swingEditor.rpb then rpbIdx = k - 1; break end end
+        local rvR, newRpbIdx = ImGui.Combo(ctx, '##rpb', rpbIdx, RPB_CHOICES_Z)
+        if rvR then swingEditor.rpb = RPB_CHOICES[newRpbIdx + 1] end
+
+        ImGui.SameLine(ctx)
+        local rvW, newWild = ImGui.Checkbox(ctx, 'Wild', swingEditor.wild or false)
+        if rvW then swingEditor.wild = newWild end
+
         ImGui.Separator(ctx)
-        local availW = ImGui.GetContentRegionAvail(ctx)
-        drawCompositeThumb(composite, availW)
+        local availW       = ImGui.GetContentRegionAvail(ctx)
+        local _, qpb       = meterQN()
+        local lcmQN        = timing.compositePeriodQN(composite)
+        local nBars        = math.max(1, math.ceil(lcmQN / qpb - 1e-9))
+        drawSwingGrid(composite, nBars * qpb,
+                      swingEditor.rpb, availW, 32, true)
         ImGui.Separator(ctx)
 
         for i, f in ipairs(composite) do
-          drawFactorRow(i, f)
+          drawFactorRow(i, f, availW)
           ImGui.Separator(ctx)
         end
 
         if ImGui.Button(ctx, '+ add factor') then addFactor() end
       end
-
-      ImGui.End(ctx)
     end
+    ImGui.End(ctx)
+    ImGui.PopStyleColor(ctx)
   end
 
   ---------- PUBLIC
@@ -1125,7 +1160,7 @@ function newRenderManager(vm, cm, cmgr)
     if not ctx then return false end
 
     ImGui.PushFont(ctx, font, 15)
-    
+
     local styleCount = pushStyles()
 
     if dragging then

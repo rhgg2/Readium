@@ -165,9 +165,9 @@ swingEditor = {
   snapshot    = <composite or nil>,      -- on-open state; Reset restores
   createBuf   = <string>,                -- pending name in create mode
   createError = <string or nil>,
+  rpb         = <subdivisions per beat>, -- preview grid resolution; default 4
   lastCount   = <n factors last seen>,   -- auto-resize trigger
   lastW       = <remembered width>,
-  dragOld     = <composite or nil>,      -- captured on slider press
 }
 ```
 
@@ -175,38 +175,60 @@ swingEditor = {
 `setSwingComposite(name, {})` + `setSwingSlot(name)` and fall through
 to edit mode in the same frame.
 
-**Edit mode**: composite preview + Reset (disabled when clean) + one
-row per factor (atom combo, amount slider, period combo, reorder,
-delete, PWL thumb) + add-factor button.
+**Edit mode**: header (Editing/Reset/Rows-per-beat) + composite preview
++ one row per factor (atom combo, amount slider, period combo, reorder,
+delete) with that factor's preview directly below + add-factor button.
 
-**Amount-slider drag.** The slider fires every frame while held. A
-naive reswing-on-change would reswing every event under the preset on
-every tick. Instead:
+**Preview (`drawSwingGrid`).** A horizontal strip — the tracker on its
+side. Cells are the unswung subdivisions (`rpb` per beat); each cell
+starts at an unswung tick line. Grid lines are 1px in `text` with alpha
+dialled to ~0.7 (full alpha is too loud against the cream bg). A
+semi-transparent black filled dot is drawn at the *swung* image of
+each unswung tick (`timing.applyFactors` applied at `i/N · periodQN`).
+Dots size by meter tier: bar starts and the mid-bar beat (when
+`qpb/2` lands on a beat — true in 4/4 and 6/8, false in 3/4 and 2/2)
+get the largest radius, other beats slightly smaller, offbeats
+smallest. The atom preview (no `shadeMeter`) uses the middle size
+throughout.
 
-- on `IsItemActivated`, snapshot the pre-drag composite into `dragOld`;
-- during the drag, `swingPreview` writes the composite without the
-  reswing, so the preview thumbs redraw cheaply;
-- on `IsItemDeactivatedAfterEdit`, fire `reswingPreset(name, dragOld,
-  now)` exactly once.
+The composite preview passes `shadeMeter = true` and a period rounded
+up to a whole number of bars (`ceil(lcmQN / qpb) · qpb`), so the
+beat/bar shading actually corresponds to a meter the user can read:
+cells on a beat get `rowBeat`, cells on a bar start get `rowBarStart`.
+Both `qpb` and the beat unit come from `meterQN()`, which reads the
+take's first time signature — so 6/8 shades on the eighth and 2/2 on
+the half, not on every quarter. Per-factor previews use the factor's
+own `period` and skip the shading — that period rarely aligns to bars
+and the colour bands would mislead.
 
-All other edits (atom, period, reorder, add, delete, Reset) go through
-`swingWrite`, which does the full `setSwingComposite` + `reswingPreset`
-pair — cheap because they're discrete, low-frequency.
+At a glance: the X tells you *where in time* the note actually lands;
+its drift from its cell wall is the swing displacement.
+
+**Amount-slider drag.** The slider fires every frame while held; each
+frame routes through `swingWrite`, which reads the currently stored
+composite as the "old" side of the delta and reswings just that
+per-frame slice. Chained across the drag, those slices compose to the
+same total transformation as a single press→release reswing, but the
+notes physically move under the cursor as the slider drags.
+
+All edits (slider, atom, period, reorder, add, delete, Reset) share
+`swingWrite`'s `setSwingComposite` + `reswingPreset` pair.
 
 **Periods.** Composites store periods in QN. The UI speaks
 bar-fractions via `PERIOD_PRESETS` (`1/16` … `2`), converting through
 `barFracToPeriod` (using the take's first time signature) and
 `periodLabel`. Non-preset periods show as `N qn` or `N.NNN qn`.
 
-**Auto-resize.** On a change in factor count, `idealSwingHeight`
-estimates a height that fits the whole stack; width is preserved from
-`lastW`. Clamped to the viewport so auto-grow stays on-screen.
+**Auto-resize.** On a change in factor count, `idealSwingHeight(n)`
+estimates a height that fits the whole stack (chrome + composite
+preview + n × per-factor block). Width is preserved from `lastW`,
+height clamped to the viewport so auto-grow stays on-screen.
 
 ## Colour
 
 Every colour is read lazily from `cm:get('colour.<name>')` and cached
-as a packed U32. A cm callback nukes the cache on any `config` change,
-so a palette edit takes effect next frame. `pushStyles` applies
+as a packed U32. A `'configChanged'` callback nukes the cache on any
+config change, so a palette edit takes effect next frame. `pushStyles` applies
 ImGui-level window-chrome colours around the main window; all grid
 drawing uses the cached palette directly.
 

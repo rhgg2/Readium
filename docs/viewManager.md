@@ -8,16 +8,22 @@ selection / clipboard, and exposes the editing command surface. Produces
 
 A pure, throwaway snapshot built once per `vm:rebuild`. Binds the
 swing snapshot, `rowPPQs` (prefix array of PPQ per row boundary),
-`length`, `numRows`, `rowPerBeat`, `timeSigs`, `tuning`. Every method is
-a function of the bound state plus its args — no callbacks, no
-mutation. Throw it away and rebuild a new one; there is no migration.
+`length`, `numRows`, `rowPerBeat`, `ppqPerRow` (the straight-grid row
+width — fractional in odd `(rpb, denom)` combinations), `timeSigs`,
+`tuning`. Every method is a function of the bound state plus its args —
+no callbacks, no mutation. Throw it away and rebuild a new one; there
+is no migration.
 
 Two responsibilities:
 
 - **Row ↔ PPQ projection.** `ppqToRow(ppq, chan)` binary-searches
   `rowPPQs`, unapplying channel-relevant swing first; `rowToPPQ` is the
   inverse (floor + swing-apply). Per-chan, because column swings
-  differ.
+  differ. `authoredRow(ppq, chan)` returns the integer row that
+  produced `ppq` via the authoring round-trip, or nil if `ppq` doesn't
+  sit on the grid — see `timing.recoverAuthoredRow`. Used by
+  `vm:rebuild` to flag off-grid cells without false positives under
+  steep-slope swings.
 - **Tuning lens.** `noteProjection(evt)` resolves `(pitch, detune)`
   into `(label, gap, halfGap)` under the bound microtuning, or nil if
   none active.
@@ -181,18 +187,20 @@ writes don't recursively self-release.
 
 Triggers:
 
-- `tm` callback when `changed.data` or `changed.take` fires;
-- `cm` callback on any config change **except** `mutedChannels` /
+- `tm` `'rebuild'` signal — always rebuilds. The take-swap flag travels
+  via tm's separate `'takeSwapped'` signal, captured here into a transient
+  flag and consumed by the next rebuild (tm guarantees the firing order);
+- `cm` `'configChanged'` signal **except** `mutedChannels` /
   `soloedChannels` (which only push mute). Non-`transient` writes to
   any `FRAME_KEYS` member while a transient override is active are
   short-circuited into `releaseTransientFrame`, whose recursive
   `cm:assign` fires the rebuild.
 
-Reentrancy-guarded by `rebuilding`. `changed.take` resets cursor /
-selection and re-reads `resolution`, `length`, `timeSigs` from tm;
-`changed.data` rebuilds the grid cols, `rowPPQs`, the viewContext,
-cell/overflow/offGrid maps, and ghost maps. Mute is pushed to tm
-unconditionally at the end.
+Reentrancy-guarded by `rebuilding`. `vm:rebuild(takeChanged)` takes a
+bool: `true` resets cursor / selection and re-reads `resolution`, `length`,
+`timeSigs` from tm; the remaining work (grid cols, `rowPPQs`, the
+viewContext, cell/overflow/offGrid maps, ghost maps) runs unconditionally
+on every rebuild. Mute is pushed to tm unconditionally at the end.
 
 ## Mute / solo
 
@@ -296,6 +304,10 @@ lives in rm, which dispatches to one or the other.
   frame, apply the current target frame, and restamp notes with the
   current frame. Two passes (plan, then mutate) so in-flight writes
   don't disturb later events' reads of their owners' `.frame`.
+  Writes are clamped to take length: when length doesn't sit on a
+  swing-period boundary, apply at the last event can land past it,
+  and any write past length makes REAPER auto-extend the source on
+  MIDI_Sort — which leaks an extra row into the next rebuild.
 - **`reswingPresetChange(name, oldComp, newComp)`** — for every event
   whose authoring frame references `name`, rebase from `oldComp` to
   `newComp` using `libOverride` to inline both composites. Independent

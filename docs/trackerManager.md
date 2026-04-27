@@ -146,10 +146,10 @@ rebuild, **don't cache `loc` values across a flush** — their validity
 ends there.
 
 ```
-tm:addEvent(type, evt)          -- local apply + stage add
-tm:assignEvent(type, evt, upd)  -- local apply + stage assign
-tm:deleteEvent(type, evt)       -- local apply + stage delete
-tm:flush()                      -- commit staged ops in one mm:modify
+tm:addEvent(type, evt)               -- local apply + stage add
+tm:assignEvent(type, evt, upd, opts) -- local apply + stage assign
+tm:deleteEvent(type, evt)            -- local apply + stage delete
+tm:flush()                           -- commit staged ops in one mm:modify
 ```
 
 Semantics:
@@ -159,7 +159,12 @@ Semantics:
 - **Single voice per (chan, pitch).** `clearSameKeyRange` truncates or
   deletes overlapping same-key notes around any add or move. Matches
   the post-hoc normalisation rebuild runs for foreign MIDI, so callers
-  don't have to think about cross-column collisions.
+  don't have to think about cross-column collisions. A caller staging
+  a coherent monotone batch (where the end-state has no new same-key
+  overlaps) can pass `opts.trustGeometry` on `assignEvent` to skip the
+  per-write clamp; rebuild's group-by-pitch pass is the backstop.
+  Reswing uses this — without it, the first-processed of two legato
+  siblings sees its endppq clipped against the second's still-old ppq.
 - **Detune changes (col-1 notes).** `assignNote` seats a pb at the
   boundary if needed, retunes the raw stream forward to the next note,
   then drops the boundary if it became redundant.
@@ -178,9 +183,15 @@ Semantics:
 ## Rebuild
 
 Triggered by:
-- mm callback with `changed.data` or `changed.take`;
-- cm callback, except for `vmOnlyKeys` (`mutedChannels`, `soloedChannels`)
-  which do not touch tm's structural view.
+- mm `'reload'` signal — always rebuilds. The take-swap flag travels via
+  the separate mm `'takeSwapped'` signal, captured into a transient flag
+  and consumed by the next reload (mm guarantees the firing order);
+- cm `'configChanged'` signal, except for `vmOnlyKeys` (`mutedChannels`,
+  `soloedChannels`) which do not touch tm's structural view.
+
+tm also forwards the reconciliation signals it receives from mm
+(`takeSwapped`, `notesDeduped`, `uuidsReassigned`) to its own subscribers,
+so layers above tm needn't reach into mm.
 
 Reentrancy-guarded by `rebuilding`. Steps:
 
@@ -207,8 +218,8 @@ Reentrancy-guarded by `rebuilding`. Steps:
 5. **tidyCol.** Strip delay into intent frame and sort each column's
    events by intent ppq.
 
-Then `um = createUpdateManager()` and callbacks fire as
-`fn(changed, tm)`.
+Then `um = createUpdateManager()` and tm fires the `'rebuild'` signal
+(no payload).
 
 ## Column allocation rules
 
@@ -262,15 +273,24 @@ rebuild (see `vmOnlyKeys`).
 
 ```
 newTrackerManager(mm, cm)   -- wires callbacks on mm/cm and rebuilds
-tm:rebuild(changed)         -- manual rebuild; changed defaults to {take=false, data=true}
+tm:rebuild(takeChanged)     -- manual rebuild; takeChanged defaults to false
 ```
 
-### Callbacks
+### Signals
 
 ```
-tm:addCallback(fn)          -- fn(changed, tm) fires at end of every rebuild
-tm:removeCallback(fn)
+'takeSwapped'      data = nil                       -- forwarded from mm
+'notesDeduped'     data = { events = [...] }        -- forwarded from mm
+'uuidsReassigned'  data = { events = [...] }        -- forwarded from mm
+'rebuild'          data = nil                       -- fires at end of every rebuild
 ```
+
+```
+tm:subscribe(signal, fn)         -- fn(data) on each fire
+tm:unsubscribe(signal, fn)
+```
+
+See `docs/midiManager.md` for the reconciliation signal payload shapes.
 
 ### Channel data
 
@@ -326,7 +346,7 @@ Omit to read from cm.
 
 ```
 tm:addEvent(evtType, evt)
-tm:assignEvent(evtType, evtOrLoc, update)
+tm:assignEvent(evtType, evtOrLoc, update, opts)
 tm:deleteEvent(evtType, evtOrLoc)
 tm:flush()                  -- no-op if nothing staged
 ```

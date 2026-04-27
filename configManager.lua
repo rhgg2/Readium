@@ -244,7 +244,7 @@ function newConfigManager()
     end
 
     refreshCache()
-    fire({ config = true }, cm)
+    fire('configChanged', {})
   end
 
   ----- Reading
@@ -287,7 +287,7 @@ function newConfigManager()
     cache[level] = cache[level] or {}
     cache[level][key] = copy(value)
     savers[level](cache[level])
-    fire({ config = true, key = key, level = level }, cm)
+    fire('configChanged', { key = key, level = level })
   end
 
   function cm:remove(level, key)
@@ -298,7 +298,7 @@ function newConfigManager()
     if cache[level] then
       cache[level][key] = nil
       savers[level](cache[level])
-      fire({ config = true, key = key, level = level }, cm)
+      fire('configChanged', { key = key, level = level })
     end
   end
 
@@ -314,7 +314,7 @@ function newConfigManager()
       else                     cache[level][k] = copy(v) end
     end
     savers[level](cache[level])
-    fire({ config = true, level = level }, cm)
+    fire('configChanged', { level = level })
   end
 
   return cm

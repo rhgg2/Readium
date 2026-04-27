@@ -18,9 +18,19 @@ Evaluation `S(x)` and inversion `S⁻¹(y)` are O(log n) via binary search.
 Shapes form a group under composition; the identity is `{ {0,0}, {1,1} }`.
 
 Strict monotonicity is the invariant that makes inversion well-defined.
-The atoms document their `|amount|` bound explicitly; pushing past it
-collapses a segment. Atoms do **not** clamp — callers (UI widgets,
-config loaders) read `timing.atomRange` and clamp there.
+The atoms document their `|a|` bound explicitly; pushing past it
+collapses a segment. Atoms do **not** clamp — callers read
+`timing.atomMeta[name].range` and clamp there.
+
+**Smooth atoms are sampled.** `arc`, `pocket`, `lilt`, `shuffle`, `tilt`
+are continuous parametric curves that emit dense PWL approximations
+(240 segments per unit square). The runtime treats them identically to
+hand-built PWL — eval/invert/tile/compose all consume the canonical
+control-point form. Smoothness is a property of how the shape is
+generated, not of the runtime. The sample count is a multiple of 12 so
+the principal-pulse breakpoints (x = 1/4, 1/3, 1/2, 2/3, 3/4) all land
+on exact sample points — the cross-atom drop-in invariant stays
+algebraic.
 
 ## Tiled extension
 
@@ -44,13 +54,35 @@ normalises both shapes; other inputs are a caller bug and raise.
 A user-facing swing is an ordered array of factors:
 
 ```
-composite = { {atom = 'classic', amount = 0.12, period = 1}, ... }
+composite = { {atom = 'classic', shift = 0.12, period = 1}, ... }
 ```
 
-`atom` names an entry in `timing.atoms`, `amount` is that atom's shape
-parameter, `period` is in QN. The realised view transform is the
-composition of the factors' tiled extensions — earlier factors are
-inner, later are outer (`applyFactors`). An empty array is identity.
+`atom` names an entry in `timing.atoms`, `period` is the *user pulse*
+in QN, and `shift` is the principal pulse-1 breakpoint's displacement,
+**also in QN**. The realised view transform is the composition of the
+factors' tiled extensions — earlier factors are inner, later are outer
+(`applyFactors`). An empty array is identity.
+
+`shift` is **atom-independent**: at fixed `period`, the same numeric
+`shift` lands the principal pulse-1 breakpoint at the same absolute
+time across {classic, arc, pocket, lilt, shuffle, tilt}. Atoms become
+drop-in replacements; switching `atom` preserves `shift` and only the
+interior shape of the period changes. (`drag` is the documented
+exception: same sign convention, but its non-linear x-shift means the
+magnitude only agrees in the small-`shift` limit.)
+
+### Tile period vs user period
+
+```
+T_tile(factor) = periodQN(factor.period) × atomMeta[atom].pulsesPerCycle
+```
+
+Only `lilt` has `pulsesPerCycle = 2` — its alternating push/pull
+covers two user-pulses per atom cycle, so its actual repeat period is
+double what the user picks. The unit-square parameter consumed by the
+atom shape is `a = shift / T_tile`. `compositePeriodQN` and the
+editor's per-factor preview both use `atomTilePeriod` so the displayed
+repeat matches the realised one.
 
 The runtime library lives in `cfg.swings` at project scope; slots in
 `cfg` reference composites **by name only**. Name lookup is done via
@@ -88,10 +120,26 @@ are algebraic rather than approximate.
 ### Atoms
 
 ```
-timing.atoms[name](amount)       -> shape S
-  names: id, classic, pocket, shuffle, drag, lilt
-timing.atomRange[name]           -- max |amount| keeping S monotonic
+timing.atoms[name](a)            -> shape S    (a is unit-square; = shift/T_tile)
+  PWL:    id, classic, drag
+  smooth: arc, pocket, lilt, shuffle, tilt
+timing.atomMeta[name]            -- { range = max |a|, pulsesPerCycle = N }
+timing.atomTilePeriod(factor)    -- periodQN(factor.period) × pulsesPerCycle
 ```
+
+| atom | shape | principal | range (max \|a\|) | pulsesPerCycle |
+|---|---|---|---|---|
+| `classic` | PWL tent: kink at x=0.5, height +a            | x = 0.5      | `0.5`           | 1 |
+| `drag`    | PWL: kink slides along y=0.5 to x=0.5+a       | x ≈ 0.5      | `0.5` (loose)   | 1 |
+| `arc`     | y = x + a·sin(πx)                             | x = 0.5      | `1/π ≈ 0.318`   | 1 |
+| `pocket`  | y = x + a·(1 − (2x−1)⁶) — flat-topped bump    | x = 0.5      | `1/12 ≈ 0.083`  | 1 |
+| `lilt`    | y = x + a·sin(2πx) — alternating push/pull    | x = 0.25 (peak), 0.75 (trough) | `1/(2π) ≈ 0.159` | 2 |
+| `shuffle` | y = x + a·k·(−2sin(2πx)+sin(4πx)), k = 2/(3√3) — anti-symmetric, extrema on the triplet positions | x = 1/3 (trough), 2/3 (peak) | `9/(16π√3) ≈ 0.103` | 1 |
+| `tilt`    | y = x + a·(27/4)·x·(1−x)² — asymmetric forward bump | x = 1/3 | `4/27 ≈ 0.148` | 1 |
+
+The shift convention pins each atom's principal at exactly `x_principal + shift`
+in tile units, so atoms drop in for one another at fixed `period` (the
+interior of each pulse changes, not the principal's location).
 
 ### Composite registry
 
@@ -114,6 +162,9 @@ timing.compose(S, T)             -> S ∘ T
 
 ```
 timing.periodQN(period)          -- number or {num,den} → scalar QN
+timing.compositePeriodQN(comp)   -- smallest T at which all factors complete
+                                 --   uses tile periods (pulsesPerCycle ×);
+                                 --   empty ⇒ 1 qn
 timing.tile(S, T, p)             -- forward at period T (in PPQ)
 timing.tileInverse(S, T, p)      -- inverse
 timing.applyFactors(factors, ppq)
@@ -131,3 +182,21 @@ timing.ppqToDelay(p, res)        -- inverse (float)
 ```
 
 `res` is PPQ per quarter note (typically from `mm:resolution()`).
+
+### Authoring round-trip
+
+```
+timing.recoverAuthoredRow(apply, ppqPerRow, ppq, hint, tolPPQ?)
+                                 -- integer r if round(apply(round(r*ppqPerRow))) == ppq,
+                                 --   else nil. tolPPQ defaults to 0.5.
+```
+
+Authoring stores `ppq = round(apply(round(r * ppqPerRow)))` for some
+integer row `r`. Inverting via `unapply` is ε-lossy: a 0.5-PPQ rounding
+error in apply-space becomes ε/slope in intent-space, and on steep
+segments (extreme atoms, multi-atom composites) the drift can cross the
+half-row boundary — so the nearest-row guess from unapply isn't
+trustworthy for the on-grid test. `recoverAuthoredRow` searches outward
+from `hint` until apply lands further than `tolPPQ` from `ppq`
+(monotonicity gives an exact early-out), and returns the row only on a
+forward-roundtrip hit. Callers typically pass `hint = round(unapply(ppq) / ppqPerRow)`.

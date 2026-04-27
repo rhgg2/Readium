@@ -99,11 +99,23 @@ end
 
 function util.installHooks(owner)
   local listeners = {}
-  function owner:addCallback(fn)    listeners[fn] = true end
-  function owner:removeCallback(fn) listeners[fn] = nil  end
-  return function(...)
-    for fn in pairs(listeners) do fn(...) end
+  function owner:subscribe(signal, fn)
+    listeners[signal] = listeners[signal] or {}
+    listeners[signal][fn] = true
   end
+  function owner:unsubscribe(signal, fn)
+    if listeners[signal] then listeners[signal][fn] = nil end
+  end
+  local function fire(signal, data)
+    local subs = listeners[signal]
+    if subs then for fn in pairs(subs) do fn(data) end end
+  end
+  -- forward: subscribe on `source` and re-fire the same signal on this owner.
+  -- Source must also have installHooks (so it has :subscribe).
+  function owner:forward(signal, source)
+    source:subscribe(signal, function(data) fire(signal, data) end)
+  end
+  return fire
 end
 
 function util.isNote(e) return e and e.endppq end
@@ -161,6 +173,14 @@ function util.round(n, to)
     return math.floor(n + 0.5)
   end
 end
+
+function util.gcd(a, b)
+  a, b = math.abs(a), math.abs(b)
+  while b ~= 0 do a, b = b, a % b end
+  return a
+end
+
+function util.lcm(a, b) return a // util.gcd(a, b) * b end
 
 function util.dotimes(n, v)
   if type(v) == 'function' then

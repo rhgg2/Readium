@@ -44,7 +44,8 @@ function newTrackerManager(mm, cm)
     for i, f in ipairs(composite) do
       local atom = timing.atoms[f.atom]
       if not atom then error('timing: unknown atom ' .. tostring(f.atom)) end
-      factors[i] = { S = atom(f.amount), T = ppqPerQN * timing.periodQN(f.period) }
+      local tileQN = timing.atomTilePeriod(f)
+      factors[i] = { S = atom(f.shift / tileQN), T = ppqPerQN * tileQN }
     end
     return factors
   end
@@ -409,7 +410,12 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    function um:assignEvent(evtType, evtOrLoc, update)
+    -- opts.trustGeometry: caller asserts the batch is internally
+    -- consistent (no new same-key overlaps introduced). Skips the
+    -- per-write clamp; rebuild's group-by-pitch normalisation is the
+    -- backstop. Used by reswing, whose monotone reparameterisation
+    -- can't create overlaps that didn't exist in the source frame.
+    function um:assignEvent(evtType, evtOrLoc, update, opts)
       local loc = type(evtOrLoc) == 'table' and evtOrLoc.loc or evtOrLoc
       if not loc then return end
       local evt = evtType == 'note' and notesByLoc[loc] or ccsByLoc[loc]
@@ -417,7 +423,8 @@ function newTrackerManager(mm, cm)
       if evtType == 'note' then
         if evt then
           realiseNoteUpdate(evt, update)
-          if update.pitch ~= nil or update.ppq ~= nil or update.endppq ~= nil then
+          if not (opts and opts.trustGeometry)
+             and (update.pitch ~= nil or update.ppq ~= nil or update.endppq ~= nil) then
             local P     = update.ppq    or evt.ppq
             local Pend  = update.endppq or evt.endppq
             local pitch = update.pitch  or evt.pitch
@@ -596,11 +603,10 @@ function newTrackerManager(mm, cm)
 
   local rebuilding = false
 
-  function tm:rebuild(changed)
+  function tm:rebuild(takeChanged)
     if rebuilding then return end
     rebuilding = true
-
-    changed = changed or { take = false, data = true }
+    takeChanged = takeChanged or false
 
     channels = {}
     for i = 1, 16 do
@@ -757,7 +763,7 @@ function newTrackerManager(mm, cm)
     um = createUpdateManager()
     rebuilding = false
 
-    fire(changed, tm)
+    fire('rebuild', nil)
   end
 
   ----- Accessors
@@ -846,7 +852,7 @@ function newTrackerManager(mm, cm)
 
   function tm:deleteEvent(type, evt) um:deleteEvent(type, evt) end
   function tm:addEvent(type, evt) um:addEvent(type, evt) end
-  function tm:assignEvent(type, evt, update) um:assignEvent(type, evt, update) end
+  function tm:assignEvent(type, evt, update, opts) um:assignEvent(type, evt, update, opts) end
   function tm:flush() um:flush() end
 
   ----- Mute
@@ -869,22 +875,23 @@ function newTrackerManager(mm, cm)
 
   ----- Lifecycle
 
-  local callback = function(changed, _mm)
-    if changed.data or changed.take then
-      tm:rebuild(changed)
-    end
-  end
-
   local vmOnlyKeys = { mutedChannels = true, soloedChannels = true }
 
-  local configCallback = function(changed, _cm)
-    if changed.config and not vmOnlyKeys[changed.key] then
-      tm:rebuild({ take = false, data = true })
-    end
-  end
-
-  mm:addCallback(callback)
-  cm:addCallback(configCallback)
-  tm:rebuild({ take = true, data = true })
+  -- Forward reconciliation signals so subscribers above tm needn't reach into mm.
+  -- takeSwapped is also captured into a transient flag and consumed by the next
+  -- reload; mm guarantees the takeSwapped→reload firing order.
+  local pendingTakeSwap = false
+  tm:forward('notesDeduped',    mm)
+  tm:forward('uuidsReassigned', mm)
+  tm:forward('takeSwapped',     mm)
+  mm:subscribe('takeSwapped', function() pendingTakeSwap = true end)
+  mm:subscribe('reload', function()
+    tm:rebuild(pendingTakeSwap)
+    pendingTakeSwap = false
+  end)
+  cm:subscribe('configChanged', function(change)
+    if not vmOnlyKeys[change.key] then tm:rebuild(false) end
+  end)
+  tm:rebuild(true)
   return tm
 end

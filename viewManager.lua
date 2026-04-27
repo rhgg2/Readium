@@ -17,6 +17,7 @@ function newViewContext(args)
   local length     = args.length
   local numRows    = args.numRows
   local rowPerBeat = args.rowPerBeat
+  local ppqPerRow  = args.ppqPerRow
   local timeSigs   = args.timeSigs
   local tuning     = args.tuning
   local ctx        = {}
@@ -68,6 +69,18 @@ function newViewContext(args)
   end
 
   function ctx:snapRow(ppq, chan) return util.round(self:ppqToRow(ppq, chan)) end
+
+  -- Did `ppq` come from authoring on an integer row in this frame?
+  -- Returns the row if so, nil otherwise. Sidesteps the ε amplification
+  -- that knocks ppqToRow off-row under steep apply slopes (extreme
+  -- atoms, multi-atom composites): the inverse-via-unapply guess is
+  -- noisy but the forward round-trip test is exact.
+  function ctx:authoredRow(ppq, chan)
+    local hint = util.round(swing.unapply(chan, ppq) / ppqPerRow)
+    return timing.recoverAuthoredRow(
+      function(p) return swing.apply(chan, p) end,
+      ppqPerRow, ppq, hint)
+  end
 
   do -- exports ctx:rowBeatInfo, ctx:barBeatSub
     local function timeSigAt(ppq)
@@ -153,10 +166,10 @@ function newViewManager(tm, cm, cmgr)
     return minStart, maxEnd
   end
 
-  local function delayRange(col, n)
-    local minStart, maxEnd = overlapBounds(col, n.ppq, n, true)
-    return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
-  end
+    local function delayRange(col, n)
+        local minStart, maxEnd = overlapBounds(col, n.ppq, n, true)
+        return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
+    end
 
   ----- Show events by column, used by lots of selection ops
 
@@ -222,7 +235,7 @@ function newViewManager(tm, cm, cmgr)
       local newRPB = cm:get('rowPerBeat')
       if newRPB ~= oldRPB then
         ec:rescaleRow(oldRPB, newRPB)
-        vm:rebuild({ data = true })
+        vm:rebuild(false)
       end
       return true
     end
@@ -864,10 +877,36 @@ function newViewManager(tm, cm, cmgr)
       return util.seek(n1.events, 'at-or-before', e.ppq, util.isNote)
     end
 
+    -- Authoring straight-PPQ-per-row for a given frame's rpb. Mirrors the
+    -- rebuild-time formula at line ~1560.
+    local function ppqPerRowOf(rpb)
+      local denom = (timeSigs[1] and timeSigs[1].denom) or 4
+      return resolution * 4 / (denom * rpb)
+    end
+
+    -- Recover intent from a stored realised PPQ, then rebuild under tgt.
+    -- For on-grid notes in the auth frame, pin intent to the exact row
+    -- so re-applying tgt doesn't drift them off-grid (see
+    -- timing.recoverAuthoredRow).
+    local function reswungPPQ(auth, tgt, frame, chan, ppq)
+      local u = auth and auth.unapply(chan, ppq) or ppq
+      if auth and frame then
+        local ppqPerRow = ppqPerRowOf(frame.rpb)
+        local r = timing.recoverAuthoredRow(
+          function(p) return auth.apply(chan, p) end,
+          ppqPerRow, ppq, util.round(u / ppqPerRow))
+        if r then u = util.round(r * ppqPerRow) end
+      end
+      return math.min(length, util.round(tgt.apply(chan, u)))
+    end
+
     -- opts: { include?, auth, target, restamp? }. auth nil means identity
     -- (legacy notes without a frame). Two passes — gather plans, then
     -- mutate — so writes in this batch don't disturb later reads of their
     -- owners' .frame.
+    -- Writes past `length` make REAPER auto-extend the take's source on
+    -- MIDI_Sort, which then leaks an extra row into the next rebuild
+    -- (numRows is derived from source length). Clamp on the way out.
     local function reswingCore(groups, opts)
       local plans = {}
       for _, g in ipairs(groups) do
@@ -875,29 +914,32 @@ function newViewManager(tm, cm, cmgr)
         for _, e in pairs(g.locs) do
           local owner = frameOwner(col, e)
           if owner and (not opts.include or opts.include(owner, chan)) then
-            local auth   = opts.auth(owner.frame, chan)
-            local tgt    = opts.target(owner.frame, chan)
-            local uPPQ   = auth and auth.unapply(chan, e.ppq) or e.ppq
-            local newPPQ = util.round(tgt.apply(chan, uPPQ))
-            local entry  = { col = col, e = e, newPPQ = newPPQ }
+            local auth  = opts.auth(owner.frame, chan)
+            local tgt   = opts.target(owner.frame, chan)
+            local frame = owner.frame
+            local entry = { col = col, e = e, newPPQ = reswungPPQ(auth, tgt, frame, chan, e.ppq) }
             if util.isNote(e) then
-              local uEnd      = auth and auth.unapply(chan, e.endppq) or e.endppq
-              entry.newEndPPQ = util.round(tgt.apply(chan, uEnd))
+              entry.newEndPPQ = reswungPPQ(auth, tgt, frame, chan, e.endppq)
               if opts.restamp then entry.newFrame = opts.restamp(chan) end
             end
             util.add(plans, entry)
           end
         end
       end
+      -- Monotone reparameterisation: the end-state can't introduce new
+      -- same-(chan, pitch) overlaps, so opt out of tm's per-write clamp.
+      -- Without this, the first-processed of two legato siblings would
+      -- see its endppq clipped against the second's still-old ppq.
+      local trust = { trustGeometry = true }
       for _, p in ipairs(plans) do
         local e, u = p.e, {}
         if p.newPPQ ~= e.ppq then u.ppq = p.newPPQ end
         if util.isNote(e) then
           if p.newEndPPQ ~= e.endppq then u.endppq = p.newEndPPQ end
           if p.newFrame then u.frame = p.newFrame end
-          if next(u) then tm:assignEvent('note', e, u) end
+          if next(u) then tm:assignEvent('note', e, u, trust) end
         elseif next(u) then
-          tm:assignEvent(p.col.type, e, u)
+          tm:assignEvent(p.col.type, e, u, trust)
         end
       end
       tm:flush()
@@ -1526,23 +1568,23 @@ function newViewManager(tm, cm, cmgr)
 
   local rebuilding = false
 
-  function vm:rebuild(changed)
+  function vm:rebuild(takeChanged)
     if not tm or rebuilding then return end
     rebuilding = true
-    changed = changed or { take = false, data = true }
+    takeChanged = takeChanged or false
 
     local LABELS = {
       note = 'Note', cc = 'CC', pb = 'PB', at = 'AT', pa = 'PA', pc = 'PC',
     }
 
-    if changed.take then
+    if takeChanged then
       resolution = tm:resolution()
       length     = tm:length()
       timeSigs   = tm:timeSigs()
       ec:reset()
     end
 
-    if changed.take or changed.data then
+    do
       local rpb = cm:get('rowPerBeat')
       -- Grid resolution is pinned to the first time sig's denominator;
       -- mid-item time sig changes affect bar/beat highlighting but not row size.
@@ -1616,6 +1658,7 @@ function newViewManager(tm, cm, cmgr)
         length     = length,
         numRows    = numRows,
         rowPerBeat = rpb,
+        ppqPerRow  = ppqPerRow,
         timeSigs   = timeSigs,
         tuning     = microtuning.findTuning(cm:get('tuning')),
       }
@@ -1626,20 +1669,23 @@ function newViewManager(tm, cm, cmgr)
         if gridCol.type == 'note' then gridCol.tails = {} end
         local chan = gridCol.midiChan
         for _, evt in ipairs(gridCol.events) do
-          local exact = ctx:ppqToRow(evt.ppq or 0, chan)
-          local y     = util.round(exact)
+          local ppq      = evt.ppq or 0
+          local authored = ctx:authoredRow(ppq, chan)
+          local startRow = authored or ctx:ppqToRow(ppq, chan)
+          local y        = authored or util.round(startRow)
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
               gridCol.overflow[y] = true
             else
               gridCol.cells[y] = evt
-              if math.abs(exact - y) > 1e-3 then gridCol.offGrid[y] = true end
+              if not authored then gridCol.offGrid[y] = true end
             end
           end
           if evt.endppq then
+            local endAuth = ctx:authoredRow(evt.endppq, chan)
             util.add(gridCol.tails, {
-              startRow = exact,
-              endRow   = ctx:ppqToRow(evt.endppq, chan),
+              startRow = startRow,
+              endRow   = endAuth or ctx:ppqToRow(evt.endppq, chan),
             })
           end
         end
@@ -1659,26 +1705,24 @@ function newViewManager(tm, cm, cmgr)
   ----- Lifecycle
 
   do
-    local callback = function(changed)
-      if changed.data or changed.take then
-        vm:rebuild(changed)
-      end
-    end
-
     -- Mute/solo changes don't affect grid shape, so skip rebuild.
     local muteKeys = { mutedChannels = true, soloedChannels = true }
 
-    local configCallback = function(change)
-      if not change.config then return end
+    -- Mirror tm's takeSwapped→rebuild dance: the flag is captured here and
+    -- consumed by the next rebuild fire. tm guarantees the firing order.
+    local pendingTakeSwap = false
+    tm:subscribe('takeSwapped', function() pendingTakeSwap = true end)
+    tm:subscribe('rebuild', function()
+      vm:rebuild(pendingTakeSwap)
+      pendingTakeSwap = false
+    end)
+    cm:subscribe('configChanged', function(change)
       -- The callback fired by releaseTransientFrame handles rebuild,
       -- so we return early to prevent double-dipping.
       if isFrameChange(change) and releaseTransientFrame() then return end
       if muteKeys[change.key] then pushMute(); return end
-      vm:rebuild({ take = false, data = true })
-    end
-
-    tm:addCallback(callback)
-    cm:addCallback(configCallback)
+      vm:rebuild(false)
+    end)
   end
 
   ----- Factory load
@@ -1719,6 +1763,6 @@ function newViewManager(tm, cm, cmgr)
     'colLeft', 'channelRight', 'channelLeft', 'delete',
   }, killAudition)
 
-  vm:rebuild({ take = true, data = true })
+  vm:rebuild(true)
   return vm
 end

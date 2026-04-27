@@ -47,7 +47,16 @@ function newMidiManager(opts)
   local resolution  = opts.resolution or 240
   local length      = opts.length or 3840
   local timeSigs    = opts.timeSigs or { { ppq = 0, num = 4, denom = 4 } }
+  local maxUuid     = 0
   local fire
+
+  -- Mirrors midiManager.lua's ccEventFields. A field outside this set is
+  -- metadata; carve-out + first-stamp logic depends on the distinction.
+  local ccEventFields = {
+    idx = true, uuidIdx = true, ppq = true, msgType = true, chan = true,
+    cc = true, pitch = true, val = true,
+    muted = true, shape = true, tension = true, uuid = true,
+  }
 
   local mm = {}
   fire = util.installHooks(mm)
@@ -70,15 +79,16 @@ function newMidiManager(opts)
 
   function mm:load(newTake)
     if not newTake then return end
-    local changed = { take = take ~= newTake, data = true }
+    local takeSwapped = take ~= newTake
     take = newTake
     -- A real load() would reparse from REAPER; the fake keeps its existing
     -- in-memory state. Tests that want a fresh buffer use mm:seed().
-    fire(changed, mm)
+    if takeSwapped then fire('takeSwapped', nil) end
+    fire('reload', nil)
   end
 
   function mm:reload()
-    fire({ take = false, data = true }, mm)
+    fire('reload', nil)
   end
 
   -- TEST-ONLY HELPERS
@@ -91,8 +101,13 @@ function newMidiManager(opts)
     for _, n in ipairs(seed.notes   or {}) do noteList[#noteList + 1]   = util.clone(n) end
     for _, c in ipairs(seed.ccs     or {}) do ccList[#ccList + 1]       = util.clone(c) end
     for _, s in ipairs(seed.sysexes or {}) do sysexList[#sysexList + 1] = util.clone(s) end
+    -- Track the high-water uuid across pre-seeded notes/ccs so subsequent
+    -- allocations don't collide.
+    for _, e in ipairs(noteList) do if e.uuid and e.uuid > maxUuid then maxUuid = e.uuid end end
+    for _, e in ipairs(ccList)   do if e.uuid and e.uuid > maxUuid then maxUuid = e.uuid end end
     reindex()
-    fire({ take = true, data = true }, mm)
+    fire('takeSwapped', nil)
+    fire('reload', nil)
   end
 
   function mm:dump()
@@ -112,7 +127,7 @@ function newMidiManager(opts)
     local ok, err = pcall(fn)
     lock = false
     reindex()
-    fire({ take = false, data = true }, mm)
+    fire('reload', nil)
     if not ok then error(err, 2) end
   end
 
@@ -200,14 +215,36 @@ function newMidiManager(opts)
   end
 
   function mm:assignCC(loc, t)
-    assertLock()
     local c = ccByLoc[loc]
     if not c then return end
+
+    local hasStructural = t.ppq or t.msgType or t.chan or t.cc or t.pitch
+                          or t.val or t.muted ~= nil or t.shape or t.tension
+    local hasMetadata = false
+    for k in pairs(t) do
+      if not ccEventFields[k] then hasMetadata = true; break end
+    end
+
+    -- Lockless carve-out: metadata-only on a uuid'd cc — mirrors the real
+    -- mm's assignCC carve-out.
+    if not hasStructural and c.uuid then
+      util.assign(c, t)
+      return
+    end
+
+    assertLock()
     util.assign(c, t)
     if c.muted == false then c.muted = nil end
     if c.msgType ~= 'cc' then c.cc    = nil end
     if c.msgType ~= 'pa' then c.pitch = nil end
     if c.shape   ~= 'bezier' then c.tension = nil end
+
+    -- First metadata stamp: allocate a uuid. Real mm also inserts a sidecar
+    -- sysex; the fake just tracks the identity.
+    if hasMetadata and not c.uuid then
+      maxUuid = maxUuid + 1
+      c.uuid  = maxUuid
+    end
   end
 
   -- SYSEX / TEXT

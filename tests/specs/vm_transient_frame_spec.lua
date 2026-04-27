@@ -4,7 +4,7 @@
 
 local t = require('support')
 
-local classic = { { atom = 'classic', amount = 0.08, period = 1 } }
+local classic = { { atom = 'classic', shift = 0.08, period = 1 } }
 
 return {
   {

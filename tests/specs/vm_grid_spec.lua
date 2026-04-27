@@ -212,4 +212,43 @@ return {
       t.eq(col.width, 10)
     end,
   },
+
+  {
+    -- Regression: under multi-atom / extreme composites, ε amplification
+    -- through unapply pushed ppqToRow off the authored row, and fresh
+    -- on-grid notes lit up the off-grid colour. vm:rebuild now invokes
+    -- ctx:authoredRow which round-trips against the apply, so on-grid
+    -- notes stay on their row regardless of slope.
+    name = 'extreme swing: a fresh on-grid note lands on its authored row, no off-grid flag',
+    run = function(harness)
+      local extreme = {
+        { atom = 'classic', shift = 0.3, period = 1 },
+        { atom = 'shuffle', shift = 0.2, period = 1 },
+      }
+      -- Build the realised ppq for row 5 the way authoring does:
+      -- rowPPQ = round(r * ppqPerRow) → round(apply(rowPPQ)).
+      local factors = {}
+      for i, f in ipairs(extreme) do
+        local Tqn = timing.atomTilePeriod(f)
+        factors[i] = { S = timing.atoms[f.atom](f.shift / Tqn), T = Tqn * 240 }
+      end
+      local rowPPQ   = util.round(5 * 60)   -- ppqPerRow=60 at default rpb=4
+      local realised = util.round(timing.applyFactors(factors, rowPPQ))
+      t.truthy(realised ~= rowPPQ,
+        'sanity: extreme swing actually deflects row 5 (got ' .. realised .. ')')
+
+      local h = harness.mk{
+        seed = {
+          notes = { { ppq = realised, endppq = realised + 60, chan = 1, pitch = 60, vel = 100 } },
+        },
+        config = {
+          project = { swings = { ['x'] = extreme } },
+          take    = { swing = 'x' },
+        },
+      }
+      local col = h.vm.grid.cols[1]
+      t.truthy(col.cells[5],     'note placed on row 5')
+      t.eq(col.offGrid[5], nil,  'note not flagged off-grid')
+    end,
+  },
 }
