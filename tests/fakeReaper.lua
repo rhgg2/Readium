@@ -97,6 +97,145 @@ function M.new()
     if os.getenv('RDM_TEST_VERBOSE') then io.write(msg) end
   end
 
+  -- MIDI take store. Created lazily on first reference. Each list keeps
+  -- entries 1-indexed internally; the REAPER API surface converts to 0-index
+  -- on read/write/delete.
+  --
+  -- Insertion order is preserved between MIDI_DisableSort and MIDI_Sort; on
+  -- Sort, notes/ccs/texts each restabilise by ppq using a stable sort. Text
+  -- events fold sysex (eventtype = -1) and notation (eventtype = 15) into
+  -- one stream — same as the real REAPER API surface.
+  state.takeMidi = {}
+  local function midi(take)
+    local m = state.takeMidi[take]
+    if not m then
+      m = { notes = {}, ccs = {}, texts = {}, sortDisabled = false }
+      state.takeMidi[take] = m
+    end
+    return m
+  end
+
+  local function stableSort(list)
+    for i, e in ipairs(list) do e.__order = i end
+    table.sort(list, function(a, b)
+      if a.ppq ~= b.ppq then return a.ppq < b.ppq end
+      return a.__order < b.__order
+    end)
+    for _, e in ipairs(list) do e.__order = nil end
+  end
+
+  function r.MIDI_CountEvts(take)
+    local m = midi(take)
+    return true, #m.notes, #m.ccs, #m.texts
+  end
+
+  function r.MIDI_GetNote(take, i)
+    local n = midi(take).notes[i + 1]
+    if not n then return false end
+    return true, n.selected or false, n.muted or false, n.ppq, n.endppq, n.chan, n.pitch, n.vel
+  end
+
+  function r.MIDI_GetCC(take, i)
+    local c = midi(take).ccs[i + 1]
+    if not c then return false end
+    return true, c.selected or false, c.muted or false, c.ppq, c.chanmsg, c.chan, c.msg2, c.msg3
+  end
+
+  function r.MIDI_GetCCShape(take, i)
+    local c = midi(take).ccs[i + 1]
+    if not c then return false end
+    return true, c.shape or 0, c.tension or 0
+  end
+
+  function r.MIDI_GetTextSysexEvt(take, i)
+    local e = midi(take).texts[i + 1]
+    if not e then return false end
+    return true, e.selected or false, e.muted or false, e.ppq, e.eventtype, e.msg
+  end
+
+  function r.MIDI_DisableSort(take) midi(take).sortDisabled = true end
+  function r.MIDI_Sort(take)
+    local m = midi(take)
+    stableSort(m.notes)
+    stableSort(m.ccs)
+    stableSort(m.texts)
+    m.sortDisabled = false
+  end
+
+  function r.MIDI_DeleteNote(take, i)
+    table.remove(midi(take).notes, i + 1)
+    return true
+  end
+  function r.MIDI_DeleteCC(take, i)
+    table.remove(midi(take).ccs, i + 1)
+    return true
+  end
+  function r.MIDI_DeleteTextSysexEvt(take, i)
+    table.remove(midi(take).texts, i + 1)
+    return true
+  end
+
+  function r.MIDI_InsertTextSysexEvt(take, _selected, muted, ppq, eventtype, msg)
+    local m = midi(take)
+    m.texts[#m.texts + 1] = { ppq = ppq, eventtype = eventtype, msg = msg, muted = muted }
+    if not m.sortDisabled then stableSort(m.texts) end
+    return true
+  end
+
+  function r.MIDI_SetTextSysexEvt(take, i, _selected, muted, ppq, eventtype, msg, _sortIn)
+    local e = midi(take).texts[i + 1]
+    if not e then return false end
+    if muted     ~= nil then e.muted     = muted     end
+    if ppq       ~= nil then e.ppq       = ppq       end
+    if eventtype ~= nil then e.eventtype = eventtype end
+    if msg       ~= nil then e.msg       = msg       end
+    return true
+  end
+
+  function r.MIDI_InsertNote(take, _selected, muted, ppq, endppq, chan, pitch, vel, _sortIn)
+    local m = midi(take)
+    m.notes[#m.notes + 1] = { ppq = ppq, endppq = endppq, chan = chan,
+                              pitch = pitch, vel = vel, muted = muted }
+    if not m.sortDisabled then stableSort(m.notes) end
+    return true
+  end
+  function r.MIDI_SetNote(take, i, _selected, muted, ppq, endppq, chan, pitch, vel, _sortIn)
+    local n = midi(take).notes[i + 1]
+    if not n then return false end
+    if muted  ~= nil then n.muted  = muted  end
+    if ppq    ~= nil then n.ppq    = ppq    end
+    if endppq ~= nil then n.endppq = endppq end
+    if chan   ~= nil then n.chan   = chan   end
+    if pitch  ~= nil then n.pitch  = pitch  end
+    if vel    ~= nil then n.vel    = vel    end
+    return true
+  end
+
+  function r.MIDI_InsertCC(take, _selected, muted, ppq, chanmsg, chan, msg2, msg3)
+    local m = midi(take)
+    m.ccs[#m.ccs + 1] = { ppq = ppq, chanmsg = chanmsg, chan = chan,
+                          msg2 = msg2, msg3 = msg3, muted = muted }
+    if not m.sortDisabled then stableSort(m.ccs) end
+    return true
+  end
+  function r.MIDI_SetCC(take, i, _selected, muted, ppq, chanmsg, chan, msg2, msg3, _sortIn)
+    local c = midi(take).ccs[i + 1]
+    if not c then return false end
+    if muted   ~= nil then c.muted   = muted   end
+    if ppq     ~= nil then c.ppq     = ppq     end
+    if chanmsg ~= nil then c.chanmsg = chanmsg end
+    if chan    ~= nil then c.chan    = chan    end
+    if msg2    ~= nil then c.msg2    = msg2    end
+    if msg3    ~= nil then c.msg3    = msg3    end
+    return true
+  end
+  function r.MIDI_SetCCShape(take, i, shape, tension, _sortIn)
+    local c = midi(take).ccs[i + 1]
+    if not c then return false end
+    c.shape = shape; c.tension = tension
+    return true
+  end
+
   -- Test helpers
 
   function r:setCursor(time)  state.cursorTime = time end
@@ -108,6 +247,27 @@ function M.new()
   end
   function r:clearCalls()   state.calls = {} end
   function r:clearConsole() state.console = {} end
+
+  -- Bulk-seed a take's MIDI store. Mirrors the field shape REAPER returns.
+  -- notes : { { ppq, endppq, chan, pitch, vel, [muted] }, ... }
+  -- ccs   : { { ppq, chanmsg, chan, msg2, msg3, [muted], [shape], [tension] }, ... }
+  -- texts : { { ppq, eventtype, msg, [muted] }, ... }
+  function r:seedMidi(take, seed)
+    local m = midi(take)
+    m.notes = {}; m.ccs = {}; m.texts = {}
+    for _, n in ipairs(seed.notes or {}) do m.notes[#m.notes+1] = { ppq = n.ppq, endppq = n.endppq,
+        chan = n.chan, pitch = n.pitch, vel = n.vel, muted = n.muted } end
+    for _, c in ipairs(seed.ccs or {})   do m.ccs[#m.ccs+1]     = { ppq = c.ppq, chanmsg = c.chanmsg,
+        chan = c.chan, msg2 = c.msg2, msg3 = c.msg3, muted = c.muted, shape = c.shape, tension = c.tension } end
+    for _, e in ipairs(seed.texts or {}) do m.texts[#m.texts+1] = { ppq = e.ppq, eventtype = e.eventtype,
+        msg = e.msg, muted = e.muted } end
+    stableSort(m.notes); stableSort(m.ccs); stableSort(m.texts)
+  end
+
+  function r:dumpMidi(take)
+    local m = midi(take)
+    return { notes = m.notes, ccs = m.ccs, texts = m.texts }
+  end
 
   return r
 end

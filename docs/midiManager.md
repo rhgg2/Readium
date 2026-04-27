@@ -47,15 +47,48 @@ event at load time even after drift.
 Sidecars sit alongside ordinary sysex; mm filters them out of `sysexes()` by
 prefix the same way `rdm_<uuid>` notation events are filtered for notes.
 
-**Reconciliation (load-time).** Phase 1 implements **tier 1** only: bind by
-exact `(ppq, msgType, chan, id, val)` fingerprint match. Anything that drifts
-is silently parked unbound for now. Tiers 2–4 (value-drift, consensus offset,
-per-orphan resolution) and the `ccsReconciled` signal are planned for the
-follow-up phase, along with cc dedup.
+**Reconciliation (load-time).** Sidecars don't have a REAPER-side anchor to
+their target the way notation events have to notes, so matching has to handle
+drift. `sr:reconcile` buckets sidecars + ccs once by `(msgType, chan, id)` —
+a uuid can't migrate to a different controller, so the partition is total —
+then runs four stages within each bucket against shared bound-bitsets. Bias
+is to keep metadata attached to *something* and route uncertainty via the
+`ccsReconciled` signal — silent loss is worse than a flagged guess.
 
-After tier-1 binding the bound cc gets `uuid` and `uuidIdx` (the sysex index
-of its sidecar); metadata from `rdm_<uuid>` is merged onto the cc just like
-for notes.
+1. **Stage 1 — exact.** Bind on `(ppq, val)` within the bucket. Catches
+   everything that moved as a unit (glue, item shift). Silent (the bind
+   carries `silent = true`); no event.
+2. **Stage 2 — value-drifted.** Same `ppq`, val differs. Catches an external
+   value-edit that didn't move the cc. Emits `valueRebound` with
+   `oldVal`/`newVal`.
+3. **Stage 3 — consensus offset.** Histogram offsets implied by every
+   (sidecar, remaining-candidate) pair in the bucket. If a unique top
+   vote-getter passes the threshold (≥ 50% of bucket sidecars, minimum 2
+   voters), apply that offset across the bucket. Emits `consensusRebound`
+   per bind. Catches the common "user dragged a group of ccs in REAPER's
+   editor" case (selection is per-event-type, so sidecars stay behind while
+   ccs move uniformly).
+4. **Stage 4 — per-orphan.** For each remaining sidecar, count candidates
+   left in its bucket: 0 → `orphaned`, 1 → `guessedRebound`, ≥2 →
+   `ambiguous`. Multi-candidate ambiguity drops the metadata rather than
+   guessing — better to surface a flagged loss than attach metadata to a
+   provably-wrong event.
+
+After binding the bound cc gets `uuid` and `uuidIdx` (the sysex index of its
+sidecar); metadata from `rdm_<uuid>` is merged onto the cc just like for
+notes. Non-silent binds (stages 2-4) also rewrite the sidecar's ppq + body
+so the next load is stage-1 silent. Sidecars unbound after reconcile
+(orphaned / ambiguous) are deleted from the take and their `rdm_<uuid>`
+ext-data is purged by the stale-key sweep.
+
+**Dedup (post-reconciliation).** ccs are dedup'd by `(ppq, chan, msgType,
+id)`. Order matters — dedup runs *after* reconciliation so rule 2 has the
+uuid attachments it needs. **Rule 2:** keep the uuid'd cc; if both have
+uuids (or neither does), the latest loc wins. Loser ccs are deleted from
+the take; uuid'd losers also lose their sidecars, and their `rdm_<uuid>`
+ext-data is purged by the same stale-key sweep that handles orphaned-tier
+casualties. Emits `ccsDeduped` with one event per group, carrying
+`keptHadUuid` for audit.
 
 ## Mutation contract
 
@@ -73,27 +106,49 @@ All write paths (`add*`, `delete*`, `assign*`) must run inside `mm:modify(fn)`.
   and so requires the lock.
 
 A structural assignCC on a uuid'd cc also rewrites the sidecar's position and
-fingerprint bytes so the next load is tier-1 clean. `deleteCC` removes the
+fingerprint bytes so the next load is stage-1 clean. `deleteCC` removes the
 sidecar alongside the event.
 
 ## Signals
 
-mm fires up to four kinds of signal per `load`. Subscribers register per
+mm fires up to six kinds of signal per `load`. Subscribers register per
 kind and receive only the payloads of that kind.
 
 ```
 'takeSwapped'      data = nil                                -- only when load received a different take
 'notesDeduped'     data = { events = [{ ppq, chan, pitch, droppedCount }, ...] }
 'uuidsReassigned'  data = { events = [{ oldUuid, newUuid, ppq, chan, pitch }, ...] }
+'ccsReconciled'    data = { events = [...] }                 -- omnibus: see below
+'ccsDeduped'       data = { events = [{ ppq, chan, msgType, cc, pitch, droppedCount, keptHadUuid }, ...] }
 'reload'           data = nil                                -- every load
 ```
 
+`ccsReconciled` events come in five kinds. The shared fields are `kind`,
+`uuid`, `chan`, `msgType`, and (per msgType) `cc` or `pitch`. Per-kind extras:
+
+```
+{ kind = 'valueRebound',     ppq,     oldVal, newVal }   -- stage 2
+{ kind = 'consensusRebound', ppq,     offset }           -- stage 3
+{ kind = 'guessedRebound',   ppq }                       -- stage 4
+{ kind = 'ambiguous',        candidatePpqs = {...} }     -- stage 4 (no bind)
+{ kind = 'orphaned',         lastPpq }                   -- stage 4 (no bind)
+```
+
+`ppq` on the rebind kinds is the bound cc's ppq (where the metadata now
+lives). `lastPpq` on `orphaned` is the sidecar's own ppq (where the cc
+*was*); orphaned/ambiguous events have no bound cc to point at. A
+subscriber that wants only the data-loss subset filters on
+`kind == 'orphaned' or 'ambiguous'`.
+
 Firing rules:
-- `takeSwapped` fires before any reconciliation signals; `reload` fires
-  last. Subscribers handling reconciliation see the events before the
-  baseline rebuild.
-- Reconciliation signals fire only when at least one event of that kind
-  is present — no zero-event calls.
+- Order on a single load is `takeSwapped` → `notesDeduped` →
+  `uuidsReassigned` → `ccsReconciled` → `ccsDeduped` → `reload`.
+  Subscribers handling reconciliation/dedup see the events before the
+  baseline rebuild. `ccsDeduped` follows `ccsReconciled` because rule 2
+  (keep the uuid'd dup) needs the uuid attachment that reconciliation
+  produces.
+- Reconciliation/dedup signals fire only when at least one event of that
+  kind is present — no zero-event calls.
 - `mm:modify` triggers a reload internally on exit, so every successful
   mutation produces a `'reload'` fire (with no `takeSwapped`).
 
@@ -168,8 +223,9 @@ mm:subscribe(signal, fn)           -- fn(data) on each fire of `signal`
 mm:unsubscribe(signal, fn)
 ```
 
-Signals: `'takeSwapped'`, `'notesDeduped'`, `'uuidsReassigned'`, `'reload'`.
-See **Signals** above for the per-signal payload shapes and firing order.
+Signals: `'takeSwapped'`, `'notesDeduped'`, `'uuidsReassigned'`,
+`'ccsReconciled'`, `'ccsDeduped'`, `'reload'`. See **Signals** above for
+the per-signal payload shapes and firing order.
 
 ### Mutation
 
@@ -270,12 +326,16 @@ sr:encode(cc)          -> 11+-byte body, or nil for unknown msgType
 sr:decode(body)        -> cc-shaped record, or nil
   Returns { uuid, msgType, chan, val } plus `cc` for msgType='cc' or
     `pitch` for msgType='pa'. Same shape encode accepts.
-sr:tier1(sidecars, ccs) -> { binds = [{sidecarIdx, ccIdx}, ...],
-                              unboundSidecarIdxs, unboundCcIdxs }
-  Both inputs are 1-indexed arrays of cc-shaped records (sidecars are
-  decode output + sysex ppq). Binds by exact (ppq, msgType, chan, id, val)
-  match; a cc is claimed at most once. Unbound entries park for higher
-  tiers (not yet implemented).
+sr:reconcile(sidecars, ccs)
+  -> { binds = { { sidecarIdx, ccIdx, silent }, ... }, events,
+       unboundSidecarIdxs, unboundCcIdxs }
+
+  Bucket by (msgType, chan, id) and run four stages per bucket. `silent` on a
+  bind is true for stage-1 exact matches and false otherwise — non-silent
+  binds need their sidecars rewritten so the next load is stage-1 clean.
+  `events` is one of valueRebound / consensusRebound / guessedRebound /
+  orphaned / ambiguous; see the `ccsReconciled` signal contract above for
+  field shapes. A cc is claimed at most once across binds.
 ```
 
 **Wire format.** `}RDM <typeNib> <chan> <id> <val_lo7> <val_hi7> <uuid-base36>`
