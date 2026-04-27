@@ -49,20 +49,23 @@ prefix the same way `rdm_<uuid>` notation events are filtered for notes.
 
 **Reconciliation (load-time).** Sidecars don't have a REAPER-side anchor to
 their target the way notation events have to notes, so matching has to handle
-drift. `sr:reconcile` buckets sidecars + ccs once by `(msgType, chan, id)` —
-a uuid can't migrate to a different controller, so the partition is total —
-then runs four stages within each bucket against shared bound-bitsets. Bias
-is to keep metadata attached to *something* and route uncertainty via the
-`ccsReconciled` signal — silent loss is worse than a flagged guess.
+drift. `sr:reconcile` runs four stages, each rebucketing the still-unbound
+sidecars and ccs by a key chosen for that stage's notion of "same" — finer
+early, coarser late. A uuid can't migrate to a different controller, so
+`(msgType, chan, id)` is always part of the key. Bound pairs are spliced
+out of the working sets so the next stage's buckets are automatically
+clean. Bias is to keep metadata attached to *something* and route
+uncertainty via the `ccsReconciled` signal — silent loss is worse than a
+flagged guess.
 
-1. **Stage 1 — exact.** Bind on `(ppq, val)` within the bucket. Catches
-   everything that moved as a unit (glue, item shift). Silent (the bind
-   carries `silent = true`); no event.
-2. **Stage 2 — value-drifted.** Same `ppq`, val differs. Catches an external
-   value-edit that didn't move the cc. Emits `valueRebound` with
-   `oldVal`/`newVal`.
-3. **Stage 3 — consensus offset.** Histogram offsets implied by every
-   (sidecar, remaining-candidate) pair in the bucket. If a unique top
+1. **Stage 1 — exact.** Bucket by `(msgType, chan, id, ppq, val)` and
+   pair off. Catches everything that moved as a unit (glue, item shift).
+   Silent (the bind carries `silent = true`); no event.
+2. **Stage 2 — value-drifted.** Bucket by `(msgType, chan, id, ppq)` and
+   pair off; val may differ. Catches an external value-edit that didn't
+   move the cc. Emits `valueRebound` with `oldVal`/`newVal`.
+3. **Stage 3 — consensus offset.** Bucket by `(msgType, chan, id)`.
+   Histogram offsets implied by every (sidecar, candidate) pair. If a unique top
    vote-getter passes the threshold (≥ 50% of bucket sidecars, minimum 2
    voters), apply that offset across the bucket. Emits `consensusRebound`
    per bind. Catches the common "user dragged a group of ccs in REAPER's
@@ -81,14 +84,26 @@ so the next load is stage-1 silent. Sidecars unbound after reconcile
 (orphaned / ambiguous) are deleted from the take and their `rdm_<uuid>`
 ext-data is purged by the stale-key sweep.
 
-**Dedup (post-reconciliation).** ccs are dedup'd by `(ppq, chan, msgType,
-id)`. Order matters — dedup runs *after* reconciliation so rule 2 has the
-uuid attachments it needs. **Rule 2:** keep the uuid'd cc; if both have
-uuids (or neither does), the latest loc wins. Loser ccs are deleted from
-the take; uuid'd losers also lose their sidecars, and their `rdm_<uuid>`
-ext-data is purged by the same stale-key sweep that handles orphaned-tier
-casualties. Emits `ccsDeduped` with one event per group, carrying
-`keptHadUuid` for audit.
+**Dedup (pre-reconciliation).** ccs are dedup'd by `(ppq, chan, msgType,
+id)`. Survivor in each group is picked to match what reconciliation will
+do next:
+
+1. **Prefer stage-1 candidates.** A cc is a stage-1 candidate if some
+   sidecar exists in the same `(msgType, chan, id)` bucket at the same
+   ppq with matching val — i.e. the reconciler would bind to it silently.
+   If any group member is a candidate, the survivor comes from that
+   subset.
+2. **Tiebreak by highest loc.** Within the preferred subset (or the whole
+   group if no candidates), the latest-loc cc wins.
+
+Sidecars are not touched at this stage. A sidecar whose preferred cc has
+just been dropped — or that never had one — flows through reconciliation
+as a `valueRebound` / `consensusRebound` / `guessedRebound` / `ambiguous`
+/ `orphaned` event, and the post-reconcile cleanup deletes orphan
+sidecars. The stale-key sweep in `saveMetadata` purges any
+`rdm_<uuid>` ext-data left behind. Emits `ccsDeduped` with one event per
+group; running before reconciliation means dedup has no uuid attachments
+to report, so the event no longer carries `keptHadUuid`.
 
 ## Mutation contract
 
@@ -119,7 +134,7 @@ kind and receive only the payloads of that kind.
 'notesDeduped'     data = { events = [{ ppq, chan, pitch, droppedCount }, ...] }
 'uuidsReassigned'  data = { events = [{ oldUuid, newUuid, ppq, chan, pitch }, ...] }
 'ccsReconciled'    data = { events = [...] }                 -- omnibus: see below
-'ccsDeduped'       data = { events = [{ ppq, chan, msgType, cc, pitch, droppedCount, keptHadUuid }, ...] }
+'ccsDeduped'       data = { events = [{ ppq, chan, msgType, cc, pitch, droppedCount }, ...] }
 'reload'           data = nil                                -- every load
 ```
 
@@ -142,11 +157,12 @@ subscriber that wants only the data-loss subset filters on
 
 Firing rules:
 - Order on a single load is `takeSwapped` → `notesDeduped` →
-  `uuidsReassigned` → `ccsReconciled` → `ccsDeduped` → `reload`.
+  `uuidsReassigned` → `ccsDeduped` → `ccsReconciled` → `reload`.
   Subscribers handling reconciliation/dedup see the events before the
-  baseline rebuild. `ccsDeduped` follows `ccsReconciled` because rule 2
-  (keep the uuid'd dup) needs the uuid attachment that reconciliation
-  produces.
+  baseline rebuild. `ccsDeduped` precedes `ccsReconciled` because the
+  reconciler runs over an already-deduped cc list — orphans (sidecars
+  whose preferred cc was just dropped) surface as proper reconcile
+  events rather than silent dedup losses.
 - Reconciliation/dedup signals fire only when at least one event of that
   kind is present — no zero-event calls.
 - `mm:modify` triggers a reload internally on exit, so every successful
@@ -223,7 +239,7 @@ mm:unsubscribe(signal, fn)
 ```
 
 Signals: `'takeSwapped'`, `'notesDeduped'`, `'uuidsReassigned'`,
-`'ccsReconciled'`, `'ccsDeduped'`, `'reload'`. See **Signals** above for
+`'ccsDeduped'`, `'ccsReconciled'`, `'reload'`. See **Signals** above for
 the per-signal payload shapes and firing order.
 
 ### Mutation
@@ -325,8 +341,10 @@ sr:decode(body)        -> cc-shaped record, or nil
   Returns { uuid, msgType, chan, val } plus `cc` for msgType='cc' or
     `pitch` for msgType='pa'. Same shape encode accepts.
 sr:reconcile(sidecars, ccs)
-  -> { binds = { { sidecarIdx, ccIdx, silent }, ... }, events,
-       unboundSidecarIdxs, unboundCcIdxs }
+  -> { binds = { { sidecar, cc, silent }, ... }, events,
+       unboundSidecars, unboundCcs }
+  binds carry refs into the input arrays — `sidecar` and `cc` are the same
+  tables the caller passed in. Stable until the next mutation of those arrays.
 
   Bucket by (msgType, chan, id) and run four stages per bucket. `silent` on a
   bind is true for stage-1 exact matches and false otherwise — non-silent

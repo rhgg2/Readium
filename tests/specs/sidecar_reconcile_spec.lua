@@ -30,13 +30,13 @@ return {
   {
     name = 'exact (ppq, val) match → silent bind, no event',
     run = function()
-      local r = sr:reconcile(
-        { sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 } },
-        { cc     { ppq = 100,           msgType = 'cc', chan = 1, cc = 7, val = 64 } })
-      t.deepEq(r.binds, { { sidecarIdx = 1, ccIdx = 1, silent = true } })
+      local sc1 = sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 }
+      local c1  = cc     { ppq = 100,           msgType = 'cc', chan = 1, cc = 7, val = 64 }
+      local r = sr:reconcile({ sc1 }, { c1 })
+      t.deepEq(r.binds, { { sidecar = sc1, cc = c1, silent = true } })
       t.deepEq(r.events, {})
-      t.deepEq(r.unboundSidecarIdxs, {})
-      t.deepEq(r.unboundCcIdxs,      {})
+      t.deepEq(r.unboundSidecars, {})
+      t.deepEq(r.unboundCcs,      {})
     end,
   },
 
@@ -99,8 +99,8 @@ return {
       t.eq(#r.binds, 2)
       local claimed = {}
       for _, b in ipairs(r.binds) do
-        t.falsy(claimed[b.ccIdx], 'cc claimed twice')
-        claimed[b.ccIdx] = true
+        t.falsy(claimed[b.cc], 'cc claimed twice')
+        claimed[b.cc] = true
         t.eq(b.silent, true)
       end
     end,
@@ -111,10 +111,10 @@ return {
   {
     name = 'val differs at same ppq → valueRebound + non-silent bind',
     run = function()
-      local r = sr:reconcile(
-        { sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 } },
-        { cc     { ppq = 100,           msgType = 'cc', chan = 1, cc = 7, val = 80 } })
-      t.deepEq(r.binds, { { sidecarIdx = 1, ccIdx = 1, silent = false } })
+      local sc1 = sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 }
+      local c1  = cc     { ppq = 100,           msgType = 'cc', chan = 1, cc = 7, val = 80 }
+      local r = sr:reconcile({ sc1 }, { c1 })
+      t.deepEq(r.binds, { { sidecar = sc1, cc = c1, silent = false } })
       t.eq(#r.events, 1)
       local e = r.events[1]
       t.eq(e.kind, 'valueRebound')
@@ -146,14 +146,11 @@ return {
     run = function()
       -- First sidecar takes the cc by valueRebound; second has no remaining
       -- candidates in the bucket → stage 4 orphans it.
-      local r = sr:reconcile(
-        {
-          sidecar{ ppq = 0, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 0 },
-          sidecar{ ppq = 0, uuid = 2, msgType = 'cc', chan = 1, cc = 7, val = 0 },
-        },
-        { cc{ ppq = 0, msgType = 'cc', chan = 1, cc = 7, val = 90 } })
+      local sc1 = sidecar{ ppq = 0, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 0 }
+      local sc2 = sidecar{ ppq = 0, uuid = 2, msgType = 'cc', chan = 1, cc = 7, val = 0 }
+      local r = sr:reconcile({ sc1, sc2 }, { cc{ ppq = 0, msgType = 'cc', chan = 1, cc = 7, val = 90 } })
       t.eq(#r.binds, 1)
-      t.eq(r.binds[1].sidecarIdx, 1)
+      t.eq(r.binds[1].sidecar, sc1)
       local kinds = {}
       for _, e in ipairs(r.events) do kinds[e.uuid] = e.kind end
       t.eq(kinds[1], 'valueRebound')
@@ -274,17 +271,18 @@ return {
       t.eq(e.msgType, 'cc')
       t.eq(e.cc, 7)
       t.eq(e.ppq, nil, 'orphans use lastPpq, never ppq (no bound cc to point at)')
-      t.deepEq(r.unboundSidecarIdxs, { 1 })
+      t.eq(#r.unboundSidecars, 1)
+      t.eq(r.unboundSidecars[1].uuid, 1)
     end,
   },
 
   {
     name = 'one candidate at drifted ppq → guessedRebound binds at the cc\'s ppq',
     run = function()
-      local r = sr:reconcile(
-        { sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 } },
-        { cc     { ppq = 130,           msgType = 'cc', chan = 1, cc = 7, val = 99 } })
-      t.deepEq(r.binds, { { sidecarIdx = 1, ccIdx = 1, silent = false } })
+      local sc1 = sidecar{ ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64 }
+      local c1  = cc     { ppq = 130,           msgType = 'cc', chan = 1, cc = 7, val = 99 }
+      local r = sr:reconcile({ sc1 }, { c1 })
+      t.deepEq(r.binds, { { sidecar = sc1, cc = c1, silent = false } })
       t.eq(#r.events, 1)
       local e = r.events[1]
       t.eq(e.kind, 'guessedRebound')
@@ -330,14 +328,11 @@ return {
       -- Stage 3: 2 sidecars, 1 cc; offsets +50 and -50 each get 1 vote → tie
       -- below threshold. Stage 4: first sidecar gets the cc as
       -- guessedRebound; second sees zero candidates → orphaned.
-      local r = sr:reconcile(
-        {
-          sidecar{ ppq = 0,   uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 0 },
-          sidecar{ ppq = 100, uuid = 2, msgType = 'cc', chan = 1, cc = 7, val = 0 },
-        },
-        { cc{ ppq = 50, msgType = 'cc', chan = 1, cc = 7, val = 0 } })
+      local sc1 = sidecar{ ppq = 0,   uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 0 }
+      local sc2 = sidecar{ ppq = 100, uuid = 2, msgType = 'cc', chan = 1, cc = 7, val = 0 }
+      local r = sr:reconcile({ sc1, sc2 }, { cc{ ppq = 50, msgType = 'cc', chan = 1, cc = 7, val = 0 } })
       t.eq(#r.binds, 1)
-      t.eq(r.binds[1].sidecarIdx, 1)
+      t.eq(r.binds[1].sidecar, sc1)
       local kinds = {}
       for _, e in ipairs(r.events) do kinds[e.uuid] = e.kind end
       t.eq(kinds[1], 'guessedRebound')
@@ -350,28 +345,28 @@ return {
   {
     name = 'mismatched chan: separate buckets → orphaned + unbound cc',
     run = function()
-      local r = sr:reconcile(
-        { sidecar{ ppq = 0, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 0 } },
-        { cc     { ppq = 0,           msgType = 'cc', chan = 2, cc = 7, val = 0 } })
+      local sc1 = sidecar{ ppq = 0, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 0 }
+      local c1  = cc     { ppq = 0,           msgType = 'cc', chan = 2, cc = 7, val = 0 }
+      local r = sr:reconcile({ sc1 }, { c1 })
       t.deepEq(r.binds, {})
       t.eq(#r.events, 1)
       t.eq(r.events[1].kind, 'orphaned')
-      t.deepEq(r.unboundSidecarIdxs, { 1 })
-      t.deepEq(r.unboundCcIdxs,      { 1 })
+      t.deepEq(r.unboundSidecars, { sc1 })
+      t.deepEq(r.unboundCcs,      { c1  })
     end,
   },
 
   {
     name = 'mismatched msgType: separate buckets (cc vs pb)',
     run = function()
-      local r = sr:reconcile(
-        { sidecar{ ppq = 0, uuid = 1, msgType = 'pb', chan = 1, val = 0       } },
-        { cc     { ppq = 0,           msgType = 'cc', chan = 1, cc = 0, val = 0 } })
+      local sc1 = sidecar{ ppq = 0, uuid = 1, msgType = 'pb', chan = 1, val = 0       }
+      local c1  = cc     { ppq = 0,           msgType = 'cc', chan = 1, cc = 0, val = 0 }
+      local r = sr:reconcile({ sc1 }, { c1 })
       t.deepEq(r.binds, {})
       t.eq(#r.events, 1)
       t.eq(r.events[1].kind, 'orphaned')
-      t.deepEq(r.unboundSidecarIdxs, { 1 })
-      t.deepEq(r.unboundCcIdxs,      { 1 })
+      t.deepEq(r.unboundSidecars, { sc1 })
+      t.deepEq(r.unboundCcs,      { c1  })
     end,
   },
 
@@ -388,13 +383,14 @@ return {
   },
 
   {
-    name = 'untouched cc with no sidecars in its bucket shows up in unboundCcIdxs',
+    name = 'untouched cc with no sidecars in its bucket shows up in unboundCcs',
     run = function()
-      local r = sr:reconcile({}, { cc{ ppq = 0, msgType = 'cc', chan = 1, cc = 7, val = 0 } })
-      t.deepEq(r.binds,              {})
-      t.deepEq(r.events,             {})
-      t.deepEq(r.unboundSidecarIdxs, {})
-      t.deepEq(r.unboundCcIdxs,      { 1 })
+      local c1 = cc{ ppq = 0, msgType = 'cc', chan = 1, cc = 7, val = 0 }
+      local r = sr:reconcile({}, { c1 })
+      t.deepEq(r.binds,           {})
+      t.deepEq(r.events,          {})
+      t.deepEq(r.unboundSidecars, {})
+      t.deepEq(r.unboundCcs,      { c1 })
     end,
   },
 
@@ -452,13 +448,14 @@ return {
       -- 2 & 3 + ccs 2 & 3 drift by +30 (consensus). Bucket cc=11 chan=1:
       -- sidecar 4 same ppq, val differs (valueRebound). Bucket cc=20 chan=1:
       -- sidecar 5, no ccs (orphaned).
+      local sc5 = sidecar{ ppq = 500, uuid = 5, msgType = 'cc', chan = 1, cc = 20, val = 99 }
       local r = sr:reconcile(
         {
           sidecar{ ppq =   0, uuid = 1, msgType = 'cc', chan = 1, cc = 7,  val = 10 },
           sidecar{ ppq = 100, uuid = 2, msgType = 'cc', chan = 1, cc = 7,  val = 20 },
           sidecar{ ppq = 200, uuid = 3, msgType = 'cc', chan = 1, cc = 7,  val = 30 },
           sidecar{ ppq = 400, uuid = 4, msgType = 'cc', chan = 1, cc = 11, val = 50 },
-          sidecar{ ppq = 500, uuid = 5, msgType = 'cc', chan = 1, cc = 20, val = 99 },
+          sc5,
         },
         {
           cc{ ppq =   0, msgType = 'cc', chan = 1, cc = 7,  val = 10 },
@@ -468,10 +465,7 @@ return {
         })
       local kinds, silentByUuid = {}, {}
       for _, e in ipairs(r.events) do kinds[e.uuid] = e.kind end
-      for _, b in ipairs(r.binds) do
-        local sc = ({ 1, 2, 3, 4, 5 })[b.sidecarIdx]
-        silentByUuid[sc] = b.silent
-      end
+      for _, b in ipairs(r.binds) do silentByUuid[b.sidecar.uuid] = b.silent end
       t.eq(silentByUuid[1], true,  'sidecar 1 silent (exact match)')
       t.eq(silentByUuid[2], false, 'sidecar 2 noisy (consensus)')
       t.eq(silentByUuid[3], false, 'sidecar 3 noisy (consensus)')
@@ -481,7 +475,7 @@ return {
       t.eq(kinds[3], 'consensusRebound')
       t.eq(kinds[4], 'valueRebound')
       t.eq(kinds[5], 'orphaned')
-      t.deepEq(r.unboundSidecarIdxs, { 5 })
+      t.deepEq(r.unboundSidecars, { sc5 })
     end,
   },
 }

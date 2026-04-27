@@ -198,7 +198,7 @@ function newMidiManager(take)
 
   -- Longest note at each (ppq, chan, pitch) wins; losers deleted.
   -- Returns one event per collided coordinate.
-  local function removeDuplicateEvents()
+  local function dedupNotes()
     if not take then return {} end
 
     local ok, noteCount = reaper.MIDI_CountEvts(take)
@@ -274,7 +274,7 @@ function newMidiManager(take)
 
     local notesLUT = {}
 
-    local dedupEvents = removeDuplicateEvents()
+    local dedupEvents = dedupNotes()
 
     local ok, noteCount, ccCount, textCount = reaper.MIDI_CountEvts(take)
     if not ok then return end
@@ -285,12 +285,8 @@ function newMidiManager(take)
         chan = chan + 1
         local tag = ppq .. '|' .. chan .. '|' .. pitch
         local entry = {
-          idx    = i,
-          ppq    = ppq,
-          endppq = endppq,
-          chan   = chan,
-          pitch  = pitch,
-          vel    = vel,
+          idx = i, ppq = ppq, endppq = endppq,
+          chan = chan, pitch  = pitch, vel = vel,
         }
         if muted then entry.muted = true end
         notesLUT[tag] = util.add(noteTbl, entry)
@@ -302,20 +298,13 @@ function newMidiManager(take)
       if ok then
         chan = chan + 1
         local msgType = chanMsgTypes[chanmsg] or ('chanmsg_' .. chanmsg)
-        local entry = {
-          idx     = i,
-          ppq     = ppq,
-          msgType = msgType,
-          chan    = chan,
-        }
+        local entry = { idx = i, ppq = ppq, msgType = msgType, chan = chan }
         if muted then entry.muted = true end
 
         if msgType == 'pa' then
-          entry.pitch = msg2
-          entry.val = msg3
+          entry.pitch, entry.val = msg2, msg3
         elseif msgType == 'cc' then
-          entry.cc  = msg2
-          entry.val = msg3
+          entry.cc, entry.val  = msg2, msg3
         elseif msgType == 'pc' or msgType == 'at' then
           entry.val = msg2
         elseif msgType == 'pb' then
@@ -367,8 +356,7 @@ function newMidiManager(take)
         UUIDCount[newUUID] = 1
         metadata[newUUID] = util.clone(metadata[oldUUID]) or {}
         reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, toBase36(newUUID)), false)
-        util.add(reassignEvents, { oldUuid = oldUUID, newUuid = newUUID,
-                                   ppq = note.ppq, chan = note.chan, pitch = note.pitch })
+        util.add(reassignEvents, { oldUuid = oldUUID, newUuid = newUUID, ppq = note.ppq, chan = note.chan, pitch = note.pitch })
       elseif not uuid then
         local newUUID = assignNewUUID(note)
         UUIDCount[newUUID] = 1
@@ -422,68 +410,66 @@ function newMidiManager(take)
       end
     end
 
-    -- See docs: dedup runs after reconciliation so rule 2 sees uuid attachments.
+    -- See docs: dedup runs before reconciliation. Survivor in each dup
+    -- group is the highest-loc cc that the reconciler would bind to
+    -- silently (stage-1: same ppq + val as some sidecar in the bucket);
+    -- if no group member matches, fall back to highest loc.
     local function dedupCCs()
-      local function key(c)
+      local stageOneHit = {}
+      for _, s in ipairs(sidecarTbl) do
+        stageOneHit[s.ppq .. '|' .. s.chan .. '|' .. s.msgType .. '|' .. (s.cc or s.pitch or 0) .. '|' .. (s.val or 0)] = true
+      end
+
+      local function dupKey(c)
         return c.ppq .. '|' .. c.chan .. '|' .. c.msgType .. '|' .. (c.cc or c.pitch or 0)
       end
+      local function valKey(c) return dupKey(c) .. '|' .. (c.val or 0) end
 
       local groups = {}
-      for loc, c in ipairs(ccTbl) do
-        local k = key(c)
-        local g = groups[k]
-        if not g then
-          groups[k] = { winnerLoc = loc, losers = {} }
-        else
-          -- Rule 2: uuid'd beats plain; on tie, latest wins.
-          local winner = ccTbl[g.winnerLoc]
-          if winner.uuid == nil or c.uuid ~= nil then
-            util.add(g.losers, g.winnerLoc); g.winnerLoc = loc
-          else
-            util.add(g.losers, loc)
-          end
-        end
-      end
+      for loc, c in ipairs(ccTbl) do util.bucket(groups, dupKey(c), loc) end
 
-      local events, ccDelIdxs, sxDelIdxs, loserSet = {}, {}, {}, {}
-      for _, g in pairs(groups) do
-        if #g.losers > 0 then
-          local kept = ccTbl[g.winnerLoc]
+      local events, ccDelIdxs, loserSet = {}, {}, {}
+      for _, locs in pairs(groups) do
+        if #locs > 1 then
+          local candidates, fallbacks = {}, {}
+          for _, loc in ipairs(locs) do
+            util.add(stageOneHit[valKey(ccTbl[loc])] and candidates or fallbacks, loc)
+          end
+          local pool = #candidates > 0 and candidates or fallbacks
+          local winnerLoc = pool[#pool]   -- highest loc within the preferred subset
+
+          local kept = ccTbl[winnerLoc]
           util.add(events, { ppq = kept.ppq, chan = kept.chan, msgType = kept.msgType,
                              cc = kept.cc, pitch = kept.pitch,
-                             droppedCount = #g.losers, keptHadUuid = kept.uuid ~= nil })
-          for _, loc in ipairs(g.losers) do
-            local lc = ccTbl[loc]
-            loserSet[loc] = true
-            util.add(ccDelIdxs, lc.idx)
-            if lc.uuidIdx then util.add(sxDelIdxs, lc.uuidIdx) end
+                             droppedCount = #locs - 1 })
+          for _, loc in ipairs(locs) do
+            if loc ~= winnerLoc then
+              loserSet[loc] = true
+              util.add(ccDelIdxs, ccTbl[loc].idx)
+            end
           end
         end
       end
 
       if #events == 0 then return events end
 
-      -- Descending so each delete leaves earlier siblings untouched. cc
-      -- and sysex arrays are independent in REAPER; the passes don't interfere.
+      -- Sidecars stay; orphans (sidecars whose stage-1 candidate was just
+      -- dropped, or that never had one) flow through reconciliation.
       table.sort(ccDelIdxs, function(a, b) return a > b end)
-      table.sort(sxDelIdxs, function(a, b) return a > b end)
       reaper.MIDI_DisableSort(take)
       for _, idx in ipairs(ccDelIdxs) do reaper.MIDI_DeleteCC(take, idx) end
-      for _, idx in ipairs(sxDelIdxs) do reaper.MIDI_DeleteTextSysexEvt(take, idx) end
       reaper.MIDI_Sort(take)
 
-      -- ccTbl is idx-sorted ascending; kept subsequence is too, so renumber in one pass.
       local kept = {}
       for loc, c in ipairs(ccTbl) do
         if not loserSet[loc] then c.idx = #kept; util.add(kept, c) end
       end
       ccTbl = kept
 
-      -- Sysex idxs shifted from the deletes; rebuild and rewire.
-      scanText(); rewireCcSysexIdxs()
-
       return events
     end
+
+    local ccDedupEvents = dedupCCs()
 
     -- Sidecar reconciliation — see docs/midiManager.md for the staging.
     -- Noisy binds (stages 2-4) need their sidecars rewritten; orphans are
@@ -496,25 +482,19 @@ function newMidiManager(take)
 
       local rebinds = {}
       for _, b in ipairs(r.binds) do
-        local cc      = ccTbl[b.ccIdx]
-        local sidecar = sidecarTbl[b.sidecarIdx]
-        cc.uuid    = sidecar.uuid
-        cc.uuidIdx = sidecar.idx
-        if cc.uuid > maxUUID then maxUUID = cc.uuid end
+        b.cc.uuid    = b.sidecar.uuid
+        b.cc.uuidIdx = b.sidecar.idx
+        if b.cc.uuid > maxUUID then maxUUID = b.cc.uuid end
         if not b.silent then util.add(rebinds, b) end
       end
 
       local orphanSysexIdxs = {}
-      for _, sci in ipairs(r.unboundSidecarIdxs) do
-        util.add(orphanSysexIdxs, sidecarTbl[sci].idx)
-      end
+      for _, s in ipairs(r.unboundSidecars) do util.add(orphanSysexIdxs, s.idx) end
 
       if #rebinds > 0 or #orphanSysexIdxs > 0 then
         reaper.MIDI_DisableSort(take)
         for _, b in ipairs(rebinds) do
-          local cc      = ccTbl[b.ccIdx]
-          local sidecar = sidecarTbl[b.sidecarIdx]
-          reaper.MIDI_SetTextSysexEvt(take, sidecar.idx, nil, nil, cc.ppq, -1, sr:encode(cc), true)
+          reaper.MIDI_SetTextSysexEvt(take, b.sidecar.idx, nil, nil, b.cc.ppq, -1, sr:encode(b.cc), true)
         end
         -- Descending order so each delete leaves earlier indices untouched.
         table.sort(orphanSysexIdxs, function(a, b) return a > b end)
@@ -527,8 +507,6 @@ function newMidiManager(take)
         scanText(); rewireCcSysexIdxs()
       end
     end
-
-    local ccDedupEvents = dedupCCs()
 
     for _, note in ipairs(noteTbl) do
       util.assign(note, metadata[note.uuid])
@@ -547,8 +525,8 @@ function newMidiManager(take)
     if takeSwapped            then fire('takeSwapped', nil) end
     if #dedupEvents > 0       then fire('notesDeduped',    { events = dedupEvents }) end
     if #reassignEvents > 0    then fire('uuidsReassigned', { events = reassignEvents }) end
-    if #reconcileEvents > 0   then fire('ccsReconciled',   { events = reconcileEvents }) end
     if #ccDedupEvents > 0     then fire('ccsDeduped',      { events = ccDedupEvents }) end
+    if #reconcileEvents > 0   then fire('ccsReconciled',   { events = reconcileEvents }) end
     fire('reload', nil)
   end
 
@@ -999,27 +977,20 @@ function newSidecarReconciler()
     if not body or #body < 10 then return nil end
     if body:sub(1, 4) ~= SIDECAR_MAGIC then return nil end
 
-    local msgType = chanMsgTypes[body:byte(5) << 4]
-    if not msgType then return nil end
-
-    local chan = body:byte(6) + 1
-    local id   = body:byte(7)
-    local lo   = body:byte(8)
-    local hi   = body:byte(9)
-
-    local val = (msgType == 'pb') and (((hi << 7) | lo) - 8192) or lo
-
-    local uuid = tonumber(body:sub(10), 36)
-    if not uuid then return nil end
-
-    local out = { uuid = uuid, msgType = msgType, chan = chan, val = val }
-    if     msgType == 'cc' then out.cc    = id
-    elseif msgType == 'pa' then out.pitch = id
+    local out = {}
+    out.msgType = chanMsgTypes[body:byte(5) << 4]
+    out.uuid = tonumber(body:sub(10), 36)
+    if not out.msgType or not out.uuid then return nil end
+    local lo, hi = body:byte(8), body:byte(9)
+    out.chan = body:byte(6) + 1
+    out.val = (out.msgType == 'pb') and (((hi << 7) | lo) - 8192) or lo
+    if     out.msgType == 'cc' then out.cc    = body:byte(7)
+    elseif out.msgType == 'pa' then out.pitch = body:byte(7)
     end
+
     return out
   end
 
-  local function bucketKey(e) return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
 
   -- Payload for rebind kinds; orphaned/ambiguous build payloads inline.
   local function payload(kind, sidecar, cc, extras)
@@ -1032,77 +1003,76 @@ function newSidecarReconciler()
   end
 
   -- Four-stage reconciler — see docs/midiManager.md for the staging.
+  -- Each stage rebuckets the still-unbound entries: finer key for stages 1–2,
+  -- coarser for stages 3–4. `bind` splices the pair out of the working sets,
+  -- so what remains at the end is exactly the unbound. Caller's tables are
+  -- untouched (we shallow-copy on entry).
   function sr:reconcile(sidecars, ccs)
-    local THRESHOLD_FRAC = 0.5
-    local THRESHOLD_MIN  = 2
+    local THRESHOLD_FRAC, THRESHOLD_MIN = 0.5, 2
 
-    local scBuckets, ccBuckets = {}, {}
-    for i, s in ipairs(sidecars) do util.bucket(scBuckets, bucketKey(s), i) end
-    for i, c in ipairs(ccs)      do util.bucket(ccBuckets, bucketKey(c), i) end
+    sidecars, ccs = util.clone(sidecars), util.clone(ccs)
 
-    local binds, events, scBound, ccBound = {}, {}, {}, {}
-
-    local function bind(sci, cci, silent, evt)
-      scBound[sci] = true; ccBound[cci] = true
-      util.add(binds, { sidecarIdx = sci, ccIdx = cci, silent = silent })
-      if evt then util.add(events, evt) end
+    local scBuckets, ccBuckets
+    local function bucketBy(keyFn)
+      scBuckets, ccBuckets = {}, {}
+      for _, s in ipairs(sidecars) do util.bucket(scBuckets, keyFn(s), s) end
+      for _, c in ipairs(ccs)      do util.bucket(ccBuckets, keyFn(c), c) end
     end
 
-    for k, scIdxs in pairs(scBuckets) do
-      local ccIdxs = ccBuckets[k] or {}
+    local function removeFirst(t, e)
+      for i, x in ipairs(t) do if x == e then table.remove(t, i); return end end
+    end
 
-      -- Stage 1: exact (ppq, val).
-      local byPpqVal = {}
-      for _, cci in ipairs(ccIdxs) do
-        local c = ccs[cci]
-        util.bucket(byPpqVal, c.ppq .. '|' .. (c.val or 0), cci)
+    local binds, events = {}, {}
+    local function bind(s, c, silent, evt)
+      util.add(binds, { sidecar = s, cc = c, silent = silent })
+      if evt then util.add(events, evt) end
+      removeFirst(sidecars, s); removeFirst(ccs, c)
+    end
+
+    local function idKey(e)   return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
+    local function ppqKey(e)  return idKey(e)  .. '|' .. e.ppq end
+    local function fullKey(e) return ppqKey(e) .. '|' .. (e.val or 0) end
+
+    -- Stage 1: exact (ppq, val).
+    bucketBy(fullKey)
+    for k, scs in pairs(scBuckets) do
+      local cs = ccBuckets[k] or {}
+      for _, s in ipairs(scs) do
+        if cs[1] then bind(s, cs[1], true); table.remove(cs, 1) end
       end
-      for _, sci in ipairs(scIdxs) do
-        local s = sidecars[sci]
-        local kk = s.ppq .. '|' .. (s.val or 0)
-        for _, cci in ipairs(byPpqVal[kk] or {}) do
-          if not ccBound[cci] then bind(sci, cci, true); break end
+    end
+
+    -- Stage 2: same ppq, val drift.
+    bucketBy(ppqKey)
+    for k, scs in pairs(scBuckets) do
+      local cs = ccBuckets[k] or {}
+      for _, s in ipairs(scs) do
+        local c = cs[1]
+        if c then
+          bind(s, c, false, payload('valueRebound', s, c, { oldVal = s.val, newVal = c.val }))
+          table.remove(cs, 1)
         end
       end
+    end
 
-      -- Stage 2: same ppq, val drift.
-      local byPpq = {}
-      for _, cci in ipairs(ccIdxs) do
-        if not ccBound[cci] then util.bucket(byPpq, ccs[cci].ppq, cci) end
-      end
-      for _, sci in ipairs(scIdxs) do
-        if not scBound[sci] then
-          local s = sidecars[sci]
-          for _, cci in ipairs(byPpq[s.ppq] or {}) do
-            if not ccBound[cci] then
-              local c = ccs[cci]
-              bind(sci, cci, false,
-                   payload('valueRebound', s, c, { oldVal = s.val, newVal = c.val }))
-              break
-            end
-          end
-        end
-      end
-
-      -- Stage 3: consensus offset.
-      local scLeft, ccLeft = {}, {}
-      for _, sci in ipairs(scIdxs) do if not scBound[sci] then util.add(scLeft, sci) end end
-      for _, cci in ipairs(ccIdxs) do if not ccBound[cci] then util.add(ccLeft, cci) end end
-
-      if #scLeft > 0 and #ccLeft > 0 then
+    -- Stage 3: consensus offset.
+    bucketBy(idKey)
+    for k, scs in pairs(scBuckets) do
+      local cs = ccBuckets[k] or {}
+      if #scs > 0 and #cs > 0 then
         -- Each sidecar votes once per distinct offset it could realise.
         local offsetVotes, sidecarOffsets = {}, {}
-        for _, sci in ipairs(scLeft) do
-          local s = sidecars[sci]
+        for _, s in ipairs(scs) do
           local seen = {}
-          for _, cci in ipairs(ccLeft) do
-            local off = ccs[cci].ppq - s.ppq
+          for _, c in ipairs(cs) do
+            local off = c.ppq - s.ppq
             if not seen[off] then
               seen[off] = true
               offsetVotes[off] = (offsetVotes[off] or 0) + 1
             end
           end
-          sidecarOffsets[sci] = seen
+          sidecarOffsets[s] = seen
         end
 
         local bestOff, bestCount, tied = nil, 0, false
@@ -1111,15 +1081,14 @@ function newSidecarReconciler()
           elseif count == bestCount then tied = true end
         end
 
-        local threshold = math.max(THRESHOLD_MIN, math.ceil(THRESHOLD_FRAC * #scLeft))
+        local threshold = math.max(THRESHOLD_MIN, math.ceil(THRESHOLD_FRAC * #scs))
         if bestOff and not tied and bestCount >= threshold then
-          for _, sci in ipairs(scLeft) do
-            if sidecarOffsets[sci][bestOff] then
-              local s = sidecars[sci]
-              for _, cci in ipairs(ccLeft) do
-                if not ccBound[cci] and ccs[cci].ppq - s.ppq == bestOff then
-                  bind(sci, cci, false,
-                       payload('consensusRebound', s, ccs[cci], { offset = bestOff }))
+          for _, s in ipairs(scs) do
+            if sidecarOffsets[s][bestOff] then
+              for i, c in ipairs(cs) do
+                if c.ppq - s.ppq == bestOff then
+                  bind(s, c, false, payload('consensusRebound', s, c, { offset = bestOff }))
+                  table.remove(cs, i)
                   break
                 end
               end
@@ -1127,36 +1096,30 @@ function newSidecarReconciler()
           end
         end
       end
+    end
 
-      -- Stage 4: per-orphan fallback.
-      for _, sci in ipairs(scIdxs) do
-        if not scBound[sci] then
-          local s = sidecars[sci]
-          local cands = {}
-          for _, cci in ipairs(ccIdxs) do
-            if not ccBound[cci] then util.add(cands, cci) end
-          end
-          if #cands == 0 then
-            util.add(events, { kind = 'orphaned', uuid = s.uuid, lastPpq = s.ppq,
-                               chan = s.chan, msgType = s.msgType,
-                               cc = s.cc, pitch = s.pitch })
-          elseif #cands == 1 then
-            bind(sci, cands[1], false, payload('guessedRebound', s, ccs[cands[1]]))
-          else
-            local ppqs = {}
-            for _, cci in ipairs(cands) do util.add(ppqs, ccs[cci].ppq) end
-            util.add(events, { kind = 'ambiguous', uuid = s.uuid, candidatePpqs = ppqs })
-          end
+    -- Stage 4: per-orphan fallback.
+    bucketBy(idKey)
+    for k, scs in pairs(scBuckets) do
+      local cs = ccBuckets[k] or {}
+      for _, s in ipairs(scs) do
+        if #cs == 0 then
+          util.add(events, { kind = 'orphaned', uuid = s.uuid, lastPpq = s.ppq,
+                             chan = s.chan, msgType = s.msgType,
+                             cc = s.cc, pitch = s.pitch })
+        elseif #cs == 1 then
+          bind(s, cs[1], false, payload('guessedRebound', s, cs[1]))
+          table.remove(cs, 1)
+        else
+          local ppqs = {}
+          for _, c in ipairs(cs) do util.add(ppqs, c.ppq) end
+          util.add(events, { kind = 'ambiguous', uuid = s.uuid, candidatePpqs = ppqs })
         end
       end
     end
 
-    local unboundSidecarIdxs, unboundCcIdxs = {}, {}
-    for i = 1, #sidecars do if not scBound[i] then util.add(unboundSidecarIdxs, i) end end
-    for i = 1, #ccs       do if not ccBound[i] then util.add(unboundCcIdxs,      i) end end
-
     return { binds = binds, events = events,
-             unboundSidecarIdxs = unboundSidecarIdxs, unboundCcIdxs = unboundCcIdxs }
+             unboundSidecars = sidecars, unboundCcs = ccs }
   end
 
   return sr

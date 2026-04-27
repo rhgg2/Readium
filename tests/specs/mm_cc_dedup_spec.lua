@@ -1,9 +1,9 @@
 -- Integration spec: real midiManager + midi-extended fakeReaper, exercising
--- the load-time cc dedup pass (phase 3 of design/cc-sidecar-metadata.md).
--- Pins rule 2 (uuid'd beats plain), the latest-loc tiebreaker, the
--- ccsDeduped signal payload, post-dedup index hygiene (cc.uuidIdx still
--- resolves a sidecar after mid-load deletions), and ordering relative to
--- ccsReconciled/reload.
+-- the load-time cc dedup pass. Pins the sidecar-aware survivor heuristic
+-- (prefer a cc whose ppq+val matches a sidecar — i.e. a stage-1 reconcile
+-- candidate — else highest loc), the ccsDeduped signal payload, post-dedup
+-- index hygiene (cc.uuidIdx still resolves a sidecar after mid-load
+-- deletions), and ordering relative to ccsReconciled/reload.
 
 local t = require('support')
 
@@ -92,13 +92,15 @@ end
 
 return {
   {
-    name = 'rule 2: stamped beats plain at same coord; keptHadUuid=true',
+    name = 'sidecar-matched group: surviving cc picks up the sidecar metadata',
     run = function()
+      -- Both dups share val=64 with the sidecar, so both are stage-1
+      -- candidates; highest loc wins, then reconcile binds it.
       local take, reaper = freshTake()
       seed(take, reaper, {
         ccs = {
-          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 64 },  -- plain
-          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 64 },  -- stamped
+          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 64 },
+          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 64 },
         },
         sidecars = { { ppq = 100, uuid = 1, msgType = 'cc', chan = 1, cc = 7, val = 64,
                        metadata = { tag = 'kept' } } },
@@ -109,17 +111,17 @@ return {
       t.eq(e.ppq, 100); t.eq(e.chan, 1); t.eq(e.msgType, 'cc')
       t.eq(e.cc, 7);    t.eq(e.pitch, nil)
       t.eq(e.droppedCount, 1)
-      t.eq(e.keptHadUuid, true)
+      t.eq(e.keptHadUuid, nil, 'keptHadUuid retired with the post-reconcile dedup')
 
       local survivor; for _, c in mm:ccs() do survivor = c end
-      t.eq(survivor.uuid, 1, 'stamped one survives')
+      t.eq(survivor.uuid, 1)
       t.eq(survivor.tag,  'kept')
       t.eq(#reaper:dumpMidi(take).ccs, 1, 'one cc remains in take')
     end,
   },
 
   {
-    name = 'both plain: latest (higher idx) survives; keptHadUuid=false',
+    name = 'no sidecar in group: highest-loc cc wins',
     run = function()
       local take, reaper = freshTake()
       seed(take, reaper, {
@@ -130,19 +132,71 @@ return {
       })
       local mm, captured = loadWithCapture(take)
       t.eq(#captured.ccsDeduped, 1)
-      t.eq(captured.ccsDeduped[1].keptHadUuid, false)
       t.eq(captured.ccsDeduped[1].droppedCount, 1)
 
       local survivor; for _, c in mm:ccs() do survivor = c end
-      t.eq(survivor.val, 90, 'latest (second-seeded) cc wins on tie')
+      t.eq(survivor.val, 90, 'latest (second-seeded) cc wins')
     end,
   },
 
   {
-    name = 'both stamped: latest survives; loser sidecar + ext-data purged',
+    name = 'sidecar val matches one dup: that dup wins over a higher-loc non-match',
     run = function()
-      -- tier-1 binds sidecar #1 (uuid 11) → cc[1], sidecar #2 (uuid 12) →
-      -- cc[2]. Dedup walks ccTbl in idx order: cc[2] is "latest" and wins.
+      -- cc[1] (val=42) is the stage-1 candidate; cc[2] (val=99) is not.
+      -- Without the candidate-preference, highest-loc would have kept the
+      -- wrong cc and forced a value-rebind onto something the user didn't
+      -- intend.
+      local take, reaper = freshTake()
+      seed(take, reaper, {
+        ccs = {
+          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 42 },
+          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 99 },
+        },
+        sidecars = { { ppq = 100, uuid = 5, msgType = 'cc', chan = 1, cc = 7, val = 42,
+                       metadata = { tag = 'kept' } } },
+      })
+      local mm, captured = loadWithCapture(take)
+      t.eq(#captured.ccsDeduped, 1)
+
+      local survivor; for _, c in mm:ccs() do survivor = c end
+      t.eq(survivor.val, 42, 'val=42 cc preferred — matches the sidecar')
+      t.eq(survivor.uuid, 5)
+      t.eq(survivor.tag, 'kept')
+      -- Reconciled silently (stage-1) — no events.
+      t.eq(captured.ccsReconciled, nil, 'silent stage-1 bind, no reconcile event')
+    end,
+  },
+
+  {
+    name = 'sidecar val matches none: fall back to highest-loc, sidecar value-rebinds',
+    run = function()
+      local take, reaper = freshTake()
+      seed(take, reaper, {
+        ccs = {
+          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 42 },
+          { ppq = 100, msgType = 'cc', chan = 1, cc = 7, val = 99 },
+        },
+        sidecars = { { ppq = 100, uuid = 6, msgType = 'cc', chan = 1, cc = 7, val = 7,
+                       metadata = { tag = 'drift' } } },
+      })
+      local mm, captured = loadWithCapture(take)
+      local survivor; for _, c in mm:ccs() do survivor = c end
+      t.eq(survivor.val, 99, 'no candidate matches → highest-loc fallback')
+      t.eq(survivor.uuid, 6, 'sidecar value-rebound onto the survivor')
+
+      t.eq(#captured.ccsReconciled, 1)
+      local rec = captured.ccsReconciled[1]
+      t.eq(rec.kind, 'valueRebound')
+      t.eq(rec.oldVal, 7); t.eq(rec.newVal, 99)
+    end,
+  },
+
+  {
+    name = 'two sidecars match different dups: one binds, the other orphans cleanly',
+    run = function()
+      -- Old code: reconcile binds both stage-1 then dedup tosses one
+      -- silently with keptHadUuid=true. New code: dedup leaves one cc, the
+      -- "extra" sidecar surfaces as a typed orphan event from reconcile.
       local take, reaper = freshTake()
       seed(take, reaper, {
         ccs = {
@@ -156,20 +210,30 @@ return {
       })
       local mm, captured = loadWithCapture(take)
       t.eq(#captured.ccsDeduped, 1)
-      t.eq(captured.ccsDeduped[1].keptHadUuid, true)
 
       local survivor; for _, c in mm:ccs() do survivor = c end
-      t.eq(survivor.uuid, 12, 'latest-loc cc (bound to sidecar 2) survives')
-      t.eq(survivor.v,    'b', 'survivor carries its own metadata, not loser\'s')
+      t.eq(#reaper:dumpMidi(take).ccs, 1, 'one cc remains in take')
+      t.truthy(survivor.uuid == 11 or survivor.uuid == 12,
+               'either sidecar may bind first — both are stage-1 candidates')
+      local loserUuid = survivor.uuid == 11 and 12 or 11
+
+      -- The sidecar that didn't get to bind surfaces as orphaned, not as a
+      -- silent dedup-loss.
+      t.truthy(captured.ccsReconciled, 'reconcile event present for the orphan')
+      local orphanSeen = false
+      for _, e in ipairs(captured.ccsReconciled) do
+        if e.kind == 'orphaned' and e.uuid == loserUuid then orphanSeen = true end
+      end
+      t.truthy(orphanSeen, 'loser sidecar reported as orphaned via reconcile')
 
       local bodies = sidecarBodies(reaper, take)
-      t.eq(#bodies, 1, 'loser sidecar deleted')
-      t.eq(bodies[1].uuid, 12)
+      t.eq(#bodies, 1, 'loser sidecar deleted by reconcile orphan path')
+      t.eq(bodies[1].uuid, survivor.uuid)
 
       local _, keys = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
-      t.eq(keys, uuidTxt(12), 'only winner uuid remains in rdm_keys')
+      t.eq(keys, uuidTxt(survivor.uuid), 'only winner uuid remains in rdm_keys')
       local _, loserSlot = reaper.GetSetMediaItemTakeInfo_String(
-        take, 'P_EXT:rdm_' .. uuidTxt(11), '', false)
+        take, 'P_EXT:rdm_' .. uuidTxt(loserUuid), '', false)
       t.eq(loserSlot, '', 'loser rdm_<uuid> slot purged')
     end,
   },
@@ -265,7 +329,7 @@ return {
   },
 
   {
-    name = 'signal ordering: ccsReconciled → ccsDeduped → reload',
+    name = 'signal ordering: ccsDeduped → ccsReconciled → reload',
     run = function()
       local take, reaper = freshTake()
       -- One tier-2 valueRebound + one plain dup group, both in one load.
@@ -284,7 +348,7 @@ return {
       mm:subscribe('ccsDeduped',    function() order[#order+1] = 'dedup'     end)
       mm:subscribe('reload',        function() order[#order+1] = 'reload'    end)
       mm:load(take)
-      t.deepEq(order, { 'reconcile', 'dedup', 'reload' })
+      t.deepEq(order, { 'dedup', 'reconcile', 'reload' })
     end,
   },
 
