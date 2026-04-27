@@ -55,6 +55,13 @@ function util.add(tbl, val)
   return val
 end
 
+function util.bucket(buckets, key, val)
+  local b = buckets[key]
+  if not b then b = {}; buckets[key] = b end
+  b[#b+1] = val
+  return b
+end
+
 function util.seek(items, mode, key, filter, keyFn)
   keyFn = keyFn or function(x) return x.ppq end
   local before = mode == 'before' or mode == 'at-or-before'

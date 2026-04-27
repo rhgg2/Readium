@@ -99,11 +99,4 @@ return {
       t.eq(sr:encode{ uuid = 1, msgType = 'bogus', chan = 1, val = 0 }, nil)
     end,
   },
-
-  {
-    name = 'magic prefix is exposed for cheap filtering',
-    run = function()
-      t.eq(sr:magic(), '\x7D\x52\x44\x4D')
-    end,
-  },
 }

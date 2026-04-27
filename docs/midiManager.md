@@ -200,9 +200,8 @@ keeps its `eventTypeLUT` name.
 
 Name→code LUTs are declared canonically; the inverse (`chanMsgTypes`,
 `shapeNames`, `textMsgTypes`) is derived in a loop so the two directions can't
-drift. `chanMsgLUT`, `BASE36`/`toBase36`/`fromBase36`, and `SIDECAR_MAGIC` are
-hoisted to module scope so `newMidiManager` and `newSidecarReconciler` share
-one source of truth.
+drift. `chanMsgLUT` and `BASE36`/`toBase36`/`fromBase36` are hoisted to module
+scope so `newMidiManager` and `newSidecarReconciler` share one source of truth.
 
 ---
 
@@ -318,7 +317,6 @@ without REAPER state.
 
 ```
 newSidecarReconciler() -> sr
-sr:magic()             -> 4-byte string '}RDM' (filter prefix)
 sr:encode(cc)          -> 11+-byte body, or nil for unknown msgType
   cc: { uuid, msgType, chan, [cc | pitch], val }
   body sans F0/F7 framing — pass straight to MIDI_InsertTextSysexEvt(...

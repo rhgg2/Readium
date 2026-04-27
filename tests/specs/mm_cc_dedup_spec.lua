@@ -85,7 +85,7 @@ end
 local function sidecarBodies(reaper, take)
   local out = {}
   for _, e in ipairs(reaper:dumpMidi(take).texts) do
-    if e.msg:sub(1, 4) == sr:magic() then out[#out+1] = sr:decode(e.msg) end
+    if e.msg:sub(1, 4) == '\x7D\x52\x44\x4D' then out[#out+1] = sr:decode(e.msg) end
   end
   return out
 end

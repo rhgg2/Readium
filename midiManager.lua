@@ -6,18 +6,10 @@ local function print(...)
   return util.print(...)
 end
 
--- Shared between newMidiManager and newSidecarReconciler. Hoisted so the
--- two factories speak the same dialect without duplicating tables.
-
--- Channel-message (CC-family) chanmsg byte LUT. Name → code is canonical;
--- the inverse is derived so they can't drift.
+-- Shared by newMidiManager + newSidecarReconciler. Inverse derived to avoid drift.
 local chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
 local chanMsgTypes = {}
 for k, v in pairs(chanMsgLUT) do chanMsgTypes[v] = k end
-
--- Readium sidecar magic prefix ('}RDM'). Sysex events with this prefix
--- carry per-cc identity; everything else passes through as ordinary sysex.
-local SIDECAR_MAGIC = '\x7D\x52\x44\x4D'
 
 local BASE36 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
@@ -55,16 +47,14 @@ function newMidiManager(take)
 
   local INTERNALS = { idx = true, uuidIdx = true }
 
-  -- chanMsgLUT / chanMsgTypes are module-scope (top of file).
-
-  -- CC point shape (REAPER MIDI_SetCCShape codes 0..5)
+  -- REAPER MIDI_SetCCShape codes 0..5
   local shapeLUT = { step = 0, linear = 1, slow = 2, ['fast-start'] = 3, ['fast-end'] = 4, bezier = 5 }
   local shapeNames = {}
   for k, v in pairs(shapeLUT) do shapeNames[v] = k end
 
-  -- Bezier tension LUT: 11 rows of (handle length, long-arm θ, short-arm θ)
-  -- sampled at |tau| = 0, 0.1, ..., 1.0. Interpolated linearly in |tau|, then
-  -- the cubic Bézier is solved for y at parameter t by 20-step bisection.
+  -- 11 rows of (handle length, long-arm θ, short-arm θ) sampled at |tau| =
+  -- 0, 0.1, ..., 1.0. Interpolated linearly in |tau|; cubic Bézier solved
+  -- for y at parameter t by 20-step bisection.
   local BEZIER = {
     { 0.2794, 0.4636,    0.4636 },
     { 0.3442, 0.7704,    0.3384 },
@@ -105,8 +95,7 @@ function newMidiManager(take)
     return 3*u*u*s*ay + 3*u*s*s*by + s*s*s
   end
 
-  -- Curve fraction in [0,1] for shape at parameter t ∈ [0,1]. tension only
-  -- meaningful for 'bezier'; ignored elsewhere.
+  -- tension is ignored except for 'bezier'.
   local function curveSample(shape, tension, t)
     if     shape == 'step'       then return t >= 1 and 1 or 0
     elseif shape == 'linear'     then return t
@@ -123,8 +112,6 @@ function newMidiManager(take)
   }
   local textMsgTypes = {}
   for k, v in pairs(eventTypeLUT) do textMsgTypes[v] = k end
-
-  -- BASE36 / toBase36 / fromBase36 are module-scope (top of file).
 
   -- matches only NOTE notation events tagged with our rdm_<uuid> marker
   local function parseUUIDNotation(msg)
@@ -150,9 +137,8 @@ function newMidiManager(take)
     return tbl
   end
 
-  -- Event-shape fields stripped when serialising per-event metadata. Notes
-  -- and ccs strip different sets; saveMetadatum dispatches by entry shape
-  -- (presence of msgType marks a cc).
+  -- Stripped when serialising per-event metadata. saveMetadatum picks the
+  -- right set by entry shape (msgType marks a cc).
   local noteEventFields = {
     idx = true, ppq = true, endppq = true, chan = true,
     pitch = true, vel = true, muted = true, uuid = true, uuidIdx = true,
@@ -197,7 +183,6 @@ function newMidiManager(take)
       saveMetadatum(uuid)
     end
 
-    -- Delete stale keys that exist in the old key list but not in metadata table
     local ok, oldKeysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
     if ok and oldKeysText and oldKeysText ~= '' then
       for oldUuidTxt in oldKeysText:gmatch('[^,]+') do
@@ -211,9 +196,8 @@ function newMidiManager(take)
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keyList, ','), true)
   end
 
-  -- Returns a list of dedup events { ppq, chan, pitch, droppedCount } — one
-  -- per (ppq, chan, pitch) coordinate that had collisions. The longest note
-  -- at each coordinate survives; the rest are deleted.
+  -- Longest note at each (ppq, chan, pitch) wins; losers deleted.
+  -- Returns one event per collided coordinate.
   local function removeDuplicateEvents()
     if not take then return {} end
 
@@ -346,7 +330,6 @@ function newMidiManager(take)
       end
     end
 
-    -- Scan notation events to obtain UUIDs for notes
     local UUIDCount = {}
 
     for i = 0, textCount-1 do
@@ -373,7 +356,6 @@ function newMidiManager(take)
       if uuid > maxUUID then maxUUID = uuid end
     end
 
-    -- fix duplicate and missing uuids
     local reassignEvents = {}
     reaper.MIDI_DisableSort(take)
     for _, note in ipairs(noteTbl) do
@@ -396,11 +378,8 @@ function newMidiManager(take)
     end
     reaper.MIDI_Sort(take)
 
-    -- Walks the take's text/sysex events and rebuilds sysexTbl + sidecarTbl
-    -- from scratch. Notation rdm_<uuid> events refresh note.uuidIdx via
-    -- notesLUT. Used twice: once after the dup/missing UUID fixup (which
-    -- inserted notation events), once more after sidecar reconciliation
-    -- mutates the take.
+    -- Rebuilds sysexTbl + sidecarTbl after any mid-load mutation that
+    -- shifts text/sysex idxs. Refreshes note.uuidIdx via notesLUT.
     local function scanText()
       sysexTbl   = {}
       sidecarTbl = {}
@@ -433,10 +412,7 @@ function newMidiManager(take)
 
     scanText()
 
-    -- After a mid-load sysex delete, sidecar idxs shift. scanText rebuilds
-    -- sidecarTbl with fresh idxs; this rewires each uuid'd cc to its
-    -- (live) sidecar via uuid lookup. Used by both the reconciliation
-    -- post-pass and the dedup post-pass.
+    -- After scanText: relink each uuid'd cc's uuidIdx to its live sidecar.
     local function rewireCcSysexIdxs()
       local uuidToCc = {}
       for _, c in ipairs(ccTbl) do if c.uuid then uuidToCc[c.uuid] = c end end
@@ -446,12 +422,7 @@ function newMidiManager(take)
       end
     end
 
-    -- CC dedup. Mirrors removeDuplicateEvents for ccs but with rule-2 priority
-    -- (uuid'd beats plain) and a "latest loc wins" tiebreaker. Runs *after*
-    -- sidecar reconciliation so uuid'd ccs are already labelled — rule 2
-    -- needs that labelling. A uuid'd loser's sidecar is also deleted from the
-    -- take; its rdm_<uuid> ext-data is purged by saveMetadata's stale-key
-    -- sweep at the end of load (loser is never added to uuidTbl).
+    -- See docs: dedup runs after reconciliation so rule 2 sees uuid attachments.
     local function dedupCCs()
       local function key(c)
         return c.ppq .. '|' .. c.chan .. '|' .. c.msgType .. '|' .. (c.cc or c.pitch or 0)
@@ -464,9 +435,7 @@ function newMidiManager(take)
         if not g then
           groups[k] = { winnerLoc = loc, losers = {} }
         else
-          -- Rule 2: keep the uuid'd one. Incoming wins unless the current
-          -- winner is uuid'd and incoming isn't (i.e. plain loses to
-          -- uuid'd; on equal uuid-status, latest wins).
+          -- Rule 2: uuid'd beats plain; on tie, latest wins.
           local winner = ccTbl[g.winnerLoc]
           if winner.uuid == nil or c.uuid ~= nil then
             util.add(g.losers, g.winnerLoc); g.winnerLoc = loc
@@ -494,9 +463,8 @@ function newMidiManager(take)
 
       if #events == 0 then return events end
 
-      -- Descending idx so each delete leaves earlier siblings untouched. cc
-      -- and sysex arrays are independent in REAPER, so the two passes don't
-      -- interfere.
+      -- Descending so each delete leaves earlier siblings untouched. cc
+      -- and sysex arrays are independent in REAPER; the passes don't interfere.
       table.sort(ccDelIdxs, function(a, b) return a > b end)
       table.sort(sxDelIdxs, function(a, b) return a > b end)
       reaper.MIDI_DisableSort(take)
@@ -504,8 +472,7 @@ function newMidiManager(take)
       for _, idx in ipairs(sxDelIdxs) do reaper.MIDI_DeleteTextSysexEvt(take, idx) end
       reaper.MIDI_Sort(take)
 
-      -- ccTbl was idx-sorted ascending; the kept subsequence is too, so we
-      -- can renumber 0..n-1 in one pass without re-reading the take.
+      -- ccTbl is idx-sorted ascending; kept subsequence is too, so renumber in one pass.
       local kept = {}
       for loc, c in ipairs(ccTbl) do
         if not loserSet[loc] then c.idx = #kept; util.add(kept, c) end
@@ -518,13 +485,10 @@ function newMidiManager(take)
       return events
     end
 
-    -- Sidecar reconciliation. sr:reconcile binds in stages and tags each
-    -- bind silent (stage 1: nothing drifted) or noisy (stages 2-4 — value
-    -- edit, group drag, per-orphan fallback). Noisy binds need their
-    -- sidecars rewritten so the next load is silent. Anything still unbound
-    -- is a metadata casualty: its sidecar is removed from the take so it
-    -- doesn't re-emit a reconciliation event on every load, and
-    -- saveMetadata's stale-key sweep below purges its rdm_<uuid> ext-data.
+    -- Sidecar reconciliation — see docs/midiManager.md for the staging.
+    -- Noisy binds (stages 2-4) need their sidecars rewritten; orphans are
+    -- deleted so they don't re-emit on every load. Stale-key sweep in
+    -- saveMetadata purges the orphans' rdm_<uuid> ext-data.
     local reconcileEvents = {}
     if #sidecarTbl > 0 then
       local r = sr:reconcile(sidecarTbl, ccTbl)
@@ -691,8 +655,8 @@ function newMidiManager(take)
 
     local note = util.clone(t)
     if not note.muted then note.muted = nil end
-    local uuid = assignNewUUID(note)
-    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, toBase36(note.uuid)), true)
+    assignNewUUID(note)
+    reaper.MIDI_InsertTextSysexEvt(take, false, false, t.ppq, 15, string.format('NOTE %d %d custom rdm_%s', t.chan - 1, t.pitch, toBase36(note.uuid)))
 
     local _, noteCount, _, sysexCount = reaper.MIDI_CountEvts(take)
     note.uuidIdx = sysexCount - 1
@@ -732,12 +696,11 @@ function newMidiManager(take)
     if msg.uuid then
       reaper.MIDI_DeleteTextSysexEvt(take, msg.uuidIdx)
       uuidTbl[msg.uuid] = nil
-      -- saveMetadata at end-of-modify will purge the rdm_<uuid> ext-data slot
+      -- saveMetadata at end-of-modify purges the rdm_<uuid> ext-data slot
     end
     ccTbl[loc] = nil
   end
 
-  -- pack semantic fields back into REAPER's (msg2, msg3) per msgType
   local function reconstruct(tbl)
     local msgType = tbl.msgType
     if not msgType then return end
@@ -766,8 +729,7 @@ function newMidiManager(take)
     local msg = ccTbl[loc]
     if not msg then return end
 
-    -- Decompose t. ccEventFields enumerates the structural set; any other key
-    -- is metadata. The two are orthogonal — t may carry either or both.
+    -- ccEventFields is the structural set; any other key is metadata.
     local hasStructural = t.ppq or t.msgType or t.chan or t.cc or t.pitch
                           or t.val or t.muted ~= nil or t.shape or t.tension
     local hasMetadata = false
@@ -775,8 +737,7 @@ function newMidiManager(take)
       if not ccEventFields[k] then hasMetadata = true; break end
     end
 
-    -- Lockless carve-out: metadata-only on a uuid'd cc — same shape as the
-    -- assignNote carve-out.
+    -- Lockless metadata-only carve-out (mirrors assignNote).
     if not hasStructural and msg.uuid then
       util.assign(msg, t)
       saveMetadatum(msg.uuid)
@@ -814,7 +775,7 @@ function newMidiManager(take)
       if msg.shape ~= 'bezier' then msg.tension = nil end
     end
 
-    -- First metadata stamp: allocate uuid + insert the sidecar that carries it.
+    -- First metadata stamp: allocate uuid + insert its sidecar.
     if hasMetadata and not msg.uuid then
       assignNewUUID(msg)
       reaper.MIDI_InsertTextSysexEvt(take, false, false, msg.ppq, -1, sr:encode(msg))
@@ -822,8 +783,7 @@ function newMidiManager(take)
       msg.uuidIdx = sysexCount - 1
     end
 
-    -- Sidecar follow-along: keep ppq + body fingerprint synced after a
-    -- structural change so the next load is tier-1 clean.
+    -- Resync sidecar ppq + fingerprint so the next load is tier-1 clean.
     if msg.uuid and hasStructural then
       reaper.MIDI_SetTextSysexEvt(take, msg.uuidIdx, nil, nil, msg.ppq, -1, sr:encode(msg), true)
     end
@@ -939,10 +899,7 @@ function newMidiManager(take)
     return take
   end
 
-  -- Interpolated value at ppq between two scalar events A and B, using the
-  -- shape/tension carried on A (REAPER's convention: a CC point's shape
-  -- governs the curve from that point to the next). Returns A.val for step
-  -- and shapeless events.
+  -- REAPER convention: shape on A governs the curve from A to next.
   function mm:interpolate(A, B, ppq)
     if not A.shape or A.shape == 'step' then return A.val end
     local span = B.ppq - A.ppq
@@ -1007,39 +964,19 @@ function newMidiManager(take)
   return mm
 end
 
--- Sidecar codec + reconciliation. Pure over its args — held as a factory
--- both for symmetry with newMidiManager and so specs can construct one
--- without dragging in REAPER state. See docs/midiManager.md for the
--- on-the-wire layout and the role each tier plays at load time.
+-- Pure factory; see docs/midiManager.md for the wire format and tiers.
 function newSidecarReconciler()
   local sr = {}
 
-  -- The body's <type> byte stores the chanmsg high nibble (0xA..0xE).
-  local kindToType, typeToKind = {}, {}
-  for kind, byte in pairs(chanMsgLUT) do
-    local nib = byte >> 4
-    kindToType[kind] = nib
-    typeToKind[nib]  = kind
-  end
+  local SIDECAR_MAGIC = '\x7D\x52\x44\x4D'  -- '}RDM'
 
-  -- The fixed prefix shared by every Readium sidecar body. Useful to callers
-  -- that need to filter sysex events without paying for a full decode.
-  function sr:magic() return SIDECAR_MAGIC end
-
-  -- Encode and reconcile both walk cc-shaped records
-  -- { msgType, chan, [cc | pitch], val }. The `id` byte stored on the wire
-  -- is the controller for cc, pitch for pa, 0 for pb/pc/at — exactly the
-  -- field already on a ccTbl entry.
+  -- wire `id` byte: controller for cc, pitch for pa, 0 for the rest.
   local function idOf(cc) return cc.cc or cc.pitch or 0 end
 
-  -- Encode the body sans F0/F7 framing — REAPER frames on serialise per the
-  -- MIDI_InsertTextSysexEvt(... type=-1 ...) contract. `cc` is a cc-shaped
-  -- record carrying { uuid, msgType, chan, [cc | pitch], val }. chan is
-  -- 1..16 (mm convention); val is signed for pb, 7-bit otherwise. Returns
-  -- nil for unknown msgTypes.
   function sr:encode(cc)
-    local typeNib = kindToType[cc.msgType]
-    if not typeNib then return nil end
+    local typeByte = chanMsgLUT[cc.msgType]
+    if not typeByte then return nil end
+    local typeNib = typeByte >> 4
 
     local lo, hi
     if cc.msgType == 'pb' then
@@ -1058,15 +995,11 @@ function newSidecarReconciler()
       .. toBase36(cc.uuid)
   end
 
-  -- Decode a body. Returns nil for non-Readium bytes or malformed payloads.
-  -- The returned record matches the cc shape so it can be passed to encode
-  -- or compared against ccTbl entries directly: `cc` is set for msgType='cc'
-  -- and `pitch` for msgType='pa'; both nil for the channel-wide kinds.
   function sr:decode(body)
     if not body or #body < 10 then return nil end
     if body:sub(1, 4) ~= SIDECAR_MAGIC then return nil end
 
-    local msgType = typeToKind[body:byte(5)]
+    local msgType = chanMsgTypes[body:byte(5) << 4]
     if not msgType then return nil end
 
     local chan = body:byte(6) + 1
@@ -1086,12 +1019,9 @@ function newSidecarReconciler()
     return out
   end
 
-  -- (msgType, chan, id) — the bucket every staged match operates in. A uuid
-  -- can't migrate to a different controller, so the bucketing is total.
   local function bucketKey(e) return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
 
-  -- Event payload shared by all rebind kinds. The `kind`-less fallback shapes
-  -- (orphaned/ambiguous) build their payloads inline.
+  -- Payload for rebind kinds; orphaned/ambiguous build payloads inline.
   local function payload(kind, sidecar, cc, extras)
     local from = cc or sidecar
     local p = { kind = kind, uuid = sidecar.uuid, ppq = from.ppq,
@@ -1101,39 +1031,14 @@ function newSidecarReconciler()
     return p
   end
 
-  -- Reconcile sidecars to live ccs in one pass. Bucket once by
-  -- (msgType, chan, id), then run four stages within each bucket against
-  -- shared scBound/ccBound bitsets:
-  --
-  --   1. exact (ppq, val) match     — silent rebind (b.silent = true)
-  --   2. same ppq, val differs      — valueRebound
-  --   3. consensus offset           — consensusRebound (≥ THRESHOLD_FRAC of
-  --                                   bucket sidecars, min THRESHOLD_MIN voters)
-  --   4. per-orphan 0/1/many fallback — orphaned / guessedRebound / ambiguous
-  --
-  -- Stages 2-4 mark binds non-silent: their sidecars need rewriting so the
-  -- next load is stage-1 silent. Stage 1 leaves the sidecar alone.
-  --
-  -- Both inputs are 1-indexed arrays of cc-shaped records (sidecars from
-  -- sr:decode plus their sysex ppq). Returns
-  -- `{ binds = { { sidecarIdx, ccIdx, silent }, ... }, events,
-  --    unboundSidecarIdxs, unboundCcIdxs }`. A cc appears at most once
-  -- across binds.
+  -- Four-stage reconciler — see docs/midiManager.md for the staging.
   function sr:reconcile(sidecars, ccs)
     local THRESHOLD_FRAC = 0.5
     local THRESHOLD_MIN  = 2
 
     local scBuckets, ccBuckets = {}, {}
-    for i, s in ipairs(sidecars) do
-      local k = bucketKey(s)
-      scBuckets[k] = scBuckets[k] or {}
-      util.add(scBuckets[k], i)
-    end
-    for i, c in ipairs(ccs) do
-      local k = bucketKey(c)
-      ccBuckets[k] = ccBuckets[k] or {}
-      util.add(ccBuckets[k], i)
-    end
+    for i, s in ipairs(sidecars) do util.bucket(scBuckets, bucketKey(s), i) end
+    for i, c in ipairs(ccs)      do util.bucket(ccBuckets, bucketKey(c), i) end
 
     local binds, events, scBound, ccBound = {}, {}, {}, {}
 
@@ -1146,13 +1051,11 @@ function newSidecarReconciler()
     for k, scIdxs in pairs(scBuckets) do
       local ccIdxs = ccBuckets[k] or {}
 
-      -- Stage 1: exact (ppq, val) match — silent.
+      -- Stage 1: exact (ppq, val).
       local byPpqVal = {}
       for _, cci in ipairs(ccIdxs) do
         local c = ccs[cci]
-        local kk = c.ppq .. '|' .. (c.val or 0)
-        byPpqVal[kk] = byPpqVal[kk] or {}
-        util.add(byPpqVal[kk], cci)
+        util.bucket(byPpqVal, c.ppq .. '|' .. (c.val or 0), cci)
       end
       for _, sci in ipairs(scIdxs) do
         local s = sidecars[sci]
@@ -1162,14 +1065,10 @@ function newSidecarReconciler()
         end
       end
 
-      -- Stage 2: same ppq, val differs — valueRebound.
+      -- Stage 2: same ppq, val drift.
       local byPpq = {}
       for _, cci in ipairs(ccIdxs) do
-        if not ccBound[cci] then
-          local p = ccs[cci].ppq
-          byPpq[p] = byPpq[p] or {}
-          util.add(byPpq[p], cci)
-        end
+        if not ccBound[cci] then util.bucket(byPpq, ccs[cci].ppq, cci) end
       end
       for _, sci in ipairs(scIdxs) do
         if not scBound[sci] then
@@ -1185,7 +1084,7 @@ function newSidecarReconciler()
         end
       end
 
-      -- Stage 3: consensus offset across remaining sidecars + ccs in bucket.
+      -- Stage 3: consensus offset.
       local scLeft, ccLeft = {}, {}
       for _, sci in ipairs(scIdxs) do if not scBound[sci] then util.add(scLeft, sci) end end
       for _, cci in ipairs(ccIdxs) do if not ccBound[cci] then util.add(ccLeft, cci) end end
@@ -1229,7 +1128,7 @@ function newSidecarReconciler()
         end
       end
 
-      -- Stage 4: per-orphan resolution on whatever sidecars remain.
+      -- Stage 4: per-orphan fallback.
       for _, sci in ipairs(scIdxs) do
         if not scBound[sci] then
           local s = sidecars[sci]

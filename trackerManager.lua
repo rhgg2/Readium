@@ -621,9 +621,8 @@ function newTrackerManager(mm, cm)
         if note.detune == nil or note.delay == nil then
           mm:assignNote(loc, { detune = note.detune or 0, delay = note.delay or 0 })
         end
-        local key = note.chan .. '|' .. note.pitch
-        groups[key] = groups[key] or {}
-        util.add(groups[key], { loc = loc, ppq = note.ppq, endppq = note.endppq })
+        util.bucket(groups, note.chan .. '|' .. note.pitch,
+                    { loc = loc, ppq = note.ppq, endppq = note.endppq })
       end
       for _, group in pairs(groups) do
         sortByPPQ(group)

@@ -18,6 +18,7 @@ local specs = {
   'command_manager_spec',
   'config_schema_spec',
   'util_edit_primitives_spec',
+  'util_bucket_spec',
   'util_install_hooks_spec',
   'mm_signal_flow_spec',
   'mm_cc_metadata_spec',

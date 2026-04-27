@@ -88,6 +88,7 @@ util.print_r(tbl)                -- recursive dump with cycle detection (dev)
 ```
 util.assign(t1, t2)       -> t1  -- merge t2 into t1; REMOVE clears
 util.add(tbl, v)          -> v   -- tbl[#tbl+1] = v, then return v
+util.bucket(t, k, v)      -> bkt -- lazy-init t[k]={}, append v, return bucket
 util.clone(src, exclude, deep)   -- shallow by default; deep recurses
 util.deepClone(src)              -- = clone(src, nil, true)
 util.REMOVE                      -- sentinel for delete-in-assign
