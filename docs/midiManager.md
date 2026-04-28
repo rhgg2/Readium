@@ -11,7 +11,7 @@ two key families:
 - `P_EXT:rdm_keys` — comma-separated list of all UUID texts. Loader's entry point.
 - `P_EXT:rdm_<uuidTxt>` — `util.serialise`d field table per event.
 
-Stale keys (present in `rdm_keys` but no longer in `uuidTbl`) are cleared by
+Stale keys (present in `rdm_keys` but no longer in `uuids`) are cleared by
 writing an empty string to their extension slot — REAPER treats this as
 deletion. UUIDs are monotonic integers, base-36 encoded; the namespace is
 unified across notes and ccs.
@@ -24,13 +24,18 @@ the same ppq. UUIDs are universal: every note gets one on load whether or not
 it carries metadata.
 
 On load, duplicates, missing UUIDs, and collisions are reconciled:
-1. Dedup identical `(ppq, chan, pitch)` notes, keeping the longest.
-2. Scan notation events, attach UUIDs to notes via `notesLUT[ppq|chan|pitch]`.
+1. Dedup identical `(ppq, chan, pitch)` notes, keeping the longest. Losers are
+   flushed before sysex is read so their cascade-deleted notation events don't
+   leave us holding stale text/sysex idxs.
+2. Scan notation events into `noteSidecars` and bind to notes by tag; the first
+   notation event at a tag claims its note (`note.uuid`, `note.uuidIdx`).
 3. Any note with a shared UUID is reassigned a fresh one (metadata cloned);
-   any note without a UUID gets a new one and a new notation event.
-4. Rescan sysex/text after step 3 because inserting notation events renumbered
-   indices — need fresh `uuidIdx` per note plus a clean sweep for non-UUID
-   sysex/text events.
+   any note without a UUID gets a new one and a queued notation-event insert.
+   Notation events that didn't claim a note (no surviving note at that tag, or
+   a duplicate at a tag already claimed) are queued for deletion.
+4. All sysex mutations — set/delete/insert — flush in a single bracketed pass
+   alongside the cc dedup deletes and reconcile rewrites. A closing read pass
+   refreshes `idx` and `uuidIdx` on the surviving entries.
 
 ### CCs — sidecar-sysex carrier (sidecar-on-touch)
 
@@ -45,7 +50,7 @@ The carrier is a coincident sysex with a Readium magic prefix
 event at load time even after drift.
 
 Sidecars sit alongside ordinary sysex but are routed to an internal
-`sidecarTbl` during load — Readium only surfaces notes and CCs to its
+`sidecars` table during load — Readium only surfaces notes and CCs to its
 upper layers, so plain sysex/text events have no public accessors.
 
 **Reconciliation (load-time).** Sidecars don't have a REAPER-side anchor to
@@ -206,7 +211,7 @@ Readium reads two text-event types and ignores the rest:
 - Notation events (REAPER type 15) matching the `rdm_<uuid>` pattern bind
   to their note via `note.uuidIdx`.
 - Sysex events (REAPER type -1) whose body starts with the Readium magic
-  (`}RDM`, `7D 52 44 4D`) are cc sidecars and feed `sidecarTbl`.
+  (`}RDM`, `7D 52 44 4D`) are cc sidecars and feed the `sidecars` table.
 
 Everything else passes through untouched — Readium neither surfaces nor
 mutates plain sysex/text events.

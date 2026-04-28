@@ -34,10 +34,10 @@ function newMidiManager(take)
 
   ---------- PRIVATE
 
-  local noteTbl    = {}
-  local ccTbl      = {}
-  local sidecarTbl = {}     -- Readium-magic sysex events
-  local uuidTbl    = {}
+  local notes      = {}
+  local ccs        = {}
+  local ccSidecars = {}     -- Readium-magic sysex events
+  local uuids      = {}
   local maxUUID    = 0
   local lock       = false
   local fire  -- installed below, once mm exists
@@ -145,7 +145,7 @@ function newMidiManager(take)
     if not take then return end
 
     local uuidTxt = toBase36(uuid)
-    local entry   = uuidTbl[uuid]
+    local entry   = uuids[uuid]
 
     if not entry then
       print('Error! uuid not found')
@@ -168,7 +168,7 @@ function newMidiManager(take)
 
     -- Collect uuids as both a set (for stale-key check) and a list (for serialisation)
     local newKeys, keyList = {}, {}
-    for uuid in pairs(uuidTbl) do
+    for uuid in pairs(uuids) do
       local uuidTxt = toBase36(uuid)
       newKeys[uuidTxt] = true
       util.add(keyList, uuidTxt)
@@ -188,58 +188,19 @@ function newMidiManager(take)
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keyList, ','), true)
   end
 
-  -- Longest note at each (ppq, chan, pitch) wins; losers deleted.
-  -- Returns one event per collided coordinate.
-  local function dedupNotes()
-    if not take then return {} end
-
-    local ok, noteCount = reaper.MIDI_CountEvts(take)
-    if not ok then return {} end
-
-    local groups = {}      -- tag -> { ppq, chan, pitch, kept = {idx,endppq}, dropped = {idx,...} }
-    for i = 0, noteCount-1 do
-      local ok, _, _, ppq, endppq, chan, pitch = reaper.MIDI_GetNote(take, i)
-      if ok then
-        chan = chan + 1
-        local tag = ppq .. '|' .. chan .. '|' .. pitch
-        local g = groups[tag]
-        if not g then
-          groups[tag] = { ppq = ppq, chan = chan, pitch = pitch,
-                          kept = { idx = i, endppq = endppq }, dropped = {} }
-        elseif endppq > g.kept.endppq then
-          util.add(g.dropped, g.kept.idx)
-          g.kept = { idx = i, endppq = endppq }
-        else
-          util.add(g.dropped, i)
-        end
-      end
-    end
-
-    local events, toDelete = {}, {}
-    for _, g in pairs(groups) do
-      if #g.dropped > 0 then
-        util.add(events, { ppq = g.ppq, chan = g.chan, pitch = g.pitch,
-                           droppedCount = #g.dropped })
-        for _, idx in ipairs(g.dropped) do util.add(toDelete, idx) end
-      end
-    end
-
-    table.sort(toDelete)
-    reaper.MIDI_DisableSort(take)
-    for i = #toDelete, 1, -1 do
-      reaper.MIDI_DeleteNote(take, toDelete[i])
-    end
-    reaper.MIDI_Sort(take)
-
-    return events
-  end
-
   ----- Utils
+
+  -- Sparse → dense, preserving order. n is the original (pre-sparsening) length.
+  local function compact(t, n)
+    local out = {}
+    for i = 1, n do if t[i] ~= nil then out[#out+1] = t[i] end end
+    return out
+  end
 
   local function assignNewUUID(entry)
     maxUUID = maxUUID + 1
     entry.uuid = maxUUID
-    uuidTbl[maxUUID] = entry
+    uuids[maxUUID] = entry
     return maxUUID
   end
 
@@ -256,33 +217,62 @@ function newMidiManager(take)
     local takeSwapped = take ~= newTake
     if takeSwapped then take = newTake end
 
-    noteTbl    = {}
-    ccTbl      = {}
-    sidecarTbl = {}
-    uuidTbl    = {}
-    maxUUID    = 0
-    lock       = false
+    notes, ccs, ccSidecars, uuids, maxUUID, lock = {}, {}, {}, {}, 0, false
 
-    local notesLUT = {}
-
-    local dedupEvents = dedupNotes()
-
-    local ok, noteCount, ccCount, textCount = reaper.MIDI_CountEvts(take)
+    local ok, noteCount = reaper.MIDI_CountEvts(take)
     if not ok then return end
 
+    ----- Read notes
     for i = 0, noteCount-1 do
       local ok, _, muted, ppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
       if ok then
         chan = chan + 1
-        local tag = ppq .. '|' .. chan .. '|' .. pitch
-        local entry = {
-          idx = i, ppq = ppq, endppq = endppq,
-          chan = chan, pitch  = pitch, vel = vel,
-        }
+        local entry = { idx = i, ppq = ppq, endppq = endppq, chan = chan, pitch = pitch, vel = vel }
         if muted then entry.muted = true end
-        notesLUT[tag] = util.add(noteTbl, entry)
+        util.add(notes, entry)
       end
     end
+    local noteCount0 = #notes
+
+    ----- Note dedup → flush. Longest endppq wins; flush before sysex read so
+    ----- the cascade-deleted notation events don't leave us with stale idxs.
+    local function noteKey(n) return n.ppq .. '|' .. n.chan .. '|' .. n.pitch end
+
+    local notesByTag, noteDedupEvents = {}, {}
+    do
+      local groups, noteDeletes = {}, {}
+      for loc, n in ipairs(notes) do
+        local key = noteKey(n)
+        local g = groups[key]
+        if not g then
+          groups[key] = { kept = loc, dropped = {} }
+        elseif n.endppq > notes[g.kept].endppq then
+          util.add(g.dropped, g.kept); g.kept = loc
+        else
+          util.add(g.dropped, loc)
+        end
+      end
+      for key, g in pairs(groups) do
+        local kept = notes[g.kept]
+        notesByTag[key] = kept
+        if #g.dropped > 0 then
+          util.add(noteDedupEvents, { ppq = kept.ppq, chan = kept.chan, pitch = kept.pitch, droppedCount = #g.dropped })
+          for _, loc in ipairs(g.dropped) do
+            util.add(noteDeletes, notes[loc].idx)
+            notes[loc] = nil
+          end
+        end
+      end
+      if #noteDeletes > 0 then
+        table.sort(noteDeletes)
+        reaper.MIDI_DisableSort(take)
+        for i = #noteDeletes, 1, -1 do reaper.MIDI_DeleteNote(take, noteDeletes[i]) end
+        reaper.MIDI_Sort(take)
+      end
+    end
+
+    ----- Read ccs + sysex (notation events for notes, magic sidecars for ccs)
+    local _, _, ccCount, textCount = reaper.MIDI_CountEvts(take)
 
     for i = 0, ccCount-1 do
       local ok, _, muted, ppq, chanmsg, chan, msg2, msg3 = reaper.MIDI_GetCC(take, i)
@@ -291,226 +281,233 @@ function newMidiManager(take)
         local msgType = chanMsgTypes[chanmsg] or ('chanmsg_' .. chanmsg)
         local entry = { idx = i, ppq = ppq, msgType = msgType, chan = chan }
         if muted then entry.muted = true end
-
-        if msgType == 'pa' then
-          entry.pitch, entry.val = msg2, msg3
-        elseif msgType == 'cc' then
-          entry.cc, entry.val  = msg2, msg3
-        elseif msgType == 'pc' or msgType == 'at' then
-          entry.val = msg2
-        elseif msgType == 'pb' then
-          entry.val = ((msg3 << 7) | msg2) - 8192
+        if     msgType == 'pa' then entry.pitch, entry.val = msg2, msg3
+        elseif msgType == 'cc' then entry.cc,    entry.val = msg2, msg3
+        elseif msgType == 'pc' or msgType == 'at' then entry.val = msg2
+        elseif msgType == 'pb' then entry.val = ((msg3 << 7) | msg2) - 8192
         end
-
         local _, shape, tension = reaper.MIDI_GetCCShape(take, i)
         entry.shape = shapeNames[shape] or 'step'
         if entry.shape == 'bezier' then entry.tension = tension end
-
-        util.add(ccTbl, entry)
+        util.add(ccs, entry)
       end
     end
+    local ccCount0 = #ccs
 
-    local UUIDCount = {}
-
+    local noteSidecars = {}
     for i = 0, textCount-1 do
       local ok, _, _, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
         local uuidTxt, chan, pitch = parseUUIDNotation(msg)
         if uuidTxt then
-          local uuid = fromBase36(uuidTxt)
-          local note = notesLUT[ppq .. '|' .. chan .. '|' .. pitch]
-          if note then
-            note.uuid = uuid
-            note.uuidIdx = i
-            UUIDCount[uuid] = (UUIDCount[uuid] or 0) + 1
-          else
-            print('Error! UUID at ' .. ppq .. ' has no coincident note')
-          end
+          util.add(noteSidecars, { idx = i, ppq = ppq, chan = chan, pitch = pitch,
+                                   uuid = fromBase36(uuidTxt) })
+        end
+      elseif ok and eventtype == -1 then
+        local sc = sr:decode(msg)
+        if sc then
+          sc.idx, sc.ppq = i, ppq
+          util.add(ccSidecars, sc)
         end
       end
     end
+    local sidecarCount0 = #ccSidecars
 
     local metadata = loadMetadata()
+    for uuid in pairs(metadata) do if uuid > maxUUID then maxUUID = uuid end end
 
-    for uuid in pairs(metadata) do
-      if uuid > maxUUID then maxUUID = uuid end
-    end
-
-    local reassignEvents = {}
-    reaper.MIDI_DisableSort(take)
-    for _, note in ipairs(noteTbl) do
-      local uuid = note.uuid
-      if uuid and UUIDCount[uuid] > 1 then
-        local oldUUID = uuid
-        local newUUID = assignNewUUID(note)
-        UUIDCount[oldUUID] = UUIDCount[oldUUID] - 1
-        UUIDCount[newUUID] = 1
-        metadata[newUUID] = util.clone(metadata[oldUUID]) or {}
-        reaper.MIDI_SetTextSysexEvt(take, note.uuidIdx, nil, nil, nil, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, toBase36(newUUID)), false)
-        util.add(reassignEvents, { oldUuid = oldUUID, newUuid = newUUID, ppq = note.ppq, chan = note.chan, pitch = note.pitch })
-      elseif not uuid then
-        local newUUID = assignNewUUID(note)
-        UUIDCount[newUUID] = 1
-        metadata[newUUID] = {}
-        reaper.MIDI_InsertTextSysexEvt(take, false, false, note.ppq, 15, string.format('NOTE %d %d custom rdm_%s', note.chan - 1, note.pitch, toBase36(newUUID)))
-      end
-    end
-    reaper.MIDI_Sort(take)
-
-    -- Rebuilds sidecarTbl after any mid-load mutation that shifts text/sysex
-    -- idxs. Refreshes note.uuidIdx via notesLUT.
-    local function scanText()
-      sidecarTbl = {}
-      local _, _, _, textCount = reaper.MIDI_CountEvts(take)
-      for i = 0, textCount-1 do
-        local ok, _, _, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
-        if ok and eventtype == 15 then
-          local uuidTxt, chan, pitch = parseUUIDNotation(msg)
-          if uuidTxt then
-            local note = notesLUT[ppq .. '|' .. chan .. '|' .. pitch]
-            if note then note.uuidIdx = i end
-          end
-        elseif ok and eventtype == -1 then
-          local sidecar = sr:decode(msg)
-          if sidecar then
-            sidecar.idx  = i
-            sidecar.ppq  = ppq
-            sidecar.body = msg
-            util.add(sidecarTbl, sidecar)
-          end
-        end
-      end
-    end
-
-    scanText()
-
-    -- After scanText: relink each uuid'd cc's uuidIdx to its live sidecar.
-    local function rewireCcSysexIdxs()
-      local uuidToCc = {}
-      for _, c in ipairs(ccTbl) do if c.uuid then uuidToCc[c.uuid] = c end end
-      for _, s in ipairs(sidecarTbl) do
-        local c = uuidToCc[s.uuid]
-        if c then c.uuidIdx = s.idx end
-      end
-    end
-
-    -- See docs: dedup runs before reconciliation. Survivor in each dup
-    -- group is the highest-loc cc that the reconciler would bind to
-    -- silently (stage-1: same ppq + val as some sidecar in the bucket);
-    -- if no group member matches, fall back to highest loc.
-    local function dedupCCs()
+    ----- CC dedup (in-memory only — flush is bundled into the single bracket below)
+    local ccDeletes, ccDedupEvents = {}, {}
+    do
       local stageOneHit = {}
-      for _, s in ipairs(sidecarTbl) do
-        stageOneHit[s.ppq .. '|' .. s.chan .. '|' .. s.msgType .. '|' .. (s.cc or s.pitch or 0) .. '|' .. (s.val or 0)] = true
+      for _, s in ipairs(ccSidecars) do
+        stageOneHit[s.ppq..'|'..s.chan..'|'..s.msgType..'|'..(s.cc or s.pitch or 0)..'|'..(s.val or 0)] = true
       end
-
       local function dupKey(c)
-        return c.ppq .. '|' .. c.chan .. '|' .. c.msgType .. '|' .. (c.cc or c.pitch or 0)
+        return c.ppq..'|'..c.chan..'|'..c.msgType..'|'..(c.cc or c.pitch or 0)
       end
-      local function valKey(c) return dupKey(c) .. '|' .. (c.val or 0) end
+      local function valKey(c) return dupKey(c)..'|'..(c.val or 0) end
 
       local groups = {}
-      for loc, c in ipairs(ccTbl) do util.bucket(groups, dupKey(c), loc) end
+      for loc, c in ipairs(ccs) do util.bucket(groups, dupKey(c), loc) end
 
-      local events, ccDelIdxs, loserSet = {}, {}, {}
       for _, locs in pairs(groups) do
         if #locs > 1 then
           local candidates, fallbacks = {}, {}
           for _, loc in ipairs(locs) do
-            util.add(stageOneHit[valKey(ccTbl[loc])] and candidates or fallbacks, loc)
+            util.add(stageOneHit[valKey(ccs[loc])] and candidates or fallbacks, loc)
           end
           local pool = #candidates > 0 and candidates or fallbacks
-          local winnerLoc = pool[#pool]   -- highest loc within the preferred subset
-
-          local kept = ccTbl[winnerLoc]
-          util.add(events, { ppq = kept.ppq, chan = kept.chan, msgType = kept.msgType,
-                             cc = kept.cc, pitch = kept.pitch,
-                             droppedCount = #locs - 1 })
+          local winnerLoc = pool[#pool]
+          local kept = ccs[winnerLoc]
+          util.add(ccDedupEvents, { ppq = kept.ppq, chan = kept.chan, msgType = kept.msgType,
+                                    cc = kept.cc, pitch = kept.pitch,
+                                    droppedCount = #locs - 1 })
           for _, loc in ipairs(locs) do
             if loc ~= winnerLoc then
-              loserSet[loc] = true
-              util.add(ccDelIdxs, ccTbl[loc].idx)
+              util.add(ccDeletes, ccs[loc].idx)
+              ccs[loc] = nil
             end
           end
         end
       end
-
-      if #events == 0 then return events end
-
-      -- Sidecars stay; orphans (sidecars whose stage-1 candidate was just
-      -- dropped, or that never had one) flow through reconciliation.
-      table.sort(ccDelIdxs, function(a, b) return a > b end)
-      reaper.MIDI_DisableSort(take)
-      for _, idx in ipairs(ccDelIdxs) do reaper.MIDI_DeleteCC(take, idx) end
-      reaper.MIDI_Sort(take)
-
-      local kept = {}
-      for loc, c in ipairs(ccTbl) do
-        if not loserSet[loc] then c.idx = #kept; util.add(kept, c) end
-      end
-      ccTbl = kept
-
-      return events
     end
 
-    local ccDedupEvents = dedupCCs()
+    ----- UUID unification (notes ↔ noteSidecars). First-arrival wins per tag;
+    ----- duplicates and orphans get queued for deletion.
+    local sidecarRewrites, sidecarInserts, sidecarDeletes = {}, {}, {}
+    local reassignEvents = {}
 
-    -- Sidecar reconciliation — see docs/midiManager.md for the staging.
-    -- Noisy binds (stages 2-4) need their sidecars rewritten; orphans are
-    -- deleted so they don't re-emit on every load. Stale-key sweep in
-    -- saveMetadata purges the orphans' rdm_<uuid> ext-data.
+    do
+      local uuidCount = {}
+      for _, ns in ipairs(noteSidecars) do
+        local note = notesByTag[noteKey(ns)]
+        if note and not note.uuid then
+          note.uuid, note.uuidIdx = ns.uuid, ns.idx
+          uuidCount[ns.uuid] = (uuidCount[ns.uuid] or 0) + 1
+        else
+          util.add(sidecarDeletes, ns.idx)
+        end
+      end
+
+      for _, note in pairs(notesByTag) do
+        local uuid = note.uuid
+        if uuid and uuidCount[uuid] > 1 then
+          local oldUUID = uuid
+          local newUUID = assignNewUUID(note)
+          uuidCount[oldUUID] = uuidCount[oldUUID] - 1
+          uuidCount[newUUID] = 1
+          metadata[newUUID] = util.clone(metadata[oldUUID]) or {}
+          util.add(sidecarRewrites, {
+            idx = note.uuidIdx, ppq = note.ppq, type = 15,
+            body = string.format('NOTE %d %d custom rdm_%s', note.chan-1, note.pitch, toBase36(newUUID)),
+          })
+          util.add(reassignEvents, { oldUuid = oldUUID, newUuid = newUUID,
+            ppq = note.ppq, chan = note.chan, pitch = note.pitch })
+        elseif not uuid then
+          local newUUID = assignNewUUID(note)
+          uuidCount[newUUID] = 1
+          metadata[newUUID] = {}
+          util.add(sidecarInserts,
+                   { ppq = note.ppq, chan = note.chan, pitch = note.pitch, uuid = newUUID })
+        end
+      end
+    end
+
+    ----- Sidecar reconcile (ccs ↔ ccSidecars). Snapshot the live (non-nil) entries
+    ----- — sr:reconcile is generic over its args.
+    local liveCcs, liveCcSidecars = {}, {}
+    for _, c in pairs(ccs)        do util.add(liveCcs,        c) end
+    for _, s in pairs(ccSidecars) do util.add(liveCcSidecars, s) end
+
     local reconcileEvents = {}
-    if #sidecarTbl > 0 then
-      local r = sr:reconcile(sidecarTbl, ccTbl)
+    if #liveCcSidecars > 0 then
+      local r = sr:reconcile(liveCcSidecars, liveCcs)
       reconcileEvents = r.events
-
-      local rebinds = {}
       for _, b in ipairs(r.binds) do
-        b.cc.uuid    = b.sidecar.uuid
-        b.cc.uuidIdx = b.sidecar.idx
+        b.cc.uuid, b.cc.uuidIdx = b.sidecar.uuid, b.sidecar.idx
         if b.cc.uuid > maxUUID then maxUUID = b.cc.uuid end
-        if not b.silent then util.add(rebinds, b) end
+        if not b.silent then
+          util.add(sidecarRewrites, { idx = b.sidecar.idx, ppq = b.cc.ppq, type = -1, body = sr:encode(b.cc) })
+        end
       end
-
-      local orphanSysexIdxs = {}
-      for _, s in ipairs(r.unboundSidecars) do util.add(orphanSysexIdxs, s.idx) end
-
-      if #rebinds > 0 or #orphanSysexIdxs > 0 then
-        reaper.MIDI_DisableSort(take)
-        for _, b in ipairs(rebinds) do
-          reaper.MIDI_SetTextSysexEvt(take, b.sidecar.idx, nil, nil, b.cc.ppq, -1, sr:encode(b.cc), true)
+      if #r.unboundSidecars > 0 then
+        local unbound = {}
+        for _, s in ipairs(r.unboundSidecars) do unbound[s] = true end
+        for loc, sc in pairs(ccSidecars) do
+          if unbound[sc] then
+            util.add(sidecarDeletes, sc.idx)
+            ccSidecars[loc] = nil
+          end
         end
-        -- Descending order so each delete leaves earlier indices untouched.
-        table.sort(orphanSysexIdxs, function(a, b) return a > b end)
-        for _, idx in ipairs(orphanSysexIdxs) do
-          reaper.MIDI_DeleteTextSysexEvt(take, idx)
-        end
-        reaper.MIDI_Sort(take)
-
-        -- Sysex indices are stale after deletion + sort; rebuild and rewire.
-        scanText(); rewireCcSysexIdxs()
       end
     end
 
-    for _, note in ipairs(noteTbl) do
+    ----- Single bracketed flush: sets first (idx-stable), deletes descending,
+    ----- inserts last (their idxs aren't tracked — final read will pick them up).
+    local hasFlush = #sidecarRewrites + #ccDeletes + #sidecarDeletes + #sidecarInserts > 0
+    if hasFlush then
+      reaper.MIDI_DisableSort(take)
+      for _, r in ipairs(sidecarRewrites) do
+        reaper.MIDI_SetTextSysexEvt(take, r.idx, nil, nil, r.ppq, r.type, r.body, true)
+      end
+      
+      table.sort(ccDeletes, function(a, b) return a > b end)
+      table.sort(sidecarDeletes, function(a, b) return a > b end)
+      for _, idx in ipairs(ccDeletes) do reaper.MIDI_DeleteCC(take, idx) end
+      for _, idx in ipairs(sidecarDeletes) do reaper.MIDI_DeleteTextSysexEvt(take, idx) end
+
+      for _, ins in ipairs(sidecarInserts) do
+        reaper.MIDI_InsertTextSysexEvt(take, false, false, ins.ppq, 15,
+          string.format('NOTE %d %d custom rdm_%s', ins.chan-1, ins.pitch, toBase36(ins.uuid)))
+      end
+      reaper.MIDI_Sort(take)
+    end
+
+    ----- Compact in-memory tables to dense.
+    notes      = compact(notes,      noteCount0)
+    ccs        = compact(ccs,        ccCount0)
+    ccSidecars = compact(ccSidecars, sidecarCount0)
+
+    ----- Final read pass: refresh idx / uuidIdx from current REAPER state.
+    local notesByTagPost, ccsByTag, ccsByUuid = {}, {}, {}
+    for _, n in ipairs(notes) do
+      notesByTagPost[noteKey(n)] = n
+    end
+    for _, c in ipairs(ccs) do
+      ccsByTag[c.ppq..'|'..c.chan..'|'..c.msgType..'|'..(c.cc or c.pitch or 0)] = c
+      if c.uuid then ccsByUuid[c.uuid] = c end
+    end
+
+    local _, noteCount2, ccCount2, textCount2 = reaper.MIDI_CountEvts(take)
+    for i = 0, noteCount2-1 do
+      local ok, _, _, ppq, _, chan, pitch = reaper.MIDI_GetNote(take, i)
+      if ok then
+        local n = notesByTagPost[ppq..'|'..(chan+1)..'|'..pitch]
+        if n then n.idx = i end
+      end
+    end
+    for i = 0, ccCount2-1 do
+      local ok, _, _, ppq, chanmsg, chan, msg2 = reaper.MIDI_GetCC(take, i)
+      if ok then
+        local msgType = chanMsgTypes[chanmsg] or ('chanmsg_'..chanmsg)
+        local id = (msgType == 'cc' or msgType == 'pa') and msg2 or 0
+        local c = ccsByTag[ppq..'|'..(chan+1)..'|'..msgType..'|'..id]
+        if c then c.idx = i end
+      end
+    end
+    for i = 0, textCount2-1 do
+      local ok, _, _, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
+      if ok and eventtype == 15 then
+        local uuidTxt, chan, pitch = parseUUIDNotation(msg)
+        if uuidTxt then
+          local n = notesByTagPost[ppq..'|'..chan..'|'..pitch]
+          if n then n.uuidIdx = i end
+        end
+      elseif ok and eventtype == -1 then
+        local sc = sr:decode(msg)
+        if sc and ccsByUuid[sc.uuid] then ccsByUuid[sc.uuid].uuidIdx = i end
+      end
+    end
+
+    ----- Metadata merge + persist + signals
+    for _, note in ipairs(notes) do
       util.assign(note, metadata[note.uuid])
-      uuidTbl[note.uuid] = note
+      uuids[note.uuid] = note
     end
-
-    for _, cc in ipairs(ccTbl) do
+    for _, cc in ipairs(ccs) do
       if cc.uuid then
         util.assign(cc, metadata[cc.uuid])
-        uuidTbl[cc.uuid] = cc
+        uuids[cc.uuid] = cc
       end
     end
-
     saveMetadata()
 
-    if takeSwapped            then fire('takeSwapped', nil) end
-    if #dedupEvents > 0       then fire('notesDeduped',    { events = dedupEvents }) end
-    if #reassignEvents > 0    then fire('uuidsReassigned', { events = reassignEvents }) end
-    if #ccDedupEvents > 0     then fire('ccsDeduped',      { events = ccDedupEvents }) end
-    if #reconcileEvents > 0   then fire('ccsReconciled',   { events = reconcileEvents }) end
+    if takeSwapped           then fire('takeSwapped',     nil) end
+    if #noteDedupEvents > 0  then fire('notesDeduped',    { events = noteDedupEvents }) end
+    if #reassignEvents > 0   then fire('uuidsReassigned', { events = reassignEvents })  end
+    if #ccDedupEvents > 0    then fire('ccsDeduped',      { events = ccDedupEvents })   end
+    if #reconcileEvents > 0  then fire('ccsReconciled',   { events = reconcileEvents }) end
     fire('reload', nil)
   end
 
@@ -542,7 +539,7 @@ function newMidiManager(take)
   ----- Notes
 
   function mm:getNote(loc)
-    local note = noteTbl[loc]
+    local note = notes[loc]
     return util.clone(note, INTERNALS)
   end
 
@@ -550,7 +547,7 @@ function newMidiManager(take)
     local i = 0
     return function()
       i = i + 1
-      local note = noteTbl[i]
+      local note = notes[i]
       if note then
         return i, util.clone(note, INTERNALS)
       end
@@ -560,14 +557,14 @@ function newMidiManager(take)
   function mm:deleteNote(loc)
     if not (take and checkLock()) then return end
 
-    local note = noteTbl[loc]
+    local note = notes[loc]
     if not note then return end
 
     reaper.MIDI_DeleteNote(take, note.idx)
 
     -- clean up internal tables
-    uuidTbl[note.uuid] = nil
-    noteTbl[loc] = nil
+    uuids[note.uuid] = nil
+    notes[loc] = nil
   end
 
   function mm:assignNote(loc, t)
@@ -575,7 +572,7 @@ function newMidiManager(take)
 
     if not (t.ppq or t.endppq or t.pitch or t.vel or t.chan or t.muted ~= nil) then
       -- just metadata, allow without lock
-      local note = noteTbl[loc]
+      local note = notes[loc]
       if not note then return end
 
       util.assign(note, t)
@@ -586,7 +583,7 @@ function newMidiManager(take)
 
     if not checkLock() then return end
 
-    local note = noteTbl[loc]
+    local note = notes[loc]
     if not note then return end
 
     local chan = (t.chan or note.chan) - 1
@@ -623,17 +620,17 @@ function newMidiManager(take)
     local _, noteCount, _, sysexCount = reaper.MIDI_CountEvts(take)
     note.uuidIdx = sysexCount - 1
     note.idx = noteCount - 1
-    util.add(noteTbl, note)
+    util.add(notes, note)
 
     saveMetadatum(note.uuid)
 
-    return #noteTbl
+    return #notes
   end
 
   ----- CCs
 
   function mm:getCC(loc)
-    local msg = ccTbl[loc]
+    local msg = ccs[loc]
     return util.clone(msg, INTERNALS)
   end
 
@@ -641,7 +638,7 @@ function newMidiManager(take)
     local i = 0
     return function()
       i = i + 1
-      local msg = ccTbl[i]
+      local msg = ccs[i]
       if msg then
         return i, util.clone(msg, INTERNALS)
       end
@@ -651,16 +648,16 @@ function newMidiManager(take)
   function mm:deleteCC(loc)
     if not (take and checkLock()) then return end
 
-    local msg = ccTbl[loc]
+    local msg = ccs[loc]
     if not msg then return end
 
     reaper.MIDI_DeleteCC(take, msg.idx)
     if msg.uuid then
       reaper.MIDI_DeleteTextSysexEvt(take, msg.uuidIdx)
-      uuidTbl[msg.uuid] = nil
+      uuids[msg.uuid] = nil
       -- saveMetadata at end-of-modify purges the rdm_<uuid> ext-data slot
     end
-    ccTbl[loc] = nil
+    ccs[loc] = nil
   end
 
   local function reconstruct(tbl)
@@ -688,7 +685,7 @@ function newMidiManager(take)
   function mm:assignCC(loc, t)
     if not take then return end
 
-    local msg = ccTbl[loc]
+    local msg = ccs[loc]
     if not msg then return end
 
     -- ccEventFields is the structural set; any other key is metadata.
@@ -783,9 +780,9 @@ function newMidiManager(take)
     end
     if msg.shape ~= 'bezier' then msg.tension = nil end
 
-    util.add(ccTbl, msg)
+    util.add(ccs, msg)
 
-    return #ccTbl
+    return #ccs
   end
 
 
