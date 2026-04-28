@@ -55,7 +55,7 @@ upper layers, so plain sysex/text events have no public accessors.
 
 **Reconciliation (load-time).** Sidecars don't have a REAPER-side anchor to
 their target the way notation events have to notes, so matching has to handle
-drift. `sr:reconcile` runs four stages, each rebucketing the still-unbound
+drift. The reconcile pass runs four stages, each rebucketing the still-unbound
 sidecars and ccs by a key chosen for that stage's notion of "same" — finer
 early, coarser late. A uuid can't migrate to a different controller, so
 `(msgType, chan, id)` is always part of the key. Bound pairs are spliced
@@ -66,7 +66,7 @@ flagged guess.
 
 1. **Stage 1 — exact.** Bucket by `(msgType, chan, id, ppq, val)` and
    pair off. Catches everything that moved as a unit (glue, item shift).
-   Silent (the bind carries `silent = true`); no event.
+   Silent — bind only, no event and no sidecar rewrite.
 2. **Stage 2 — value-drifted.** Bucket by `(msgType, chan, id, ppq)` and
    pair off; val may differ. Catches an external value-edit that didn't
    move the cc. Emits `valueRebound` with `oldVal`/`newVal`.
@@ -221,7 +221,7 @@ mutates plain sysex/text events.
 Name→code LUTs are declared canonically; the inverse (`chanMsgTypes`,
 `shapeNames`) is derived in a loop so the two directions can't drift.
 `chanMsgLUT` and `BASE36`/`toBase36`/`fromBase36` are hoisted to module
-scope so `newMidiManager` and `newSidecarReconciler` share one source of truth.
+scope so they're shared across helpers without drift.
 
 ---
 
@@ -316,36 +316,10 @@ Pure function of its arguments — no take state touched.
 
 ---
 
-## newSidecarReconciler — sidecar codec + binding
+## Sidecar wire format
 
-A second factory in the same file. Pure over its args; held as a factory
-both for symmetry with `newMidiManager` and so specs can construct one
-without REAPER state.
-
-```
-newSidecarReconciler() -> sr
-sr:encode(cc)          -> 11+-byte body, or nil for unknown msgType
-  cc: { uuid, msgType, chan, [cc | pitch], val }
-  body sans F0/F7 framing — pass straight to MIDI_InsertTextSysexEvt(...
-    type=-1 ...). chan is 1..16; val is signed for pb, 7-bit otherwise.
-sr:decode(body)        -> cc-shaped record, or nil
-  Returns { uuid, msgType, chan, val } plus `cc` for msgType='cc' or
-    `pitch` for msgType='pa'. Same shape encode accepts.
-sr:reconcile(sidecars, ccs)
-  -> { binds = { { sidecar, cc, silent }, ... }, events,
-       unboundSidecars, unboundCcs }
-  binds carry refs into the input arrays — `sidecar` and `cc` are the same
-  tables the caller passed in. Stable until the next mutation of those arrays.
-
-  Bucket by (msgType, chan, id) and run four stages per bucket. `silent` on a
-  bind is true for stage-1 exact matches and false otherwise — non-silent
-  binds need their sidecars rewritten so the next load is stage-1 clean.
-  `events` is one of valueRebound / consensusRebound / guessedRebound /
-  orphaned / ambiguous; see the `ccsReconciled` signal contract above for
-  field shapes. A cc is claimed at most once across binds.
-```
-
-**Wire format.** `}RDM <typeNib> <chan> <id> <val_lo7> <val_hi7> <uuid-base36>`
-where `typeNib` is the chanmsg high nibble (0xA..0xE) and `id` is the
-controller for cc, pitch for pa, 0 for pb/pc/at. REAPER frames with
-`F0`/`F7` on serialise.
+`}RDM <typeNib> <chan> <id> <val_lo7> <val_hi7> <uuid-base36>` where
+`typeNib` is the chanmsg high nibble (0xA..0xE) and `id` is the controller
+for cc, pitch for pa, 0 for pb/pc/at. REAPER frames with `F0`/`F7` on
+serialise. Encode/decode live as private closures inside `newMidiManager`;
+reconcile is a `do`-block in `mm:load`.
