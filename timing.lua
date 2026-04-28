@@ -263,37 +263,13 @@ function M.unapplyFactors(factors, ppq)
   return ppq
 end
 
------ Authoring round-trip
+----- Straight grid
 
--- Authoring stores ppq = round(apply(round(r * ppqPerRow))) for some
--- integer row r. Inverting that round-trip via unapply is ε-lossy: a
--- 0.5-PPQ rounding error in apply-space lands as ε/slope in intent-
--- space, and on steep apply segments (extreme atoms, multi-atom
--- composites) the drift can cross the half-row boundary — so the
--- nearest-row guess from unapply is no longer trustworthy.
---
--- Recover the row by direct round-trip test from a starting hint,
--- walking outward until apply lands further than `tolPPQ` from `ppq`
--- (apply is monotone, so once past tolerance no further r will hit).
--- Returns r on hit, nil if no integer row produces this realised ppq.
-function M.recoverAuthoredRow(apply, ppqPerRow, ppq, hint, tolPPQ)
-  tolPPQ = tolPPQ or 0.5
-  local function tryRow(r) return util.round(apply(util.round(r * ppqPerRow))) end
-  if tryRow(hint) == ppq then return hint end
-  local upDone, downDone = false, false
-  for d = 1, 64 do
-    if not downDone then
-      local p = tryRow(hint - d)
-      if p == ppq then return hint - d end
-      if p < ppq - tolPPQ then downDone = true end
-    end
-    if not upDone then
-      local p = tryRow(hint + d)
-      if p == ppq then return hint + d end
-      if p > ppq + tolPPQ then upDone = true end
-    end
-    if upDone and downDone then return nil end
-  end
+-- ppq width of one straight-grid row at the given (rpb, denom). Pure;
+-- callers pass `resolution` (PPQ per QN). May be fractional under odd
+-- (rpb, denom) combinations.
+function M.straightPPQPerRow(rpb, denom, resolution)
+  return resolution * 4 / (denom * rpb)
 end
 
 ----- Delay <-> PPQ

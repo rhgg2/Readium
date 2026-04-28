@@ -154,97 +154,20 @@ return {
     end,
   },
 
-  ---------- recoverAuthoredRow
+  ---------- straightPPQPerRow
 
   {
-    name = 'recoverAuthoredRow under identity returns the trivial row',
+    name = 'straightPPQPerRow gives 60 PPQ for default rpb=4 / 4/4 / res=240',
     run = function()
-      local apply = function(p) return p end
-      for _, r in ipairs{ 0, 1, 4, 17, 100 } do
-        t.eq(timing.recoverAuthoredRow(apply, 60, r * 60, r), r,
-          'identity row=' .. r)
-      end
+      t.eq(timing.straightPPQPerRow(4, 4, 240), 60)
     end,
   },
 
   {
-    name = 'recoverAuthoredRow recovers on-grid rows under classic-58',
+    name = 'straightPPQPerRow handles non-divisor rpbs (returns float)',
     run = function()
-      local factors = realise(timing.presets['classic-58'], 240)
-      local apply   = function(p) return timing.applyFactors(factors, p) end
-      local unapply = function(p) return timing.unapplyFactors(factors, p) end
-      local ppqPerRow = 60
-      -- Sweep rows; for each, compute the realised ppq the way authoring
-      -- would, then check that recovery returns the original row.
-      for r = 0, 32 do
-        local rp     = util.round(r * ppqPerRow)
-        local stored = util.round(apply(rp))
-        local hint   = util.round(unapply(stored) / ppqPerRow)
-        t.eq(timing.recoverAuthoredRow(apply, ppqPerRow, stored, hint), r,
-          'classic-58 row=' .. r)
-      end
-    end,
-  },
-
-  {
-    name = 'recoverAuthoredRow recovers on-grid rows under an extreme classic',
-    -- The motivating case: at a=0.4 (near max), classic has slope ~0.2 on
-    -- the long half. Inverse amplification of the 0.5-PPQ rounding error
-    -- pushes ppqToRow's nearest-row guess off the authored row, but the
-    -- forward round-trip test stays exact.
-    run = function()
-      local factors = realise({ { atom = 'classic', shift = 0.4, period = 1 } }, 240)
-      local apply   = function(p) return timing.applyFactors(factors, p) end
-      local unapply = function(p) return timing.unapplyFactors(factors, p) end
-      local ppqPerRow = 60
-      for r = 0, 32 do
-        local rp     = util.round(r * ppqPerRow)
-        local stored = util.round(apply(rp))
-        local hint   = util.round(unapply(stored) / ppqPerRow)
-        t.eq(timing.recoverAuthoredRow(apply, ppqPerRow, stored, hint), r,
-          'extreme classic row=' .. r)
-      end
-    end,
-  },
-
-  {
-    name = 'recoverAuthoredRow recovers on-grid rows under multi-atom composites',
-    -- Multi-atom slot, the case the user originally hit. Slopes multiply
-    -- across factors, so individual rows can land on very steep segments
-    -- where the unapply guess is unreliable.
-    run = function()
-      local factors = realise({
-        { atom = 'classic', shift = 0.3, period = 1 },
-        { atom = 'shuffle', shift = 0.2, period = 1 },
-      }, 240)
-      local apply   = function(p) return timing.applyFactors(factors, p) end
-      local unapply = function(p) return timing.unapplyFactors(factors, p) end
-      local ppqPerRow = 60
-      for r = 0, 32 do
-        local rp     = util.round(r * ppqPerRow)
-        local stored = util.round(apply(rp))
-        local hint   = util.round(unapply(stored) / ppqPerRow)
-        t.eq(timing.recoverAuthoredRow(apply, ppqPerRow, stored, hint), r,
-          'multi-atom row=' .. r)
-      end
-    end,
-  },
-
-  {
-    name = 'recoverAuthoredRow returns nil for ppqs not produced by any row',
-    -- Genuine off-grid PPQs (between rows) should not be claimed as
-    -- authored. Pick a value far enough from any apply(rowPPQ) to dodge
-    -- accidental coincidence.
-    run = function()
-      local factors = realise(timing.presets['classic-58'], 240)
-      local apply   = function(p) return timing.applyFactors(factors, p) end
-      local unapply = function(p) return timing.unapplyFactors(factors, p) end
-      local ppqPerRow = 60
-      -- 290 is between rows 4 and 5, ≈14 PPQ from either; well outside
-      -- any rounding from apply.
-      local stored = 290
-      local hint   = util.round(unapply(stored) / ppqPerRow)
-      t.eq(timing.recoverAuthoredRow(apply, ppqPerRow, stored, hint), nil)
+      local v = timing.straightPPQPerRow(7, 4, 240)
+      t.truthy(math.abs(v - 240/7) < 1e-12, 'rpb=7: ' .. tostring(v))
     end,
   },
 }

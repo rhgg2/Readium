@@ -84,14 +84,15 @@ window is `cm:get('pbRange') * 100` per side.
 **Fake pb (detune absorber).** When a col-1 note's `detune` differs
 from prevailing `detune` just before it, a pb must seat at the note
 boundary to absorb the raw step while keeping the logical stream
-unchanged. That pb is tagged `fake=true`, and its host note is tagged
-`fakePb=true`. Fake pbs are hidden from the pb column unless an interp
-shape pulls them into view (`hidden = fakeNote and (shape==nil or
-'step')`), and their identity is always inferable from the co-located
-col-1 note.
+unchanged. That pb is tagged `fake=true` (persisted as cc metadata via
+`mm:assignCC` / `mm:addCC`'s lazy-sidecar path). Fake pbs are hidden
+from the pb column unless an interp shape pulls them into view
+(`hidden = cc.fake and (shape==nil or 'step')`); the host note for
+delay inheritance is just the col-1 note at exactly `cc.ppq` whenever
+`cc.fake` is set.
 
-`markFake` / `unmarkFake` keep the pb's `fake` flag and the owner note's
-`fakePb` flag in sync — never flip one without the other.
+`markFake` / `unmarkFake` toggle the pb's `fake` flag. The host note
+carries no marker — it's recovered geometrically.
 
 ## Intent vs realised frame
 
@@ -257,8 +258,8 @@ rebuild (see `vmOnlyKeys`).
 - **Ppq throughout.** Intent frame at the vm boundary, realised frame
   inside um and toward mm. `timing.delayToPPQ` is the sole converter.
 - **pb.val in cents** inside tm; raw conversion only at load and flush.
-- **Fake pb flags paired.** `pb.fake` ↔ `note.fakePb`; always toggle
-  through `markFake`/`unmarkFake`.
+- **Fake pb flag.** `pb.fake` is the sole marker (persisted as cc
+  metadata); always toggle through `markFake`/`unmarkFake`.
 - **`util.REMOVE`** as a value in `assignEvent` deletes the field
   (passed through to mm).
 - **Location lifetime.** `loc` values are valid only within a single
@@ -339,8 +340,7 @@ tm:swingSnapshot(override)  -> {
 }
 ```
 
-`override` (optional): `{ swing=name, colSwing={[c]=name}, libOverride={[name]=composite} }`.
-Omit to read from cm.
+`override` (optional): `{ swing=name, colSwing={[c]=name} }`. Omit to read from cm.
 
 ### Mutation
 
@@ -361,6 +361,14 @@ Event fields accepted on `addEvent('note', evt)`:
 
 Event fields accepted on `addEvent('pb', evt)`:
 `{ ppq, chan, val (cents), [shape], [tension] }`.
+
+`evt.frame` and `evt.straightPPQ` (and `evt.straightEndPPQ` for
+notes), when supplied by the caller, pass through as sidecar metadata
+at the mm layer. tm itself never inspects or fills them — their
+semantics live entirely in vm. Callers that want a frame on an
+authored event must stamp it themselves before calling `addEvent`.
+Delay nudges shift `ppq` / `endppq` only — `straightPPQ` is
+delay-independent and rides through unchanged.
 
 Update values may include `util.REMOVE` to delete the field.
 

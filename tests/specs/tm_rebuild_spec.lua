@@ -109,7 +109,7 @@ return {
         seed = {
           notes = {
             { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100,
-              detune = 50, delay = 0, fakePb = true },
+              detune = 50, delay = 0 },
           },
           ccs = {
             { ppq = 0, chan = 1, msgType = 'pb', val = rawFor50, fake = true },
@@ -135,7 +135,7 @@ return {
         seed = {
           notes = {
             { ppq = 120, endppq = 360, chan = 1, pitch = 60, vel = 100,
-              detune = 50, delay = 500, fakePb = true },
+              detune = 50, delay = 500 },
           },
           ccs = {
             { ppq = 120, chan = 1, msgType = 'pb', val = rawFor50, fake = true },

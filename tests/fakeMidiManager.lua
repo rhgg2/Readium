@@ -192,6 +192,14 @@ function newMidiManager(opts)
     if not c.muted then c.muted = nil end
     if c.shape ~= 'bezier' then c.tension = nil end
     ccList[#ccList + 1] = c
+    local hasMetadata = false
+    for k in pairs(t) do
+      if not ccEventFields[k] then hasMetadata = true; break end
+    end
+    if hasMetadata then
+      maxUuid = maxUuid + 1
+      c.uuid  = maxUuid
+    end
     return #ccList
   end
 

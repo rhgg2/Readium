@@ -19,14 +19,32 @@ Two responsibilities:
 - **Row ↔ PPQ projection.** `ppqToRow(ppq, chan)` binary-searches
   `rowPPQs`, unapplying channel-relevant swing first; `rowToPPQ` is the
   inverse (floor + swing-apply). Per-chan, because column swings
-  differ. `authoredRow(ppq, chan)` returns the integer row that
-  produced `ppq` via the authoring round-trip, or nil if `ppq` doesn't
-  sit on the grid — see `timing.recoverAuthoredRow`. Used by
-  `vm:rebuild` to flag off-grid cells without false positives under
-  steep-slope swings.
+  differ. `ppqPerRow()` exposes the bound straight-grid row width so
+  callers (e.g. clipboard paste) can compute straightPPQ at the
+  destination row.
 - **Tuning lens.** `noteProjection(evt)` resolves `(pitch, detune)`
   into `(label, gap, halfGap)` under the bound microtuning, or nil if
   none active.
+
+**Row placement and off-grid follow the spec** (`design/archive/swing.md`):
+
+```
+displayRow(e) = round(ppqToRow_c(e.ppq))                  -- under current swing
+offGrid(e)    = rowToPPQ_c(displayRow(e)) ≠ e.ppq
+```
+
+`rowPPQs` is stored as **floats** (`r · ppqPerRow`, no rounding) so
+`rowToPPQ` / `ppqToRow` are mutually exact — a single round happens
+only at realisation. The off-grid test then collapses to a clean
+integer compare, with no ε to tune. A swing slot change correctly
+surfaces previously-on-grid events as off-grid: their realised ppq
+sits at the old grid's swung position, which under the new swing no
+longer matches `rowToPPQ_c(N)`.
+
+`evt.straightPPQ` and `evt.frame` are not consulted by rebuild's row
+placement — they exist for `reswing` (preserve authored row across
+swing changes) and for editing operations that need the unswung row
+position.
 
 ## Ghost sampling
 
@@ -137,30 +155,51 @@ Cursor-axis clamping lives in `ec:clampPos`; viewport follow stays
 vm-side because it touches scrollRow/scrollCol and runs through the
 move hook.
 
-## Frames
+## Frames and straight ppq
 
 Two halves of one mechanism: authoring frames stamped on notes at
 write time, and a view-layer override that pushes a frame onto cm's
 `transient` tier when active.
 
-**Per-note stamp.** Every new note gets `evt.frame = currentFrame(chan)`
-on write — snapshotting the authoring swing + rpb so later reswings
-can undo it. `currentFrame` reads merged cm, so a transient override
-is naturally inherited: notes authored under the override stamp the
-override's frame, not the underlying cfg's.
+**Per-event stamp.** vm (and clipboard, in `editCursor.lua`) set
+`evt.frame = currentFrame(chan)` at every authoring call site before
+handing the event to `tm:addEvent`. tm doesn't know what a frame is —
+it just persists whatever is supplied as sidecar metadata. `currentFrame`
+reads merged cm, so a transient override is naturally inherited:
+events authored under the override stamp the override's frame, not
+the underlying cfg's. PAs are bound to a host note, so the call site
+sets `evt.frame = host.frame` instead.
 
-For events that don't carry a frame of their own (CC / PB / AT / PC /
-PA), `frameOwner(col, e)` inherits one:
+CC / PB / AT / PC frames travel as sidecar metadata at the mm layer
+(the same channel the per-note `uuid → metadata` map uses). On rebuild,
+tm copies `cc.frame` onto the column-level event tables.
 
-- **notes** own themselves;
-- **PA** inherits from the lane-1 note whose pitch and interval
-  contain it;
-- **CC / PB / AT / PC** inherit from the most recent lane-1 note
-  at-or-before their ppq on the same channel.
+**Straight ppq** rides alongside `frame`. Every event with a frame
+carries `straightPPQ` (and `straightEndPPQ` for notes), the canonical
+authoring-grid position pre-swing, pre-delay. The invariant is
 
-Orphans (no lane-1 note / no PA host) return nil and are skipped by
-reswing. Legacy notes without a frame pass identity — `auth=nil` in
-`reswingCore` means no authoring unapply.
+```
+evt.ppq         = round(apply(frame.swing, evt.straightPPQ))
+evt.straightPPQ = r · timing.straightPPQPerRow(frame.rpb, denom, res)   -- r integer ⇔ on-grid
+```
+
+Mutation rules (one rule per kind of edit, exhaustively):
+
+| operation                                | straightPPQ                                                   | frame             |
+| ---------------------------------------- | ------------------------------------------------------------- | ----------------- |
+| snap-to-cursor (off-grid → cursor row)   | `cursorRow · sppr_currentFrame`; end preserves straight delta | restamp `currentFrame` |
+| shift-by-rows (`adjustPosition`, multi)  | `+= rowDelta · sppr_currentFrame`                             | restamp `currentFrame` |
+| quantize (snap to nearest row)           | `newRow · sppr_currentFrame`                                  | restamp `currentFrame` |
+| insert-row / delete-row                  | `± numRows · sppr_currentFrame`                               | restamp `currentFrame` |
+| delay nudge                              | unchanged                                                     | unchanged              |
+| reswing (frame swap)                     | unchanged; realised re-applied                                | restamp `currentFrame` |
+| reswing-preset (composite for `name` changes) | unchanged; realised re-applied                          | unchanged (name kept)  |
+
+Events without a `frame` (e.g. older data) are skipped by
+`reswingCore`: there is no after-the-fact frame inference. They also
+carry no `straightPPQ`; rebuild displays them via `ppqToRow` on the
+realised ppq directly (which, in the absence of swing, is the same as
+straight).
 
 **View-layer override.** `matchGridToCursor` (Ctrl-G) reads the
 authoring frame off the note under the cursor and writes it to cm's
@@ -239,8 +278,10 @@ evt-kind)`:
 - **pb**: decimal signed nibble on `val`, with `-` toggling sign.
 
 An off-grid edit snaps intent time to the cursor row (`snap`); delay
-survives, tm re-realises on assign. Endppq shifts by the same delta
-so straight duration is preserved.
+survives, tm re-realises on assign. The straightPPQ is repinned to
+the cursor row (`row · sppr_currentFrame`) and the frame is restamped
+to current; for notes, straightEndPPQ shifts by the same delta so
+straight duration is preserved exactly.
 
 After any edit, `commit` calls `tm:flush`, advances by `advanceBy`,
 and optionally auditions the new pitch.
@@ -250,7 +291,7 @@ and optionally auditions the new pitch.
 The clipboard lives in a `newClipboard` factory in `editCursor.lua`
 (co-located with ec, since clipboard reads ec's region/eachSelectedCol/
 cursorKind to drive collect and paste). vm constructs it once over
-`{ ec, grid, tm, cm, addNoteEvent, getCtx, getLength }` and exposes it
+`{ ec, grid, tm, cm, currentFrame, getCtx, getLength }` and exposes it
 via `vm:clipboard()`. Public surface: `collect`, `copy`, `paste`,
 `pasteClip(clip)` (paste a given clip without touching ExtState — used
 by `duplicate`), `trimTop(clip, n)`.
@@ -300,20 +341,19 @@ vm exposes paired domain verbs `vm:<base>Selection()` /
 quantizeKeepRealised). The selection-vs-all-with-confirm UX choice
 lives in rm, which dispatches to one or the other.
 
-- **`reswingScope`** — for each event, unapply its owner's authoring
-  frame, apply the current target frame, and restamp notes with the
-  current frame. Two passes (plan, then mutate) so in-flight writes
-  don't disturb later events' reads of their owners' `.frame`.
-  Writes are clamped to take length: when length doesn't sit on a
-  swing-period boundary, apply at the last event can land past it,
-  and any write past length makes REAPER auto-extend the source on
-  MIDI_Sort — which leaks an extra row into the next rebuild.
-- **`reswingPresetChange(name, oldComp, newComp)`** — for every event
-  whose authoring frame references `name`, rebase from `oldComp` to
-  `newComp` using `libOverride` to inline both composites. Independent
-  of the library's current state, so the caller may invoke before or
-  after writing the new composite. No restamp — the name didn't
-  change, only the composite behind it.
+- **`reswingScope`** — for each event, apply the current target swing
+  to the event's stored straightPPQ and restamp the frame to current.
+  Two passes (plan, then mutate) so in-flight writes don't disturb
+  later events. Writes are clamped to take length: when length doesn't
+  sit on a swing-period boundary, apply at the last event can land
+  past it, and any write past length makes REAPER auto-extend the
+  source on MIDI_Sort — which leaks an extra row into the next
+  rebuild.
+- **`reswingPresetChange(name)`** — for every event whose authoring
+  frame references `name`, re-realise from straightPPQ under the new
+  composite. The caller must update the project lib first; the
+  snapshot reads it back via cm. No restamp — the name didn't change,
+  only the composite behind it.
 - **`quantizeScope`** — snap every event to the nearest row under the
   current frame; notes preserve straight length in rows.
 - **`quantizeKeepRealisedScope`** — move the intent onto the grid
@@ -404,13 +444,16 @@ vm then applies three families of `cmgr:wrap`:
   `vm.grid`, `vm:ec()`, `vm:rowPerBar()` etc. each frame, and reads
   pure config (`rowPerBeat`, `currentOctave`, `advanceBy`) directly
   from cm rather than through vm.
-- **Frame stamping is unconditional on note add** via
-  `addNoteEvent` — the single choke point. Never call
-  `tm:addEvent('note', ...)` from vm directly.
+- **Frame + straightPPQ stamping is the view layer's responsibility** —
+  every authoring call site in vm and clipboard sets `evt.frame =
+  currentFrame(chan)` (or `host.frame` for PA) and
+  `evt.straightPPQ = row · sppr_currentFrame` before `tm:addEvent`. tm
+  is frame-agnostic.
 - **Row encoding in the clipboard uses the source column's swing**;
   paste decodes into the destination column's. Round-trip is
   symmetric, not absolute-ppq.
-- **Off-grid writes snap intent** to the cursor row; delay survives.
+- **Off-grid writes snap intent + straightPPQ** to the cursor row;
+  delay survives, frame restamps to current.
 
 ---
 

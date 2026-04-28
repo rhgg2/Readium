@@ -479,7 +479,7 @@ function newClipboard(deps)
   local grid         = deps.grid
   local tm           = deps.tm
   local cm           = deps.cm
-  local addNoteEvent = deps.addNoteEvent
+  local currentFrame = deps.currentFrame
   local getCtx       = deps.getCtx
   local getLength    = deps.getLength
 
@@ -610,8 +610,10 @@ function newClipboard(deps)
         if note and note.endppq > ce.ppq
           and note.ppq ~= ce.ppq then
           tm:addEvent('pa', {
-            ppq = ce.ppq, chan = dstCol.midiChan,
-            pitch = note.pitch, val = util.clamp(ce.val, 1, 127)
+            ppq = ce.ppq, straightPPQ = ce.straightPPQ,
+            chan = dstCol.midiChan,
+            pitch = note.pitch, val = util.clamp(ce.val, 1, 127),
+            frame = note.frame,
           })
         end
       end
@@ -629,15 +631,21 @@ function newClipboard(deps)
     local startPPQ = ctx:rowToPPQ(r, chan)
     local endPPQ = ctx:rowToPPQ(r + clip.numRows, chan)
     local kind = ec:cursorKind()
+    local sppr = ctx:ppqPerRow()
+    local capRow = r + clip.numRows  -- straight-row of endPPQ
 
-    -- Resolve clipboard events to target PPQs, truncating past end
+    -- Resolve clipboard events to target PPQs, truncating past end.
+    -- straightPPQ rides alongside ppq so the destination keeps its
+    -- authoring-row identity in the current take frame.
     local events = {}
     for _, ce in ipairs(clip.events) do
       local ppq = ctx:rowToPPQ(r + ce.row, chan)
       if ppq >= endPPQ then goto nextCe end
-      local e = util.assign({ ppq = ppq }, ce)
+      local e = util.assign({ ppq = ppq, straightPPQ = (r + ce.row) * sppr }, ce)
       if ce.endRow then
-        e.endppq = math.min(ctx:rowToPPQ(r + ce.endRow, chan), endPPQ)
+        local eRow = math.min(r + ce.endRow, capRow)
+        e.endppq         = math.min(ctx:rowToPPQ(r + ce.endRow, chan), endPPQ)
+        e.straightEndPPQ = eRow * sppr
       end
       util.add(events, e)
       ::nextCe::
@@ -669,18 +677,23 @@ function newClipboard(deps)
         tm:deleteEvent(evt.type == 'pa' and 'pa' or 'note', evt)
       end
 
+      local frame = currentFrame(dstCol.midiChan)
+      local capStraightEnd = ctx:ppqToRow(nextNotePPQ, chan) * sppr
       local vi = 1
       for _, ce in ipairs(events) do
         while vi <= #velList and velList[vi].ppq <= ce.ppq do
           currentVel = util.clamp(velList[vi].val, 1, 127)
           vi = vi + 1
         end
-        addNoteEvent {
-          ppq = ce.ppq,
-          endppq = ce.endppq or nextNotePPQ,
+        tm:addEvent('note', {
+          ppq            = ce.ppq,
+          endppq         = ce.endppq         or nextNotePPQ,
+          straightPPQ    = ce.straightPPQ,
+          straightEndPPQ = ce.straightEndPPQ or capStraightEnd,
           chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
           lane = lane,
-        }
+          frame = frame,
+        })
       end
       tm:flush()
       return
@@ -697,8 +710,12 @@ function newClipboard(deps)
         tm:deleteEvent(dstCol.type, evt)
       end
 
+      local frame = currentFrame(dstCol.midiChan)
       for _, ce in ipairs(events) do
-        local add = { ppq = ce.ppq, chan = dstCol.midiChan, val = ce.val }
+        local add = {
+          ppq = ce.ppq, straightPPQ = ce.straightPPQ,
+          chan = dstCol.midiChan, val = ce.val, frame = frame,
+        }
         if dstCol.type == 'cc' then add.cc = dstCol.cc end
         tm:addEvent(dstCol.type, add)
       end
@@ -763,21 +780,25 @@ function newClipboard(deps)
     end
 
     local cRow = ec:row()
+    local sppr = ctx:ppqPerRow()
+    local capRow = cRow + clip.numRows
     for _, clipCol in ipairs(clip.cols) do
       local r = resolve(clipCol)
       if not r then goto nextCol end
       local dst = r.col
       local startPPQ = ctx:rowToPPQ(cRow, r.chan)
-      local endPPQ   = ctx:rowToPPQ(cRow + clip.numRows, r.chan)
+      local endPPQ   = ctx:rowToPPQ(capRow, r.chan)
 
       -- Materialise clip events to target PPQs, sorted.
       local events = {}
       for _, ce in ipairs(clipCol.events) do
         local ppq = ctx:rowToPPQ(cRow + ce.row, r.chan)
         if ppq < endPPQ then
-          local e = util.assign({ ppq = ppq }, ce)
+          local e = util.assign({ ppq = ppq, straightPPQ = (cRow + ce.row) * sppr }, ce)
           if ce.endRow then
-            e.endppq = math.min(ctx:rowToPPQ(cRow + ce.endRow, r.chan), endPPQ)
+            local eRow = math.min(cRow + ce.endRow, capRow)
+            e.endppq         = math.min(ctx:rowToPPQ(cRow + ce.endRow, r.chan), endPPQ)
+            e.straightEndPPQ = eRow * sppr
           end
           util.add(events, e)
         end
@@ -806,24 +827,37 @@ function newClipboard(deps)
       end
 
       -- End cap for pasted notes that lack an explicit endppq.
-      local capPPQ = endPPQ
+      local capPPQ      = endPPQ
+      local capStraight = capRow * sppr
       if r.type == 'note' and dst then
         local nn = util.seek(dst.events, 'at-or-after', endPPQ, util.isNote)
-        if nn then capPPQ = math.min(capPPQ, nn.ppq) end
+        if nn then
+          capPPQ      = math.min(capPPQ, nn.ppq)
+          capStraight = math.min(capStraight, ctx:ppqToRow(nn.ppq, r.chan) * sppr)
+        end
       end
 
       -- Write clip events.
+      local frame = currentFrame(r.chan)
       for _, e in ipairs(events) do
         if r.type == 'note' then
-          addNoteEvent {
+          tm:addEvent('note', {
             ppq = e.ppq, endppq = e.endppq or capPPQ,
+            straightPPQ    = e.straightPPQ,
+            straightEndPPQ = e.straightEndPPQ or capStraight,
             chan = r.chan, pitch = e.pitch, vel = e.vel,
-            lane = r.lane,
-          }
+            lane = r.lane, frame = frame,
+          })
         elseif r.type == 'cc' then
-          tm:addEvent('cc', { ppq = e.ppq, chan = r.chan, cc = r.ccNum, val = e.val })
+          tm:addEvent('cc', {
+            ppq = e.ppq, straightPPQ = e.straightPPQ,
+            chan = r.chan, cc = r.ccNum, val = e.val, frame = frame,
+          })
         else
-          tm:addEvent(r.type, { ppq = e.ppq, chan = r.chan, val = e.val })
+          tm:addEvent(r.type, {
+            ppq = e.ppq, straightPPQ = e.straightPPQ,
+            chan = r.chan, val = e.val, frame = frame,
+          })
         end
       end
       ::nextCol::

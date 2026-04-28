@@ -900,6 +900,18 @@ function newMidiManager(take)
 
     util.add(ccs, msg)
 
+    local hasMetadata = false
+    for k in pairs(t) do
+      if not ccEventFields[k] then hasMetadata = true; break end
+    end
+    if hasMetadata then
+      assignNewUUID(msg)
+      reaper.MIDI_InsertTextSysexEvt(take, false, false, msg.ppq, -1, ccSidecarEncode(msg))
+      local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
+      msg.uuidIdx = sysexCount - 1
+      saveMetadatum(msg.uuid)
+    end
+
     return #ccs
   end
 

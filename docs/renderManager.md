@@ -39,6 +39,13 @@ Visible columns are laid out afresh each frame, starting from
 would overflow `gridWidth`. Everywhere downstream, `col.x == nil`
 is the visibility predicate.
 
+`computeLayout()` runs once per frame between `drawToolbar` and the
+draw routines. It establishes char metrics, viewport dimensions, and
+calls `layoutColumns`, leaving `chanX/chanW/chanOrder/totalWidth` as
+factory locals shared by `drawLaneStrip` and `drawTracker`. `gridHeight`
+already accounts for the lane strip's `laneStrip.rows`, so the tracker
+sees the row count it actually gets to fill.
+
 ## Paint order
 
 `drawTracker` draws back-to-front:
@@ -83,6 +90,32 @@ Colour resolution per cell, outermost-wins:
 
 `pa` events inside note columns render as `··· vv`: velocity shows, the
 note name is dotted out.
+
+## Lane strip
+
+`drawLaneStrip` renders a single horizontal envelope above the tracker
+grid, mirroring its horizontal extent. Time goes left→right (decoupled
+from the tracker's vertical time axis below); the y-axis is value.
+
+The strip displays the column the cursor is currently on if its type is
+`cc`, `pb`, or `at`; otherwise the strip is just a tinted background.
+Anchors are circles at each event's `(ppq, val)`; segments between
+consecutive events follow the shape on the *first* event of the pair —
+`step` paints horizontal-then-vertical, `linear` is a straight line, and
+the curved shapes (`slow`, `fast-start`, `fast-end`, `bezier`) sample
+the curve via `vm:sampleCurve` (which forwards to `tm:interpolate`).
+A held-flat segment extends to each viewport edge so the eye never
+sees an envelope drop to zero outside the data.
+
+Value range:
+
+- `cc` / `at` — `[0, 127]`, bottom-up.
+- `pb` — `[-pbRange*100, +pbRange*100]` cents, axis line at zero.
+
+Strip height is `laneStrip.rows * gridY`; setting `laneStrip.rows = 0`
+suppresses the strip entirely. Colour keys: `colour.laneBg`,
+`colour.laneAxis`, `colour.laneEnvelope`, `colour.laneAnchor`,
+`colour.laneLabel`.
 
 ## Input
 

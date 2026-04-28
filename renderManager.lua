@@ -27,6 +27,31 @@ function newRenderManager(vm, cm, cmgr)
   local gridWidth   = 0
   local gridHeight  = 0
 
+  -- Per-frame layout, populated by computeLayout() before any draw routine
+  -- that needs it. drawLaneStrip and drawTracker both consume these.
+  local chanX, chanW, chanOrder, totalWidth = {}, {}, {}, 0
+
+  -- Pack columns left-to-right starting at scrollCol, fitting as many as
+  -- gridWidth allows; sets col.x on visible cols, clears on the rest.
+  local function layoutColumns(cols, scrollCol)
+    for _, col in ipairs(cols) do col.x = nil end
+    local cX, cW, cOrder = {}, {}, {}
+    local cx = 0
+    for i = scrollCol, #cols do
+      local col = cols[i]
+      if cx + col.width > gridWidth then break end
+      col.x = cx
+      local chan = col.midiChan
+      if cX[chan] == nil then
+        cX[chan] = cx
+        util.add(cOrder, chan)
+      end
+      cW[chan] = (cx + col.width) - cX[chan]
+      cx = cx + col.width + 1
+    end
+    return cX, cW, cOrder, math.max(0, cx - 1)
+  end
+
   local ctx         = nil
   local font        = nil
   local dragging    = false
@@ -194,48 +219,139 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.Separator(ctx)
   end
 
+  -- Establish per-frame layout: char metrics, viewport dimensions, and the
+  -- column packing. Called once after drawToolbar so subsequent draw
+  -- routines (lane strip, tracker) share a single layout snapshot.
+  local function computeLayout()
+    local grid = vm.grid
+    local _, scrollCol = vm:scroll()
+
+    if not gridX then
+      local charW, charH = ImGui.CalcTextSize(ctx, 'W')
+      gridX = 2 * math.ceil(charW / 2) - 1
+      gridY = 2 * math.ceil(charH / 2) - 1
+    end
+
+    local windowWidth, windowHeight = ImGui.GetContentRegionAvail(ctx)
+    gridWidth  = math.max(1, math.floor(windowWidth  / gridX) - GUTTER)
+    -- Lane strip eats a fixed number of rows above the tracker header.
+    local laneRows = cm:get('laneStrip.rows') or 0
+    gridHeight = math.max(1, math.floor(windowHeight / gridY) - HEADER - 1 - laneRows)
+    vm:setGridSize(gridWidth, gridHeight)
+
+    chanX, chanW, chanOrder, totalWidth = layoutColumns(grid.cols, scrollCol)
+  end
+
+  ----- Lane strip
+
+  -- Single horizontal envelope above the grid, mirroring the tracker's
+  -- horizontal extent. Renders the column the cursor is currently on if
+  -- it's a cc/pb/at; blank background otherwise. Time on x, value on y;
+  -- shape (step/linear/curve) honoured between consecutive events.
+  local laneRenderable = { cc = true, pb = true, at = true }
+
+  local function drawLaneStrip()
+    local laneRows = cm:get('laneStrip.rows') or 0
+    if laneRows <= 0 then return end
+
+    local px, py   = ImGui.GetCursorScreenPos(ctx)
+    local x0       = px + GUTTER * gridX
+    local y0       = py
+    local w        = totalWidth * gridX
+    local h        = laneRows  * gridY
+    local drawList = ImGui.GetWindowDrawList(ctx)
+
+    ImGui.DrawList_AddRectFilled(drawList, x0, y0, x0 + w, y0 + h, colour('laneBg'))
+
+    local col = vm.grid.cols[vm:ec():col()]
+    if w > 0 and col and laneRenderable[col.type] and #col.events > 0 then
+      local scrollRow = select(1, vm:scroll())
+      local chan      = col.midiChan
+      local events    = col.events
+      local n         = #events
+
+      local valMin, valMax
+      if col.type == 'pb' then
+        local cents = (cm:get('pbRange') or 2) * 100
+        valMin, valMax = -cents, cents
+      else
+        valMin, valMax = 0, 127
+      end
+
+      local rowSpan = math.max(1, gridHeight)
+      local function rowToX(row) return x0 + (row - scrollRow) / rowSpan * w end
+      local function ppqToX(ppq) return rowToX(vm:ppqToRow(ppq, chan)) end
+      local function valToY(v)
+        local t = util.clamp((v - valMin) / (valMax - valMin), 0, 1)
+        return y0 + h - t * h
+      end
+
+      local axisCol   = colour('laneAxis')
+      local envCol    = colour('laneEnvelope')
+      local anchorCol = colour('laneAnchor')
+
+      local axisY = col.type == 'pb' and valToY(0) or (y0 + h - 0.5)
+      ImGui.DrawList_AddLine(drawList, x0, axisY, x0 + w, axisY, axisCol, 1)
+
+      ImGui.DrawList_PushClipRect(drawList, x0, y0, x0 + w, y0 + h, true)
+
+      -- One sample per pixel column. We work in row-space (vm:ppqToRow is
+      -- exact), and compute a fractional ppq by lerping inside the segment
+      -- only at sample time — vm:rowToPPQ rounds to integer ppq, which
+      -- would plateau the curve when many pixels share an integer ppq.
+      local rowOf = {}
+      for i = 1, n do rowOf[i] = vm:ppqToRow(events[i].ppq, chan) end
+
+      local segIdx = 1
+      local function evalAtRow(row)
+        while segIdx < n and rowOf[segIdx + 1] <= row do
+          segIdx = segIdx + 1
+        end
+        local A, B = events[segIdx], events[segIdx + 1]
+        if not B or row < rowOf[segIdx] then return A.val end
+        local rA, rB = rowOf[segIdx], rowOf[segIdx + 1]
+        local t      = rB > rA and (row - rA) / (rB - rA) or 0
+        local fracP  = A.ppq + t * (B.ppq - A.ppq)
+        return vm:sampleCurve(A, B, fracP) or A.val
+      end
+
+      local pts     = {}
+      local pxLeft  = math.floor(x0)
+      local pxRight = math.ceil(x0 + w)
+      for px = pxLeft, pxRight do
+        local row = scrollRow + (px - x0) / w * rowSpan
+        pts[#pts + 1] = px
+        pts[#pts + 1] = valToY(evalAtRow(row))
+      end
+
+      ImGui.DrawList_AddPolyline(drawList, reaper.new_array(pts), envCol, 0, 1.5)
+
+      for i = 1, n do
+        ImGui.DrawList_AddCircleFilled(drawList, ppqToX(events[i].ppq), valToY(events[i].val), 2.5, anchorCol)
+      end
+
+      ImGui.DrawList_PopClipRect(drawList)
+
+      -- Label in the top-left corner.
+      local label = string.format('Ch%d %s', chan, col.label)
+      if col.type == 'cc' then label = label .. ' ' .. tostring(col.cc) end
+      ImGui.DrawList_AddText(drawList, x0 + 4, y0 + 2, colour('laneLabel'), label)
+    end
+
+    ImGui.Dummy(ctx, (totalWidth + GUTTER) * gridX, h)
+  end
+
   local function drawTracker()
     local grid = vm.grid
     local ec = vm:ec()
     local cursorRow, cursorCol, cursorStop = ec:pos()
     local scrollRow, scrollCol, lastVisCol = vm:scroll()
 
-    if not gridX then
-      local charW, charH = ImGui.CalcTextSize(ctx, 'W')
-      gridX              = 2 * math.ceil(charW / 2) -1
-      gridY              = 2 * math.ceil(charH / 2) -1
-    end
-
     local px, py = ImGui.GetCursorScreenPos(ctx)
     gridOriginX  = px + GUTTER * gridX
     gridOriginY  = py + HEADER * gridY
 
-    local windowWidth, windowHeight = ImGui.GetContentRegionAvail(ctx)
-    gridWidth  = math.max(1, math.floor(windowWidth  / gridX) - GUTTER)
-    gridHeight = math.max(1, math.floor(windowHeight / gridY) - HEADER - 1)
-    vm:setGridSize(gridWidth, gridHeight)
     local numRows = grid.numRows or 0
-
-    -- Clear last frame's layout; then lay out visible columns left-to-right,
-    -- accumulating each channel's x/width as we go.
-    for _, col in ipairs(grid.cols) do col.x = nil end
-    local chanX, chanW, chanOrder = {}, {}, {}
-
-    local cx = 0
-    for i = scrollCol, #grid.cols do
-      local col = grid.cols[i]
-      if cx + col.width > gridWidth then break end
-      col.x = cx
-      local chan = col.midiChan
-      if chanX[chan] == nil then
-        chanX[chan] = cx
-        util.add(chanOrder, chan)
-      end
-      chanW[chan] = (cx + col.width) - chanX[chan]
-      cx = cx + col.width + 1
-    end
-
-    local totalWidth = math.max(0, cx - 1)
     local draw = printer(ctx, gridX, gridY, gridOriginX, gridOriginY)
 
     -- Solo (amber) wins over mute (red): audibility semantic.
@@ -914,10 +1030,9 @@ function newRenderManager(vm, cm, cmgr)
   end
 
   local function swingWrite(composite)
-    local old = util.deepClone(swingRead()) or {}
-    if compositesEqual(old, composite) then return end
+    if compositesEqual(swingRead() or {}, composite) then return end
     vm:setSwingComposite(swingEditor.name, composite)
-    vm:reswingPreset(swingEditor.name, old, composite)
+    vm:reswingPreset(swingEditor.name)
   end
 
   local function patchFactor(i, patch)
@@ -1175,6 +1290,8 @@ function newRenderManager(vm, cm, cmgr)
     if visible then
       if #vm.grid.cols > 0 then
         drawToolbar()
+        computeLayout()
+        drawLaneStrip()
         drawTracker()
         drawStatusBar()
         handleMouse()

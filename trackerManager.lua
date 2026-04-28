@@ -35,9 +35,8 @@ function newTrackerManager(mm, cm)
 
   ----- Swing
 
-  local function resolveSlot(name, libOverride)
-    local composite = libOverride and libOverride[name]
-                   or timing.findShape(name, cm:get('swings'))
+  local function resolveSlot(name)
+    local composite = timing.findShape(name, cm:get('swings'))
     if timing.isIdentity(composite) then return nil end
     local ppqPerQN = mm:resolution()
     local factors = {}
@@ -201,32 +200,34 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    local function forcePb(chan, P)
+    local function forcePb(chan, P, extras)
       if pbAt(chan, P) then return false end
-      addLowlevel('pb', { ppq = P, chan = chan, val = rawAt(chan, P) })
+      addLowlevel('pb', util.assign({ ppq = P, chan = chan, val = rawAt(chan, P) }, extras))
       return true
     end
 
-    local function markFake(n)
-      local pb = pbAt(n.chan, n.ppq)
+    local function markFake(chan, P)
+      local pb = pbAt(chan, P)
       if pb then assignLowlevel('pb', pb, { fake = true }) end
-      assignLowlevel('note', n, { fakePb = true })
     end
 
     local function unmarkFake(chan, P)
       local pb = pbAt(chan, P)
       if not (pb and pb.fake) then return end
       assignLowlevel('pb', pb, { fake = util.REMOVE })
-      local o = owner(chan, P)
-      if o then assignLowlevel('note', o, { fakePb = util.REMOVE }) end
     end
 
     ----- High-level ops
 
     local function addPb(pb)
       local chan, P, L = pb.chan, pb.ppq, pb.val or 0
-      local delta = L - logicalAt(chan, P)
-      if not forcePb(chan, P) then unmarkFake(chan, P) end
+      local delta  = L - logicalAt(chan, P)
+      local extras = util.pick(pb, 'straightPPQ frame')
+      if not next(extras) then extras = nil end
+      if not forcePb(chan, P, extras) then
+        if extras then assignLowlevel('pb', pbAt(chan, P), extras) end
+        unmarkFake(chan, P)
+      end
       retuneLowlevel(chan, P, nextRealChange(chan, P), delta)
     end
 
@@ -236,8 +237,7 @@ function newTrackerManager(mm, cm)
       if detuneAt(chan, P) == detuneBefore(chan, P) then
         deleteLowlevel('pb', pb)
       else
-        local o = owner(chan, P)
-        if o then markFake(o) end
+        if owner(chan, P) then markFake(chan, P) end
       end
     end
 
@@ -245,8 +245,13 @@ function newTrackerManager(mm, cm)
       if update.ppq and update.ppq ~= pb.ppq then
         local chan   = pb.chan
         local newVal = update.val or logicalAt(chan, pb.ppq)
+        -- delete-and-readd is identity-preserving for the pb's stamp;
+        -- carry the existing pb's extras forward, with `update`
+        -- overriding any overlapping fields.
+        local extras = util.assign(util.pick(pb,     'straightPPQ frame'),
+                                   util.pick(update, 'straightPPQ frame'))
         deletePb(pb)
-        addPb({ chan = chan, ppq = update.ppq, val = newVal })
+        addPb(util.assign({ chan = chan, ppq = update.ppq, val = newVal }, extras))
         return
       end
       if update.val then
@@ -264,7 +269,7 @@ function newTrackerManager(mm, cm)
       if lastMuteSet[n.chan] then n.muted = true end
       if n.lane == 1 then
         local C = detuneAt(n.chan, n.ppq)
-        if D ~= C and forcePb(n.chan, n.ppq) then markFake(n) end
+        if D ~= C and forcePb(n.chan, n.ppq) then markFake(n.chan, n.ppq) end
         retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D - C)
       end
       addLowlevel('note', util.assign(n, { detune = D }))
@@ -316,7 +321,6 @@ function newTrackerManager(mm, cm)
 
       if oldPb and oldPb.fake then
         deleteLowlevel('pb', oldPb)
-        assignLowlevel('note', n, { fakePb = util.REMOVE })
       end
       retuneLowlevel(n.chan, oldPpq, NP1, C1 - D)
 
@@ -325,7 +329,7 @@ function newTrackerManager(mm, cm)
       if L ~= logicalBefore(n.chan, P1) then
         forcePb(n.chan, P1)
       elseif D ~= C2 and forcePb(n.chan, P1) then
-        markFake(n)
+        markFake(n.chan, P1)
       end
       retuneLowlevel(n.chan, P1, nextNotePPQ(n.chan, P1), D - C2)
     end
@@ -342,16 +346,13 @@ function newTrackerManager(mm, cm)
         forEachAttachedPA(n, function(e) assignLowlevel('pa', e, { pitch = update.pitch }) end)
       end
       if n.lane == 1 and update.detune ~= nil and update.detune ~= n.detune then
-        if forcePb(n.chan, n.ppq) then markFake(n) end
+        if forcePb(n.chan, n.ppq) then markFake(n.chan, n.ppq) end
         retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), update.detune - n.detune)
         -- Boundary became redundant (detune matches prior, no raw step) — drop it.
         if update.detune == detuneBefore(n.chan, n.ppq)
            and rawAt(n.chan, n.ppq) == rawBefore(n.chan, n.ppq) then
           local pb = pbAt(n.chan, n.ppq)
-          if pb then
-            deleteLowlevel('pb', pb)
-            if n.fakePb then assignLowlevel('note', n, { fakePb = util.REMOVE }) end
-          end
+          if pb then deleteLowlevel('pb', pb) end
         end
       end
       if next(update) then assignLowlevel('note', n, update) end
@@ -507,8 +508,8 @@ function newTrackerManager(mm, cm)
       for loc, cc in mm:ccs() do
         local evt
         if cc.msgType == 'pb' then
-          evt = { ppq = cc.ppq, chan = cc.chan, val = rawToCents(cc.val), loc = loc,
-                  shape = cc.shape, tension = cc.tension }
+          evt = util.pick(cc, 'ppq straightPPQ chan shape tension fake frame',
+                          { val = rawToCents(cc.val), loc = loc })
           util.add(chans[evt.chan].pbs, evt)
         else
           evt = util.assign(cc, { loc = loc })
@@ -522,10 +523,6 @@ function newTrackerManager(mm, cm)
         notesByLoc[loc] = evt
         if n.lane == 1 then
           util.add(chans[n.chan].notes, evt)
-          if n.fakePb then
-            local pb = pbAt(n.chan, n.ppq)
-            if pb then pb.fake = true end
-          end
         end
       end
       for i = 1, 16 do sortByPPQ(chans[i].notes) end
@@ -658,52 +655,45 @@ function newTrackerManager(mm, cm)
         local channel = channels[cc.chan]
 
         if cc.msgType == 'pb' then
-          -- One scan over col-1 resolves both detune context (latest note
-          -- at-or-before cc.ppq) and fakePb host (note exactly at cc.ppq).
-          local col1      = channel.columns.notes[1]
-          local notes     = (col1 and col1.events) or {}
-          local fakeNote, prevailing
-          for _, n in ipairs(notes) do
-            if n.ppq == cc.ppq and n.fakePb then fakeNote = n end
-            if n.ppq <= cc.ppq and (not prevailing or n.ppq > prevailing.ppq) then
-              prevailing = n
-            end
-          end
-          local detune = (prevailing and prevailing.detune) or 0
-          local hidden = fakeNote and (cc.shape == nil or cc.shape == 'step')
+          -- Prevailing col-1 note at-or-before cc.ppq supplies detune
+          -- context; if it sits exactly at cc.ppq and cc.fake is set, it
+          -- is also the host that lends its delay.
+          local col1       = channel.columns.notes[1]
+          local prevailing = col1 and util.seek(col1.events, 'at-or-before', cc.ppq) or nil
+          local detune     = (prevailing and prevailing.detune) or 0
+          local hostNote   = (cc.fake and prevailing and prevailing.ppq == cc.ppq) and prevailing or nil
+          local hidden     = cc.fake and (cc.shape == nil or cc.shape == 'step')
 
           local pb = pbByChan[cc.chan] or { events = {}, anyVisible = false }
           pbByChan[cc.chan] = pb
           pb.anyVisible = pb.anyVisible or not hidden
-          util.add(pb.events, {
-            loc     = loc,
-            ppq     = cc.ppq,
-            val     = util.round(rawToCents(cc.val) - detune),
-            detune  = detune,
-            hidden  = hidden,
-            shape   = cc.shape,
-            tension = cc.tension,
-            -- fake pbs inherit host delay so tidyCol shifts both into intent together
-            delay   = fakeNote and fakeNote.delay or nil,
-          })
+          -- fake pbs inherit host delay so tidyCol shifts both into intent together
+          util.add(pb.events, util.pick(cc, 'ppq straightPPQ shape tension frame', {
+            loc    = loc,
+            val    = util.round(rawToCents(cc.val) - detune),
+            detune = detune,
+            hidden = hidden,
+            delay  = hostNote and hostNote.delay or nil,
+          }))
 
         elseif cc.msgType == 'pa' then
           local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
           if noteCol then
-            util.add(noteCol.events, {
-              ppq = cc.ppq, type = 'pa', pitch = cc.pitch, vel = cc.val, loc = loc
-            })
+            util.add(noteCol.events, util.pick(cc, 'ppq straightPPQ pitch frame', {
+              type = 'pa', vel = cc.val, loc = loc,
+            }))
           end
 
-        elseif cc.msgType == 'cc' then
-          local col = channel.columns.ccs[cc.cc] or { cc = cc.cc, events = {} }
-          channel.columns.ccs[cc.cc] = col
-          util.add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
-
-        elseif cc.msgType == 'at' or cc.msgType == 'pc' then
-          local col = channel.columns[cc.msgType] or { events = {} }
-          channel.columns[cc.msgType] = col
-          util.add(col.events, { ppq = cc.ppq, val = cc.val, loc = loc, shape = cc.shape, tension = cc.tension })
+        elseif cc.msgType == 'cc' or cc.msgType == 'at' or cc.msgType == 'pc' then
+          local col
+          if cc.msgType == 'cc' then
+            col = channel.columns.ccs[cc.cc] or { cc = cc.cc, events = {} }
+            channel.columns.ccs[cc.cc] = col
+          else
+            col = channel.columns[cc.msgType] or { events = {} }
+            channel.columns[cc.msgType] = col
+          end
+          util.add(col.events, util.pick(cc, 'ppq straightPPQ val shape tension frame', { loc = loc }))
         end
       end
 
@@ -808,13 +798,13 @@ function newTrackerManager(mm, cm)
   function tm:swingSnapshot(override)
     local global, column = nil, {}
     if mm then
-      local gSrc, cSrc, libO
-      if override then gSrc, cSrc, libO = override.swing, override.colSwing, override.libOverride
-      else             gSrc, cSrc       = cm:get('swing'), cm:get('colSwing')
+      local gSrc, cSrc
+      if override then gSrc, cSrc = override.swing, override.colSwing
+      else             gSrc, cSrc = cm:get('swing'), cm:get('colSwing')
       end
-      global = resolveSlot(gSrc, libO)
+      global = resolveSlot(gSrc)
       if cSrc then
-        for chan, name in pairs(cSrc) do column[chan] = resolveSlot(name, libO) end
+        for chan, name in pairs(cSrc) do column[chan] = resolveSlot(name) end
       end
     end
     return {

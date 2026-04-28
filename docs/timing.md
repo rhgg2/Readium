@@ -183,20 +183,18 @@ timing.ppqToDelay(p, res)        -- inverse (float)
 
 `res` is PPQ per quarter note (typically from `mm:resolution()`).
 
-### Authoring round-trip
+### Straight grid
 
 ```
-timing.recoverAuthoredRow(apply, ppqPerRow, ppq, hint, tolPPQ?)
-                                 -- integer r if round(apply(round(r*ppqPerRow))) == ppq,
-                                 --   else nil. tolPPQ defaults to 0.5.
+timing.straightPPQPerRow(rpb, denom, resolution)   -- ppq width of one straight-grid row
 ```
 
-Authoring stores `ppq = round(apply(round(r * ppqPerRow)))` for some
-integer row `r`. Inverting via `unapply` is ε-lossy: a 0.5-PPQ rounding
-error in apply-space becomes ε/slope in intent-space, and on steep
-segments (extreme atoms, multi-atom composites) the drift can cross the
-half-row boundary — so the nearest-row guess from unapply isn't
-trustworthy for the on-grid test. `recoverAuthoredRow` searches outward
-from `hint` until apply lands further than `tolPPQ` from `ppq`
-(monotonicity gives an exact early-out), and returns the row only on a
-forward-roundtrip hit. Callers typically pass `hint = round(unapply(ppq) / ppqPerRow)`.
+Pure: `resolution * 4 / (denom * rpb)`. May be fractional under odd
+`(rpb, denom)` combinations; callers store the result as a float and
+compare with a small ε when checking row alignment.
+
+The straight grid is the canonical authoring frame: a row at index `r`
+sits at `r · straightPPQPerRow(rpb, denom, res)` PPQ. Swing realisation
+applies on top — `apply(swing, straight)` produces the realised intent
+ppq, and `delayToPPQ(delay)` shifts further into the realised+delay
+frame stored by REAPER.

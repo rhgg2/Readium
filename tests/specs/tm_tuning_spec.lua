@@ -3,7 +3,7 @@
 --   - a col-1 note with non-zero detune seats a "fake" pb absorbing the step.
 --   - clearing detune back to prevailing cleans up the fake pb.
 --   - at every seat P: logicalAt(P) = rawAt(P) - detuneAt(P), and a fake
---     pb carries `fake=true` while its host note carries `fakePb=true`.
+--     pb carries `fake=true` (persisted as cc metadata).
 
 local t = require('support')
 
@@ -39,7 +39,6 @@ return {
       local n = findNote(dump, 60)
       t.truthy(n, 'note persisted')
       t.eq(n.detune, 50, 'detune preserved on the note')
-      t.eq(n.fakePb, true, 'note tagged with fakePb')
 
       local pbs = pbsAt(dump, 0)
       t.eq(#pbs, 1, 'exactly one pb seated at ppq=0')
@@ -70,7 +69,7 @@ return {
   },
 
   {
-    name = 'clearing detune back to 0 removes the fake pb and the fakePb tag',
+    name = 'clearing detune back to 0 removes the fake pb',
     run = function(harness)
       local h = harness.mk()
       h.tm:addEvent('note', {
@@ -89,7 +88,6 @@ return {
 
       local n = findNote(dump, 60)
       t.eq(n.detune, 0, 'detune zeroed')
-      t.falsy(n.fakePb, 'fakePb tag removed')
     end,
   },
 
@@ -117,6 +115,29 @@ return {
       t.eq(at240[1].val, cents2raw(-30), 'second seat carries -30 cents raw')
       t.eq(at0[1].fake,   true)
       t.eq(at240[1].fake, true)
+    end,
+  },
+
+  {
+    name = 'pb.fake survives a rebuild (persisted as cc metadata)',
+    run = function(harness)
+      local h = harness.mk()
+      h.tm:addEvent('note', {
+        ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100,
+        detune = 50, delay = 0, lane = 1,
+      })
+      h.tm:flush()
+
+      -- Confirm the seated pb has metadata (uuid) and fake=true after flush.
+      local pbs = pbsAt(h.fm:dump(), 0)
+      t.eq(#pbs, 1, 'pb seated')
+      t.eq(pbs[1].fake, true, 'fake flag persisted on cc')
+      t.truthy(pbs[1].uuid, 'cc has a uuid (metadata sidecar allocated)')
+
+      -- A rebuild reads from mm and must reconstruct the in-memory fake flag.
+      h.tm:rebuild()
+      local ch = h.tm:getChannel(1)
+      t.falsy(ch.columns.pb, 'pb column still hidden after rebuild (fake-only)')
     end,
   },
 
@@ -162,15 +183,12 @@ return {
       t.eq(#pbs, 1, 'still a single pb at the seat')
       t.falsy(pbs[1].fake, 'existing real pb stays real')
 
-      local n = findNote(dump, 60)
-      t.falsy(n.fakePb, 'note not marked as having a fake pb')
-
       -- Logical pb (raw - detune) should read as the originally-authored 100
       -- plus the delta introduced by the new note's detune above prior (0).
       -- That is: raw was 100¢ → 25¢ delta added → new raw is 125¢.
       t.eq(pbs[1].val, cents2raw(125),
         'raw advanced by detune delta so logical is preserved')
-      t.eq(n.detune, 25)
+      t.eq(findNote(dump, 60).detune, 25)
     end,
   },
 }

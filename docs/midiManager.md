@@ -130,6 +130,11 @@ A structural assignCC on a uuid'd cc also rewrites the sidecar's position and
 fingerprint bytes so the next load is stage-1 clean. `deleteCC` removes the
 sidecar alongside the event.
 
+`addCC(t)` mirrors the lazy-sidecar pattern: if `t` carries any non-structural
+key it allocates a uuid + inserts a sidecar in the same shot. Plain ccs
+(no metadata) skip the allocation entirely. Symmetric with `addNote`'s
+unconditional uuid, but lazy — most ccs never need one.
+
 ## Signals
 
 mm fires up to six kinds of signal per `load`. Subscribers register per

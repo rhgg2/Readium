@@ -214,32 +214,33 @@ return {
   },
 
   {
-    -- Regression: under multi-atom / extreme composites, ε amplification
-    -- through unapply pushed ppqToRow off the authored row, and fresh
-    -- on-grid notes lit up the off-grid colour. vm:rebuild now invokes
-    -- ctx:authoredRow which round-trips against the apply, so on-grid
-    -- notes stay on their row regardless of slope.
-    name = 'extreme swing: a fresh on-grid note lands on its authored row, no off-grid flag',
+    -- Spec (design/archive/swing.md): displayRow(e) = round(ppqToRow_c(e.ppq))
+    -- under current swing; on-grid iff rowToPPQ_c reproduces e.ppq exactly.
+    -- With float rowPPQs the round-trip is bit-exact even for extreme
+    -- multi-atom composites, so a note authored under the active swing
+    -- lands on its row with no off-grid flag.
+    name = 'extreme swing: a note authored under the current swing lands on its row, no off-grid flag',
     run = function(harness)
       local extreme = {
         { atom = 'classic', shift = 0.3, period = 1 },
         { atom = 'shuffle', shift = 0.2, period = 1 },
       }
-      -- Build the realised ppq for row 5 the way authoring does:
-      -- rowPPQ = round(r * ppqPerRow) → round(apply(rowPPQ)).
       local factors = {}
       for i, f in ipairs(extreme) do
         local Tqn = timing.atomTilePeriod(f)
         factors[i] = { S = timing.atoms[f.atom](f.shift / Tqn), T = Tqn * 240 }
       end
-      local rowPPQ   = util.round(5 * 60)   -- ppqPerRow=60 at default rpb=4
+      local rowPPQ   = 5 * 60   -- ppqPerRow=60 at rpb=4
       local realised = util.round(timing.applyFactors(factors, rowPPQ))
       t.truthy(realised ~= rowPPQ,
         'sanity: extreme swing actually deflects row 5 (got ' .. realised .. ')')
 
       local h = harness.mk{
         seed = {
-          notes = { { ppq = realised, endppq = realised + 60, chan = 1, pitch = 60, vel = 100 } },
+          notes = {
+            { ppq = realised, endppq = realised + 60,
+              chan = 1, pitch = 60, vel = 100 },
+          },
         },
         config = {
           project = { swings = { ['x'] = extreme } },
@@ -249,6 +250,119 @@ return {
       local col = h.vm.grid.cols[1]
       t.truthy(col.cells[5],     'note placed on row 5')
       t.eq(col.offGrid[5], nil,  'note not flagged off-grid')
+    end,
+  },
+
+  {
+    -- Bug 1: notes added with swing off then swing-on must surface as
+    -- off-grid — their realised ppq sits at the straight-grid position,
+    -- which under the new swing no longer lands on rowToPPQ_c(N).
+    name = 'swing change: notes authored under swing-off are off-grid under a non-trivial swing',
+    run = function(harness)
+      -- Seed each note as the user would have authored it with swing off:
+      -- frame.swing = nil, straightPPQ pins the row. Under c58 the realised
+      -- ppq remains at the unswung position, no longer on the swung grid.
+      local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
+      local nilFrame = { swing = nil, colSwing = nil, rpb = 4 }
+      local h = harness.mk{
+        seed = {
+          notes = {
+            -- ppqPerRow = 60 at rpb=4. Rows 0, 1, 2, 4 placed with no swing.
+            { ppq = 0,   endppq = 60,  straightPPQ = 0,   straightEndPPQ = 60,
+              chan = 1, pitch = 60, vel = 100, frame = nilFrame },
+            { ppq = 60,  endppq = 120, straightPPQ = 60,  straightEndPPQ = 120,
+              chan = 1, pitch = 62, vel = 100, frame = nilFrame },
+            { ppq = 120, endppq = 180, straightPPQ = 120, straightEndPPQ = 180,
+              chan = 1, pitch = 64, vel = 100, frame = nilFrame },
+            { ppq = 240, endppq = 300, straightPPQ = 240, straightEndPPQ = 300,
+              chan = 1, pitch = 67, vel = 100, frame = nilFrame },
+          },
+        },
+        config = {
+          project = { swings = { c58 = c58 } },
+          take    = { swing = 'c58', rowPerBeat = 4 },
+        },
+      }
+      local col = h.vm.grid.cols[1]
+      -- Period boundaries (rows 0, 4) are fixed points of c58 → on-grid.
+      t.truthy(col.cells[0], 'row 0 cell present')
+      t.eq(col.offGrid[0], nil, 'row 0 (period boundary) on-grid')
+      t.truthy(col.cells[4], 'row 4 cell present')
+      t.eq(col.offGrid[4], nil, 'row 4 (period boundary) on-grid')
+      -- Off-fixed-point rows: realised ppq doesn't sit on the new grid.
+      t.truthy(col.cells[1], 'row 1 cell present')
+      t.truthy(col.offGrid[1], 'row 1 flagged off-grid under c58')
+      t.truthy(col.cells[2], 'row 2 cell present')
+      t.truthy(col.offGrid[2], 'row 2 flagged off-grid under c58')
+    end,
+  },
+
+  {
+    -- Bug 2: a fresh PB authored at a row under non-trivial swing must
+    -- land on-grid. Regression guard for addPb dropping straightPPQ/frame.
+    name = 'fresh PB authored under swing lands on-grid (no off-grid flag, regardless of period position)',
+    run = function(harness)
+      local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
+      local h = harness.mk{
+        seed = {
+          ccs = { { ppq = 0, chan = 1, msgType = 'pb', val = 0 } },
+        },
+        config = {
+          project = { swings = { c58 = c58 } },
+          take    = { swing = 'c58', rowPerBeat = 4, currentOctave = 4 },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+
+      local pbColIdx
+      for i, c in ipairs(h.vm.grid.cols) do
+        if c.type == 'pb' and c.midiChan == 1 then pbColIdx = i end
+      end
+      t.truthy(pbColIdx, 'pb column present')
+
+      -- Author a non-zero pb at row 2 (off the period boundary under c58).
+      h.ec:setPos(2, pbColIdx, 1)
+      h.vm:editEvent(h.vm.grid.cols[pbColIdx], nil, 1, string.byte('5'), false)
+
+      local pbCol = h.vm.grid.cols[pbColIdx]
+      t.truthy(pbCol.cells[2],     'fresh pb landed on row 2')
+      t.eq(pbCol.offGrid[2], nil,  'fresh pb not flagged off-grid')
+    end,
+  },
+
+  {
+    -- Underlying mechanism for bug 2: fresh PBs must retain straightPPQ
+    -- and frame through addPb, otherwise reswing has nothing to invert.
+    name = 'fresh PB carries straightPPQ + frame after authoring',
+    run = function(harness)
+      local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
+      local h = harness.mk{
+        seed = {
+          ccs = { { ppq = 0, chan = 1, msgType = 'pb', val = 0 } },
+        },
+        config = {
+          project = { swings = { c58 = c58 } },
+          take    = { swing = 'c58', rowPerBeat = 4, currentOctave = 4 },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+
+      local pbColIdx
+      for i, c in ipairs(h.vm.grid.cols) do
+        if c.type == 'pb' and c.midiChan == 1 then pbColIdx = i end
+      end
+      h.ec:setPos(2, pbColIdx, 1)
+      h.vm:editEvent(h.vm.grid.cols[pbColIdx], nil, 1, string.byte('5'), false)
+
+      local fresh
+      for _, c in ipairs(h.fm:dump().ccs) do
+        if c.msgType == 'pb' and c.ppq ~= 0 then fresh = c end
+      end
+      t.truthy(fresh,                'fresh pb landed in mm dump')
+      t.truthy(fresh.frame,          'fresh pb carries frame')
+      t.eq(fresh.frame.swing, 'c58', 'frame.swing matches cm')
+      t.eq(fresh.frame.rpb,   4,     'frame.rpb matches cm')
+      t.eq(fresh.straightPPQ, 120,   'straightPPQ pins authoring row 2 (60·2)')
     end,
   },
 }

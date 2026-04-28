@@ -70,17 +70,8 @@ function newViewContext(args)
 
   function ctx:snapRow(ppq, chan) return util.round(self:ppqToRow(ppq, chan)) end
 
-  -- Did `ppq` come from authoring on an integer row in this frame?
-  -- Returns the row if so, nil otherwise. Sidesteps the ε amplification
-  -- that knocks ppqToRow off-row under steep apply slopes (extreme
-  -- atoms, multi-atom composites): the inverse-via-unapply guess is
-  -- noisy but the forward round-trip test is exact.
-  function ctx:authoredRow(ppq, chan)
-    local hint = util.round(swing.unapply(chan, ppq) / ppqPerRow)
-    return timing.recoverAuthoredRow(
-      function(p) return swing.apply(chan, p) end,
-      ppqPerRow, ppq, hint)
-  end
+  -- Straight-grid ppq width of one row in this rebuild's frame.
+  function ctx:ppqPerRow() return ppqPerRow end
 
   do -- exports ctx:rowBeatInfo, ctx:barBeatSub
     local function timeSigAt(ppq)
@@ -200,6 +191,18 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Frames & timing
 
+  -- Straight-grid ppq width of one row at the given rpb. Take-wide
+  -- denom comes off timeSigs[1]; resolution is constant per take.
+  local function straightPPQPerRowFor(rpb)
+    local denom = (timeSigs[1] and timeSigs[1].denom) or 4
+    return timing.straightPPQPerRow(rpb, denom, resolution)
+  end
+
+  -- Read straight ppq off an event, falling back to ppq for events
+  -- with no authored frame (legacy / raw-imported MIDI).
+  local function straightOf(e)    return e.straightPPQ    or e.ppq    end
+  local function straightEndOf(e) return e.straightEndPPQ or e.endppq end
+
   -- An authoring frame comprises swing slot, per-column swing map,
   -- and rowPerBeat.
   local isFrameChange, currentFrame, releaseTransientFrame do
@@ -238,6 +241,29 @@ function newViewManager(tm, cm, cmgr)
         vm:rebuild(false)
       end
       return true
+    end
+  end
+
+  -- Frame + its row scale for the current channel.
+  local function frameAndSppr(chan)
+    local f = currentFrame(chan)
+    return f, straightPPQPerRowFor(f.rpb)
+  end
+
+  -- Row-aligned authoring stamp. Returns `at(rowS, rowE?)` which
+  -- produces the canonical (ppq, [endppq,] straightPPQ,
+  -- [straightEndPPQ,] frame) payload. Pass rowE for span events (notes).
+  local function stamping(chan)
+    local f, sppr = frameAndSppr(chan)
+    return function(rowS, rowE)
+      local s = { ppq         = ctx:rowToPPQ(rowS, chan),
+                  straightPPQ = rowS * sppr,
+                  frame       = f }
+      if rowE then
+        s.endppq         = ctx:rowToPPQ(rowE, chan)
+        s.straightEndPPQ = rowE * sppr
+      end
+      return s
     end
   end
 
@@ -417,7 +443,7 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Editing
 
-  local addNoteEvent do
+  do
     local hexDigit = {}
     for i = 0, 9 do hexDigit[string.byte(tostring(i))] = i end
     for i = 0, 5 do
@@ -425,21 +451,25 @@ function newViewManager(tm, cm, cmgr)
       hexDigit[string.byte('A') + i] = 10 + i
     end
 
-    function addNoteEvent(update)
-      update.frame = currentFrame(update.chan)
-      tm:addEvent('note', update)
-    end
-
+    -- Caller has already pinned (ppq, straightPPQ, frame) onto `update`.
+    -- Endppq stretches to the next note start (or take length); the
+    -- straight end derives from that intent ppq via the row map under
+    -- the new note's own frame.
     local function placeNewNote(col, update)
       local last = util.seek(col.events, 'before', update.ppq, util.isNote)
       local next = util.seek(col.events, 'after',  update.ppq, util.isNote)
       if last and last.endppq >= update.ppq then
-        tm:assignEvent('note', last, { endppq = update.ppq })
+        tm:assignEvent('note', last, {
+          endppq         = update.ppq,
+          straightEndPPQ = update.straightPPQ,
+        })
       end
-      update.vel    = last and last.vel or cm:get('defaultVelocity')
-      update.endppq = next and next.ppq or length
-      update.lane   = col.lane
-      addNoteEvent(update)
+      update.vel             = last and last.vel or cm:get('defaultVelocity')
+      update.endppq          = next and next.ppq or length
+      update.straightEndPPQ  = ctx:ppqToRow(update.endppq, update.chan)
+                               * straightPPQPerRowFor(update.frame.rpb)
+      update.lane            = col.lane
+      tm:addEvent('note', update)
     end
 
     local function notePAEvents(col, pitch, startPPQ, endPPQ)
@@ -455,8 +485,11 @@ function newViewManager(tm, cm, cmgr)
 
     function vm:editEvent(col, evt, stop, char, half)
       if not col then return end
-      local type = col.type
+      local type      = col.type
+      local frameNow  = currentFrame(col.midiChan)
+      local spprNow   = straightPPQPerRowFor(frameNow.rpb)
       local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
+      local cursorSPPQ = ec:row() * spprNow
 
       local function commit(auditionPitch, auditionVel)
         tm:flush()
@@ -465,11 +498,19 @@ function newViewManager(tm, cm, cmgr)
         if auditionPitch then audition(auditionPitch, auditionVel or 100, col.midiChan) end
       end
 
-      -- Off-grid write snaps intent to the cursor row
+      -- Off-grid write snaps intent to the cursor row, restamps the
+      -- frame, and preserves straight duration. Endppq derives from
+      -- the new straight end via the row map so the realised tail
+      -- lines up with the displayed one.
       local function snap(update)
         if not evt or evt.ppq == cursorPPQ then return update end
-        update.ppq = cursorPPQ
-        if evt.endppq then update.endppq = cursorPPQ + (evt.endppq - evt.ppq) end
+        update.ppq         = cursorPPQ
+        update.straightPPQ = cursorSPPQ
+        update.frame       = frameNow
+        if evt.endppq then
+          update.straightEndPPQ = cursorSPPQ + (straightEndOf(evt) - straightOf(evt))
+          update.endppq         = ctx:rowToPPQ(update.straightEndPPQ / spprNow, col.midiChan)
+        end
         return update
       end
 
@@ -501,7 +542,11 @@ function newViewManager(tm, cm, cmgr)
             end
           end
 
-          local new = { pitch = pitch, detune = detune, ppq = cursorPPQ, chan = col.midiChan }
+          local new = {
+            pitch = pitch, detune = detune,
+            ppq = cursorPPQ, straightPPQ = cursorSPPQ,
+            chan = col.midiChan, frame = frameNow,
+          }
           placeNewNote(col, new)
           return commit(pitch, new.vel)
 
@@ -561,9 +606,15 @@ function newViewManager(tm, cm, cmgr)
             local note = util.seek(col.events, 'before', cursorPPQ, util.isNote)
             if note and note.endppq > cursorPPQ then
               local val = newVel(0)
+              -- PA inherits host's frame so reswing moves PA with host.
+              -- Straight ppq is the cursor's straight position in current
+              -- frame; under the common case host.frame.rpb == frameNow.rpb
+              -- this is exact, otherwise it's a benign approximation.
               tm:addEvent('pa', {
-                ppq = cursorPPQ, chan = col.midiChan,
-                pitch = note.pitch, val = val
+                ppq = cursorPPQ, straightPPQ = cursorSPPQ,
+                chan = col.midiChan,
+                pitch = note.pitch, val = val,
+                frame = note.frame,
               })
               return commit()
             end
@@ -596,7 +647,10 @@ function newViewManager(tm, cm, cmgr)
         tm:assignEvent(type, evt, snap(update))
       else
         if type == 'cc' then util.assign(update, { cc = col.cc }) end
-        util.assign(update, { ppq = cursorPPQ, chan = col.midiChan })
+        util.assign(update, {
+          ppq = cursorPPQ, straightPPQ = cursorSPPQ,
+          chan = col.midiChan, frame = frameNow,
+        })
         tm:addEvent(type, update)
       end
       commit()
@@ -682,14 +736,26 @@ function newViewManager(tm, cm, cmgr)
     end
 
     local function applyNoteOff(col, last, targetPPQ, undo)
+      local sppr = ctx:ppqPerRow()
+      local function endStraight(ppq)
+        return ctx:ppqToRow(ppq, col.midiChan) * sppr
+      end
       if undo then
         local next = util.seek(col.events, 'at-or-after', targetPPQ, util.isNote)
-        tm:assignEvent('note', last, { endppq = next and next.ppq or length })
+        local newEnd = next and next.ppq or length
+        tm:assignEvent('note', last, {
+          endppq         = newEnd,
+          straightEndPPQ = next and next.straightPPQ or endStraight(newEnd),
+        })
       elseif last.ppq >= targetPPQ then
         tm:deleteEvent('note', last)
       else
         local _, maxEnd = overlapBounds(col, last.ppq, last, true)
-        tm:assignEvent('note', last, { endppq = util.clamp(targetPPQ, last.ppq + 1, maxEnd) })
+        local newEnd    = util.clamp(targetPPQ, last.ppq + 1, maxEnd)
+        tm:assignEvent('note', last, {
+          endppq         = newEnd,
+          straightEndPPQ = endStraight(newEnd),
+        })
       end
     end
 
@@ -737,7 +803,10 @@ function newViewManager(tm, cm, cmgr)
       local minPPQ = math.min(note.endppq, ctx:rowToPPQ(ctx:snapRow(note.ppq, chan) + 1, chan))
       local _, maxPPQ = overlapBounds(col, note.ppq, note, true)
       local newPPQ = util.clamp(ctx:rowToPPQ(newRow, chan), minPPQ, maxPPQ)
-      tm:assignEvent('note', note, { endppq = newPPQ })
+      tm:assignEvent('note', note, {
+        endppq         = newPPQ,
+        straightEndPPQ = ctx:ppqToRow(newPPQ, chan) * ctx:ppqPerRow(),
+      })
     end
 
     function adjustDuration(rowDelta)
@@ -785,15 +854,15 @@ function newViewManager(tm, cm, cmgr)
       -- the direction that keeps shifted PBs out of unprocessed notes' ranges.
       for _, r in ipairs(runs) do
         local chan = r.col.midiChan
+        local at = stamping(chan)
         local notes = r.notes
         local s, e, step = 1, #notes, 1
         if rowDelta > 0 then s, e, step = #notes, 1, -1 end
         for i = s, e, step do
           local n = notes[i]
-          tm:assignEvent('note', n, {
-            ppq    = ctx:rowToPPQ(ctx:ppqToRow(n.ppq, chan)    + rowDelta, chan),
-            endppq = ctx:rowToPPQ(ctx:ppqToRow(n.endppq, chan) + rowDelta, chan),
-          })
+          local rowS = ctx:ppqToRow(n.ppq,    chan) + rowDelta
+          local rowE = ctx:ppqToRow(n.endppq, chan) + rowDelta
+          tm:assignEvent('note', n, at(rowS, rowE))
         end
       end
       tm:flush()
@@ -825,7 +894,7 @@ function newViewManager(tm, cm, cmgr)
         newRow    = math.max(reqRow, minRow)
         newEndRow = math.max(reqRow + curLen, newRow + minLen)
       end
-      local newPPQ = ctx:rowToPPQ(newRow, chan)
+      local newPPQ    = ctx:rowToPPQ(newRow, chan)
       local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
 
       if newPPQ == note.ppq and newEndPPQ == note.endppq then return end
@@ -838,7 +907,8 @@ function newViewManager(tm, cm, cmgr)
           tm:assignEvent('note', note, { ppq = note.endppq - finalDur })
         end
       end
-      tm:assignEvent('note', note, { ppq = newPPQ, endppq = newEndPPQ })
+      local at = stamping(chan)
+      tm:assignEvent('note', note, at(newRow, newEndRow))
       tm:flush()
     end
   end
@@ -858,70 +928,26 @@ function newViewManager(tm, cm, cmgr)
       return groups
     end
 
-    -- Frame owner for reswing. Notes own themselves. CC/PB/AT/PC inherit
-    -- from the most recent lane-1 note at-or-before their ppq on the same
-    -- channel; PAs from the note they attach to (pitch match within span).
-    -- Orphans (no lane-1 note / no host) return nil and are skipped.
-    local function frameOwner(col, e)
-      if util.isNote(e) then return e end
-      local n1 = grid.lane1Col[col.midiChan]
-      if not n1 then return end
-      if e.type == 'pa' then
-        for _, n in ipairs(n1.events) do
-          if n.pitch == e.pitch and n.ppq <= e.ppq and e.ppq <= n.endppq then
-            return n
-          end
-        end
-        return
-      end
-      return util.seek(n1.events, 'at-or-before', e.ppq, util.isNote)
-    end
-
-    -- Authoring straight-PPQ-per-row for a given frame's rpb. Mirrors the
-    -- rebuild-time formula at line ~1560.
-    local function ppqPerRowOf(rpb)
-      local denom = (timeSigs[1] and timeSigs[1].denom) or 4
-      return resolution * 4 / (denom * rpb)
-    end
-
-    -- Recover intent from a stored realised PPQ, then rebuild under tgt.
-    -- For on-grid notes in the auth frame, pin intent to the exact row
-    -- so re-applying tgt doesn't drift them off-grid (see
-    -- timing.recoverAuthoredRow).
-    local function reswungPPQ(auth, tgt, frame, chan, ppq)
-      local u = auth and auth.unapply(chan, ppq) or ppq
-      if auth and frame then
-        local ppqPerRow = ppqPerRowOf(frame.rpb)
-        local r = timing.recoverAuthoredRow(
-          function(p) return auth.apply(chan, p) end,
-          ppqPerRow, ppq, util.round(u / ppqPerRow))
-        if r then u = util.round(r * ppqPerRow) end
-      end
-      return math.min(length, util.round(tgt.apply(chan, u)))
-    end
-
-    -- opts: { include?, auth, target, restamp? }. auth nil means identity
-    -- (legacy notes without a frame). Two passes — gather plans, then
-    -- mutate — so writes in this batch don't disturb later reads of their
-    -- owners' .frame.
-    -- Writes past `length` make REAPER auto-extend the take's source on
-    -- MIDI_Sort, which then leaks an extra row into the next rebuild
-    -- (numRows is derived from source length). Clamp on the way out.
+    -- opts: { include?, target, restamp? }. Each event carries its own
+    -- .frame and .straightPPQ (stamped at authoring time); events
+    -- without a frame are skipped — there's no inferring a frame after
+    -- the fact. Two passes — gather plans, then mutate — to keep frame
+    -- reads stable across the batch. Writes past `length` make REAPER
+    -- auto-extend the source on MIDI_Sort (numRows leaks into the next
+    -- rebuild), so clamp on the way out.
     local function reswingCore(groups, opts)
       local plans = {}
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
         for _, e in pairs(g.locs) do
-          local owner = frameOwner(col, e)
-          if owner and (not opts.include or opts.include(owner, chan)) then
-            local auth  = opts.auth(owner.frame, chan)
-            local tgt   = opts.target(owner.frame, chan)
-            local frame = owner.frame
-            local entry = { col = col, e = e, newPPQ = reswungPPQ(auth, tgt, frame, chan, e.ppq) }
+          if e.frame and (not opts.include or opts.include(e, chan)) then
+            local tgt   = opts.target(e.frame, chan)
+            local entry = { col = col, e = e,
+              newPPQ = math.min(length, util.round(tgt.apply(chan, e.straightPPQ))) }
             if util.isNote(e) then
-              entry.newEndPPQ = reswungPPQ(auth, tgt, frame, chan, e.endppq)
-              if opts.restamp then entry.newFrame = opts.restamp(chan) end
+              entry.newEndPPQ = math.min(length, util.round(tgt.apply(chan, e.straightEndPPQ)))
             end
+            if opts.restamp then entry.newFrame = opts.restamp(chan) end
             util.add(plans, entry)
           end
         end
@@ -933,78 +959,58 @@ function newViewManager(tm, cm, cmgr)
       local trust = { trustGeometry = true }
       for _, p in ipairs(plans) do
         local e, u = p.e, {}
-        if p.newPPQ ~= e.ppq then u.ppq = p.newPPQ end
-        if util.isNote(e) then
-          if p.newEndPPQ ~= e.endppq then u.endppq = p.newEndPPQ end
-          if p.newFrame then u.frame = p.newFrame end
-          if next(u) then tm:assignEvent('note', e, u, trust) end
-        elseif next(u) then
-          tm:assignEvent(p.col.type, e, u, trust)
-        end
+        if p.newPPQ    ~= e.ppq    then u.ppq    = p.newPPQ    end
+        if p.newEndPPQ ~= e.endppq and util.isNote(e) then u.endppq = p.newEndPPQ end
+        if p.newFrame  ~= nil      then u.frame  = p.newFrame  end
+        if next(u) then tm:assignEvent(util.isNote(e) and 'note' or p.col.type, e, u, trust) end
       end
       tm:flush()
     end
 
     local function reswingScope(groups)
       local curSnap = tm:swingSnapshot()
-      local cache   = {}
-      local function auth(frame, chan)
-        if not frame then return nil end
-        local hit = cache[frame]
-        if hit then return hit end
-        hit = tm:swingSnapshot({ swing = frame.swing, colSwing = { [chan] = frame.colSwing } })
-        cache[frame] = hit
-        return hit
-      end
       reswingCore(groups, {
-        auth    = auth,
         target  = function() return curSnap end,
         restamp = function(chan) return currentFrame(chan) end,
       })
     end
 
-    -- Name unchanged (only the composite behind it moved), so no restamp.
-    -- libOverride inlines both composites so this is independent of the
-    -- library's current state.
-    function reswingPresetChange(name, oldComp, newComp)
-      local authCache, tgtCache = {}, {}
-      local function snapWith(frame, chan, comp, cache)
-        local hit = cache[frame]
-        if hit then return hit end
-        hit = tm:swingSnapshot({
-          swing       = frame.swing,
-          colSwing    = { [chan] = frame.colSwing },
-          libOverride = { [name] = comp },
-        })
-        cache[frame] = hit
-        return hit
-      end
+    -- Name unchanged (only the composite behind it moved), so no
+    -- restamp. The new composite is already in the lib by the time
+    -- we run, so the snapshot resolves it via cm.
+    function reswingPresetChange(name)
+      local cache = {}
       reswingCore(allGroups(), {
-        include = function(owner)
-          local f = owner.frame
-          return f and (f.swing == name or f.colSwing == name) or false
+        include = function(e) return e.frame.swing == name or e.frame.colSwing == name end,
+        target  = function(frame, chan)
+          local hit = cache[frame]
+          if hit then return hit end
+          hit = tm:swingSnapshot({
+            swing    = frame.swing,
+            colSwing = { [chan] = frame.colSwing },
+          })
+          cache[frame] = hit
+          return hit
         end,
-        auth   = function(frame, chan) return snapWith(frame, chan, oldComp, authCache) end,
-        target = function(frame, chan) return snapWith(frame, chan, newComp, tgtCache)  end,
       })
     end
 
     local function quantizeScope(groups)
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
+        local at        = stamping(chan)
         for _, e in pairs(g.locs) do
           local sRow   = ctx:ppqToRow(e.ppq, chan)
           local newRow = util.round(sRow)
           local newPPQ = ctx:rowToPPQ(newRow, chan)
           if util.isNote(e) then
-            local eRow      = ctx:ppqToRow(e.endppq, chan)
-            local newEndRow = newRow + util.round((eRow - sRow))
+            local newEndRow = newRow + util.round(ctx:ppqToRow(e.endppq, chan) - sRow)
             local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
             if newPPQ ~= e.ppq or newEndPPQ ~= e.endppq then
-              tm:assignEvent('note', e, { ppq = newPPQ, endppq = newEndPPQ })
+              tm:assignEvent('note', e, at(newRow, newEndRow))
             end
           elseif newPPQ ~= e.ppq then
-            tm:assignEvent(col.type, e, { ppq = newPPQ })
+            tm:assignEvent(col.type, e, at(newRow))
           end
         end
       end
@@ -1018,9 +1024,11 @@ function newViewManager(tm, cm, cmgr)
       local clamped = 0
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
+        local at        = stamping(chan)
         for _, e in pairs(g.locs) do
           if util.isNote(e) then
-            local targetPPQ = ctx:rowToPPQ(ctx:snapRow(e.ppq, chan), chan)
+            local newRow    = ctx:snapRow(e.ppq, chan)
+            local targetPPQ = ctx:rowToPPQ(newRow, chan)
             if targetPPQ ~= e.ppq then
               local wantDelay  = e.delay + timing.ppqToDelay(e.ppq - targetPPQ, resolution)
               local dMin, dMax = delayRange(col, e)
@@ -1028,13 +1036,18 @@ function newViewManager(tm, cm, cmgr)
               local newPPQ     = util.round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
               if newPPQ ~= e.ppq or newDelay ~= e.delay then
                 if newDelay ~= wantDelay then clamped = clamped + 1 end
-                local newEnd = newPPQ + (e.endppq - e.ppq)
-                tm:assignEvent('note', e, { ppq = newPPQ, endppq = newEnd, delay = newDelay })
+                -- Intent moves to newRow; realised duration in straight space is preserved.
+                local s = at(newRow)
+                s.ppq, s.endppq, s.delay = newPPQ, newPPQ + (e.endppq - e.ppq), newDelay
+                s.straightEndPPQ = s.straightPPQ + (straightEndOf(e) - straightOf(e))
+                tm:assignEvent('note', e, s)
               end
             end
           else
-            local newPPQ = ctx:rowToPPQ(ctx:snapRow(e.ppq, chan), chan)
-            if newPPQ ~= e.ppq then tm:assignEvent(col.type, e, { ppq = newPPQ }) end
+            local newRow = ctx:snapRow(e.ppq, chan)
+            if ctx:rowToPPQ(newRow, chan) ~= e.ppq then
+              tm:assignEvent(col.type, e, at(newRow))
+            end
           end
         end
       end
@@ -1054,63 +1067,83 @@ function newViewManager(tm, cm, cmgr)
     function vm:quantizeKeepRealisedAll()       quantizeKeepRealisedScope(allGroups())    end
   end
 
-  function vm:reswingPreset(name, oldComp, newComp)
+  function vm:reswingPreset(name)
     if not name or name == '' then return end
-    reswingPresetChange(name, oldComp, newComp)
+    reswingPresetChange(name)
   end
 
   local insertRow, deleteRow do
+    -- Shift one event's intent + straight position by (dPPQ, dStraight) under
+    -- frame f. Note tails clamp to take length; for delete (dPPQ < 0) the clamp
+    -- is a no-op since e.endppq ≤ length already.
+    local function shiftEvent(col, e, dPPQ, dStraight, f)
+      if util.isNote(e) then
+        tm:assignEvent('note', e, {
+          ppq            = e.ppq + dPPQ,
+          endppq         = math.min(e.endppq + dPPQ, length),
+          straightPPQ    = straightOf(e)    + dStraight,
+          straightEndPPQ = straightEndOf(e) + dStraight,
+          frame          = f,
+        })
+      else
+        tm:assignEvent(col.type, e, {
+          ppq         = e.ppq + dPPQ,
+          straightPPQ = straightOf(e) + dStraight,
+          frame       = f,
+        })
+      end
+    end
+
     local function insertRowCore(col, topRow, numRows)
-      local chan = col.midiChan
-      local C = ctx:rowToPPQ(topRow, chan)
-      local R = ctx:rowToPPQ(topRow + numRows, chan) - C
+      local chan    = col.midiChan
+      local f, sppr = frameAndSppr(chan)
+      local C       = ctx:rowToPPQ(topRow, chan)
+      local R       = ctx:rowToPPQ(topRow + numRows, chan) - C
+      local Sshift  = numRows * sppr
 
       local shifted = {}
       for e in util.between(col.events, C, length) do util.add(shifted, e) end
       for i = #shifted, 1, -1 do
         local e = shifted[i]
-        local newPpq = e.ppq + R
-        if newPpq >= length then
-          tm:deleteEvent(col.type, e)
-        elseif util.isNote(e) then
-          tm:assignEvent('note', e, { ppq = newPpq, endppq = math.min(e.endppq + R, length) })
-        else
-          tm:assignEvent(col.type, e, { ppq = newPpq })
-        end
+        if e.ppq + R >= length then tm:deleteEvent(col.type, e)
+        else                        shiftEvent(col, e, R, Sshift, f) end
       end
 
       if col.type == 'note' then
         local spanning = util.seek(col.events, 'before', C, util.isNote)
         if spanning and spanning.endppq > C then
-          tm:assignEvent('note', spanning, { endppq = math.min(spanning.endppq + R, length) })
+          tm:assignEvent('note', spanning, {
+            endppq         = math.min(spanning.endppq + R, length),
+            straightEndPPQ = straightEndOf(spanning) + Sshift,
+          })
         end
       end
     end
 
     local function deleteRowCore(col, topRow, numRows)
-      local chan = col.midiChan
-      local C = ctx:rowToPPQ(topRow, chan)
-      local D = ctx:rowToPPQ(topRow + numRows, chan)
-      local R = D - C
+      local chan    = col.midiChan
+      local f, sppr = frameAndSppr(chan)
+      local C       = ctx:rowToPPQ(topRow, chan)
+      local D       = ctx:rowToPPQ(topRow + numRows, chan)
+      local R       = D - C
+      local Sshift  = numRows * sppr
 
       if col.type == 'note' then
         local spanning = util.seek(col.events, 'before', C, util.isNote)
         if spanning and spanning.endppq > C then
-          local newEnd = spanning.endppq > D and spanning.endppq - R or C
-          tm:assignEvent('note', spanning, { endppq = newEnd })
+          local clip = spanning.endppq > D
+          tm:assignEvent('note', spanning, {
+            endppq         = clip and spanning.endppq - R or C,
+            straightEndPPQ = clip and straightEndOf(spanning) - Sshift or straightOf(spanning),
+          })
         end
       end
 
       local touched = {}
       for e in util.between(col.events, C, length) do util.add(touched, e) end
       for _, e in ipairs(touched) do
-        if e.ppq < D then
-          tm:deleteEvent(col.type, e)
-        elseif util.isNote(e) then
-          tm:assignEvent('note', e, { ppq = e.ppq - R, endppq = e.endppq - R })
-        else
-          tm:assignEvent(col.type, e, { ppq = e.ppq - R })
-        end
+        if e.ppq < D then tm:deleteEvent(col.type, e)
+        else              shiftEvent(col, e, -R, -Sshift, f) end
       end
     end
 
@@ -1248,6 +1281,7 @@ function newViewManager(tm, cm, cmgr)
     -- Fixups are computed before any mutation: tm:assignEvent's same-key clamp
     -- reads live state, so we must delete first and stretch second.
     local function queueDeleteNotes(col, locs)
+      local sppr = ctx:ppqPerRow()
       local fixups = {}
       local lastSurvivor, pendingFixup = nil, false
       for _, evt in ipairs(col.events) do
@@ -1258,7 +1292,12 @@ function newViewManager(tm, cm, cmgr)
             end
           else
             if pendingFixup then
-              util.add(fixups, { evt = lastSurvivor, endppq = evt.ppq })
+              util.add(fixups, {
+                evt            = lastSurvivor,
+                endppq         = evt.ppq,
+                straightEndPPQ = evt.straightPPQ
+                                 or ctx:ppqToRow(evt.ppq, col.midiChan) * sppr,
+              })
             end
             pendingFixup = false
             lastSurvivor = evt
@@ -1266,14 +1305,18 @@ function newViewManager(tm, cm, cmgr)
         end
       end
       if pendingFixup then
-        util.add(fixups, { evt = lastSurvivor, endppq = length })
+        util.add(fixups, {
+          evt            = lastSurvivor,
+          endppq         = length,
+          straightEndPPQ = ctx:ppqToRow(length, col.midiChan) * sppr,
+        })
       end
 
       for _, evt in pairs(locs) do
         if evt.type ~= 'pa' then tm:deleteEvent('note', evt) end
       end
       for _, f in ipairs(fixups) do
-        tm:assignEvent('note', f.evt, { endppq = f.endppq })
+        tm:assignEvent('note', f.evt, { endppq = f.endppq, straightEndPPQ = f.straightEndPPQ })
       end
     end
 
@@ -1392,6 +1435,9 @@ function newViewManager(tm, cm, cmgr)
   function vm:noteProjection(evt) return ctx:noteProjection(evt) end
   function vm:rowBeatInfo(row) return ctx:rowBeatInfo(row) end
   function vm:barBeatSub(row) return ctx:barBeatSub(row) end
+  function vm:ppqToRow(ppq, chan) return ctx:ppqToRow(ppq, chan) end
+  function vm:rowToPPQ(row, chan) return ctx:rowToPPQ(row, chan) end
+  function vm:sampleCurve(A, B, ppq) return tm:interpolate(A, B, ppq) end
   function vm:timeSig()
     local ts = timeSigs[1] or { num = 4, denom = 4 }
     return ts.num, ts.denom
@@ -1637,10 +1683,15 @@ function newViewManager(tm, cm, cmgr)
         for _, n in ipairs(ccNums) do addGridCol(chan, 'cc', n, c.ccs[n].events) end
       end
 
+      -- Stored as floats: under non-divisor rpb (e.g. 7) the rounded
+      -- form would alternate row widths and seed ε that compounds
+      -- through unapply. With floats, rowToPPQ/ppqToRow are mutually
+      -- exact (single round only at realisation) and on-grid tests
+      -- collapse to a clean integer compare against evt.ppq.
       rowPPQs = {}
       local r = 0
       while true do
-        local ppq = util.round(r * ppqPerRow)
+        local ppq = r * ppqPerRow
         if ppq >= length and r > 0 then break end
         rowPPQs[r] = ppq
         r = r + 1
@@ -1663,29 +1714,31 @@ function newViewManager(tm, cm, cmgr)
         tuning     = microtuning.findTuning(cm:get('tuning')),
       }
 
+      -- Per design/archive/swing.md: displayRow(e) = round(ppqToRow_c(e.ppq))
+      -- under *current* swing. tm has stripped delay, so e.ppq is
+      -- intent. On-grid iff rowToPPQ_c reproduces e.ppq exactly — with
+      -- float rowPPQs the round-trip is bit-exact, so a swing change
+      -- correctly surfaces previously-on-grid events as off-grid.
       for _, gridCol in ipairs(grid.cols) do
         gridCol.overflow = {}
         gridCol.offGrid  = {}
         if gridCol.type == 'note' then gridCol.tails = {} end
         local chan = gridCol.midiChan
         for _, evt in ipairs(gridCol.events) do
-          local ppq      = evt.ppq or 0
-          local authored = ctx:authoredRow(ppq, chan)
-          local startRow = authored or ctx:ppqToRow(ppq, chan)
-          local y        = authored or util.round(startRow)
+          local startRow = ctx:ppqToRow(evt.ppq or 0, chan)
+          local y        = util.round(startRow)
           if y >= 0 and y < numRows then
             if gridCol.cells[y] then
               gridCol.overflow[y] = true
             else
               gridCol.cells[y] = evt
-              if not authored then gridCol.offGrid[y] = true end
+              if ctx:rowToPPQ(y, chan) ~= evt.ppq then gridCol.offGrid[y] = true end
             end
           end
           if evt.endppq then
-            local endAuth = ctx:authoredRow(evt.endppq, chan)
             util.add(gridCol.tails, {
               startRow = startRow,
-              endRow   = endAuth or ctx:ppqToRow(evt.endppq, chan),
+              endRow   = ctx:ppqToRow(evt.endppq, chan),
             })
           end
         end
@@ -1736,7 +1789,7 @@ function newViewManager(tm, cm, cmgr)
 
   clipboard = newClipboard {
     ec = ec, grid = grid, tm = tm, cm = cm,
-    addNoteEvent = addNoteEvent,
+    currentFrame = currentFrame,
     getCtx       = function() return ctx end,
     getLength    = function() return length end,
   }

@@ -36,6 +36,8 @@ local specs = {
   'edit_cursor_spec',
   'clipboard_spec',
   'vm_transient_frame_spec',
+  'vm_reswing_cc_spec',
+  'vm_straight_ppq_spec',
 }
 
 local pass, fail, failures = 0, 0, {}

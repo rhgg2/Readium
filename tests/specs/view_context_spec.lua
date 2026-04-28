@@ -132,68 +132,12 @@ return {
     end,
   },
 
-  ---------- AUTHORED ROW
+  ---------- PPQ-PER-ROW
 
   {
-    name = 'authoredRow under identity: integer rowPPQ → row, off-grid → nil',
+    name = 'ppqPerRow exposes the rebuild frame straight ppq width',
     run = function()
-      local ctx = mkCtx()
-      for _, r in ipairs{ 0, 1, 4, 17 } do
-        t.eq(ctx:authoredRow(r * 60, 1), r, 'identity row=' .. r)
-      end
-      t.eq(ctx:authoredRow(30, 1), nil, 'mid-row ppq is not authored')
-    end,
-  },
-
-  {
-    name = 'authoredRow under classic-58: rowToPPQ output round-trips back to its row',
-    -- rowToPPQ produces realised ppq the way authoring would; authoredRow
-    -- must invert it exactly. For mild swings the unapply hint is correct,
-    -- but we sweep widely to keep the contract pinned.
-    run = function(harness)
-      local ctx = mkCtx{ swing = swungSnapshot(harness, classic58) }
-      for r = 0, 32 do
-        local ppq = ctx:rowToPPQ(r, 1)
-        t.eq(ctx:authoredRow(ppq, 1), r, 'classic-58 row=' .. r)
-      end
-    end,
-  },
-
-  {
-    name = 'authoredRow under an extreme multi-atom composite: still inverts on-grid ppqs',
-    -- The motivating regression: under multi-atom composites with steep
-    -- segments, ε amplification through unapply pushed the nearest-row
-    -- guess off the authored row, and on-grid notes displayed off-grid.
-    -- authoredRow should recover the row regardless.
-    run = function(harness)
-      local extreme = {
-        { atom = 'classic', shift = 0.3, period = 1 },
-        { atom = 'shuffle', shift = 0.2, period = 1 },
-      }
-      local ctx = mkCtx{ swing = swungSnapshot(harness, extreme) }
-      for r = 0, 32 do
-        local ppq = ctx:rowToPPQ(r, 1)
-        t.eq(ctx:authoredRow(ppq, 1), r, 'multi-atom row=' .. r)
-      end
-    end,
-  },
-
-  {
-    name = 'authoredRow returns nil for off-grid ppqs even under extreme swing',
-    run = function(harness)
-      local extreme = {
-        { atom = 'classic', shift = 0.3, period = 1 },
-        { atom = 'shuffle', shift = 0.2, period = 1 },
-      }
-      local ctx = mkCtx{ swing = swungSnapshot(harness, extreme) }
-      -- Pick a ppq that sits between two adjacent rowToPPQ outputs; it
-      -- should not be claimed as authored on either side.
-      local p4 = ctx:rowToPPQ(4, 1)
-      local p5 = ctx:rowToPPQ(5, 1)
-      local mid = util.round((p4 + p5) / 2)
-      if mid ~= p4 and mid ~= p5 then
-        t.eq(ctx:authoredRow(mid, 1), nil, 'mid ppq ' .. mid .. ' is not authored')
-      end
+      t.eq(mkCtx():ppqPerRow(), 60)
     end,
   },
 
