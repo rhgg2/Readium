@@ -9,9 +9,8 @@ local t = require('support')
 
 _G.loadModule = _G.loadModule or function(n) require(n) end
 require('util')
-local realMM, realSR = require('realMidiManager')()
+local realMM = require('realMidiManager')()
 
-local sr      = realSR()
 local CHANMSG = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
 
 -- Build a fresh take + reaper. Returns (take, reaper).
@@ -56,8 +55,8 @@ local function seed(take, reaper, spec)
                     msg2 = msg2, msg3 = msg3, muted = c.muted }
   end
   for _, sc in ipairs(spec.sidecars or {}) do
-    local body = sr:encode{ uuid = sc.uuid, msgType = sc.msgType, chan = sc.chan,
-                            cc = sc.cc, pitch = sc.pitch, val = sc.val }
+    local body = t.encodeSidecar{ uuid = sc.uuid, msgType = sc.msgType, chan = sc.chan,
+                                  cc = sc.cc, pitch = sc.pitch, val = sc.val }
     texts[#texts+1] = { ppq = sc.ppq, eventtype = -1, msg = body }
   end
   for _, n in ipairs(spec.notations or {}) do
@@ -268,7 +267,7 @@ return {
       mm:modify(function() mm:assignCC(1, { val = 100 }) end)
       local m = reaper:dumpMidi(take)
       t.eq(#m.texts, 1, 'one sidecar survives')
-      local decoded = sr:decode(m.texts[1].msg)
+      local decoded = t.decodeSidecar(m.texts[1].msg)
       t.eq(decoded.uuid, 2, 'right sidecar')
       t.eq(decoded.val, 100, 'sidecar body tracks the new cc val')
     end,

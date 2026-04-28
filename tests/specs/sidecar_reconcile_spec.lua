@@ -271,8 +271,10 @@ return {
       t.eq(e.msgType, 'cc')
       t.eq(e.cc, 7)
       t.eq(e.ppq, nil, 'orphans use lastPpq, never ppq (no bound cc to point at)')
-      t.eq(#r.unboundSidecars, 1)
-      t.eq(r.unboundSidecars[1].uuid, 1)
+      local count, lone = 0, nil
+      for _, s in pairs(r.unboundSidecars) do count, lone = count + 1, s end
+      t.eq(count, 1)
+      t.eq(lone.uuid, 1)
     end,
   },
 
@@ -475,7 +477,7 @@ return {
       t.eq(kinds[3], 'consensusRebound')
       t.eq(kinds[4], 'valueRebound')
       t.eq(kinds[5], 'orphaned')
-      t.deepEq(r.unboundSidecars, { sc5 })
+      t.bagEq(r.unboundSidecars, { sc5 })
     end,
   },
 }

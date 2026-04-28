@@ -9,9 +9,8 @@ local t = require('support')
 
 _G.loadModule = _G.loadModule or function(n) require(n) end
 require('util')
-local realMM, realSR = require('realMidiManager')()
+local realMM = require('realMidiManager')()
 
-local sr      = realSR()
 local CHANMSG = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
 
 local function freshTake()
@@ -52,8 +51,8 @@ local function seed(take, reaper, spec)
                     msg2 = msg2, msg3 = msg3 }
   end
   for _, sc in ipairs(spec.sidecars or {}) do
-    local body = sr:encode{ uuid = sc.uuid, msgType = sc.msgType, chan = sc.chan,
-                            cc = sc.cc, pitch = sc.pitch, val = sc.val }
+    local body = t.encodeSidecar{ uuid = sc.uuid, msgType = sc.msgType, chan = sc.chan,
+                                  cc = sc.cc, pitch = sc.pitch, val = sc.val }
     texts[#texts+1] = { ppq = sc.ppq, eventtype = -1, msg = body }
   end
   reaper:seedMidi(take, { ccs = ccs, texts = texts })
@@ -85,7 +84,7 @@ end
 local function sidecarBodies(reaper, take)
   local out = {}
   for _, e in ipairs(reaper:dumpMidi(take).texts) do
-    if e.msg:sub(1, 4) == '\x7D\x52\x44\x4D' then out[#out+1] = sr:decode(e.msg) end
+    if e.msg:sub(1, 4) == '\x7D\x52\x44\x4D' then out[#out+1] = t.decodeSidecar(e.msg) end
   end
   return out
 end

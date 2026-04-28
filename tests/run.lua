@@ -24,7 +24,6 @@ local specs = {
   'mm_cc_metadata_spec',
   'mm_cc_reconcile_spec',
   'mm_cc_dedup_spec',
-  'sidecar_codec_spec',
   'sidecar_reconcile_spec',
   'tm_rebuild_spec',
   'tm_tuning_spec',

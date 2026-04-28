@@ -36,7 +36,7 @@ function newMidiManager(take)
 
   local notes      = {}
   local ccs        = {}
-  local uuids      = {}
+  local eventsByUuid      = {}
   local maxUUID    = 0
   local lock       = false
 
@@ -49,65 +49,115 @@ function newMidiManager(take)
   local shapeNames = {}
   for k, v in pairs(shapeLUT) do shapeNames[v] = k end
 
-  -- 11 rows of (handle length, long-arm θ, short-arm θ) sampled at |tau| =
-  -- 0, 0.1, ..., 1.0. Interpolated linearly in |tau|; cubic Bézier solved
-  -- for y at parameter t by 20-step bisection.
-  local BEZIER = {
-    { 0.2794, 0.4636,    0.4636 },
-    { 0.3442, 0.7704,    0.3384 },
-    { 0.4020, 0.9849,    0.2466 },
-    { 0.4642, 1.1455,    0.1812 },
-    { 0.5326, 1.2647,    0.1353 },
-    { 0.6059, 1.3532,    0.1011 },
-    { 0.6820, 1.4199,    0.0738 },
-    { 0.7604, 1.4714,    0.0515 },
-    { 0.8397, 1.5116,    0.0321 },
-    { 0.9198, 1.5441,    0.0154 },
-    { 1.0000, math.pi/2, 0      },
-  }
+  local curveSample do
+    local BEZIER = {
+      { 0.2794, 0.4636,    0.4636 },
+      { 0.3442, 0.7704,    0.3384 },
+      { 0.4020, 0.9849,    0.2466 },
+      { 0.4642, 1.1455,    0.1812 },
+      { 0.5326, 1.2647,    0.1353 },
+      { 0.6059, 1.3532,    0.1011 },
+      { 0.6820, 1.4199,    0.0738 },
+      { 0.7604, 1.4714,    0.0515 },
+      { 0.8397, 1.5116,    0.0321 },
+      { 0.9198, 1.5441,    0.0154 },
+      { 1.0000, math.pi / 2, 0 },
+    }
 
-  local function bezierSample(tau, t)
-    if t <= 0 then return 0 end
-    if t >= 1 then return 1 end
-    local fi = util.clamp(math.abs(tau), 0, 1) * 10
-    local i = math.min(math.floor(fi), 9)
-    local f = fi - i
-    local r0, r1 = BEZIER[i+1], BEZIER[i+2]
-    local h  = r0[1] + (r1[1] - r0[1]) * f
-    local tL = r0[2] + (r1[2] - r0[2]) * f
-    local tS = r0[3] + (r1[3] - r0[3]) * f
-    local t1, t2 = tS, tL
-    if tau < 0 then t1, t2 = tL, tS end
-    local ax, ay = h*math.cos(t1),     h*math.sin(t1)
-    local bx, by = 1 - h*math.cos(t2), 1 - h*math.sin(t2)
-    local lo, hi = 0, 1
-    for _ = 1, 20 do
+    local function bezierSample(tau, t)
+      if t <= 0 then return 0 end
+      if t >= 1 then return 1 end
+      local fi     = util.clamp(math.abs(tau), 0, 1) * 10
+      local i      = math.min(math.floor(fi), 9)
+      local f      = fi - i
+      local r0, r1 = BEZIER[i + 1], BEZIER[i + 2]
+      local h      = r0[1] + (r1[1] - r0[1]) * f
+      local tL     = r0[2] + (r1[2] - r0[2]) * f
+      local tS     = r0[3] + (r1[3] - r0[3]) * f
+      local t1, t2 = tS, tL
+      if tau < 0 then t1, t2 = tL, tS end
+      local ax, ay = h * math.cos(t1), h * math.sin(t1)
+      local bx, by = 1 - h * math.cos(t2), 1 - h * math.sin(t2)
+      local lo, hi = 0, 1
+      for _ = 1, 20 do
+        local s = (lo + hi) * 0.5
+        local u = 1 - s
+        local x = 3 * u * u * s * ax + 3 * u * s * s * bx + s * s * s
+        if x < t then lo = s else hi = s end
+      end
       local s = (lo + hi) * 0.5
       local u = 1 - s
-      local x = 3*u*u*s*ax + 3*u*s*s*bx + s*s*s
-      if x < t then lo = s else hi = s end
+      return 3 * u * u * s * ay + 3 * u * s * s * by + s * s * s
     end
-    local s = (lo + hi) * 0.5
-    local u = 1 - s
-    return 3*u*u*s*ay + 3*u*s*s*by + s*s*s
+
+    function curveSample(shape, tension, t)
+      if shape == 'step' then
+        return t >= 1 and 1 or 0
+      elseif shape == 'linear' then
+        return t
+      elseif shape == 'slow' then
+        return t * t * (3 - 2 * t)
+      elseif shape == 'fast-start' then
+        local u = 1 - t; return 1 - u * u * u
+      elseif shape == 'fast-end' then
+        return t * t * t
+      elseif shape == 'bezier' then
+        return bezierSample(tension or 0, t)
+      end
+    end
   end
 
-  -- tension is ignored except for 'bezier'.
-  local function curveSample(shape, tension, t)
-    if     shape == 'step'       then return t >= 1 and 1 or 0
-    elseif shape == 'linear'     then return t
-    elseif shape == 'slow'       then return t*t*(3 - 2*t)
-    elseif shape == 'fast-start' then local u = 1 - t; return 1 - u*u*u
-    elseif shape == 'fast-end'   then return t*t*t
-    elseif shape == 'bezier'     then return bezierSample(tension or 0, t)
+  local noteSidecarDecode, ccSidecarEncode, ccSidecarDecode do
+    local SIDECAR_MAGIC = '\x7D\x52\x44\x4D'  -- '}RDM'
+    local function idOf(cc) return cc.cc or cc.pitch or 0 end
+
+    function noteSidecarDecode(msg)
+      local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
+      if uuidTxt then
+        return { chan = chan + 1, pitch = pitch, uuid = fromBase36(uuidTxt) }
+      end
+    end
+
+    function ccSidecarEncode(cc)
+      local typeByte = chanMsgLUT[cc.msgType]
+      if not typeByte then return nil end
+      local typeNib = typeByte >> 4
+
+      local lo, hi
+      if cc.msgType == 'pb' then
+        local raw = (cc.val or 0) + 8192
+        lo, hi = raw & 0x7F, (raw >> 7) & 0x7F
+      else
+        lo, hi = (cc.val or 0) & 0x7F, 0
+      end
+
+      return SIDECAR_MAGIC
+        .. string.char(typeNib)
+        .. string.char((cc.chan or 1) - 1)
+        .. string.char(idOf(cc))
+        .. string.char(lo)
+        .. string.char(hi)
+        .. toBase36(cc.uuid)
+    end
+
+    function ccSidecarDecode(body)
+      if not body or #body < 10 then return nil end
+      if body:sub(1, 4) ~= SIDECAR_MAGIC then return nil end
+
+      local out = {}
+      out.msgType = chanMsgTypes[body:byte(5) << 4]
+      out.uuid = tonumber(body:sub(10), 36)
+      if not out.msgType or not out.uuid then return nil end
+      local lo, hi = body:byte(8), body:byte(9)
+      out.chan = body:byte(6) + 1
+      out.val = (out.msgType == 'pb') and (((hi << 7) | lo) - 8192) or lo
+      if     out.msgType == 'cc' then out.cc    = body:byte(7)
+      elseif out.msgType == 'pa' then out.pitch = body:byte(7)
+      end
+      return out
     end
   end
 
-  -- matches only NOTE notation events tagged with our rdm_<uuid> marker
-  local function parseUUIDNotation(msg)
-    local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
-    if uuidTxt then return uuidTxt, chan + 1, pitch end
-  end
 
   local function loadMetadata()
     if not take then return {} end
@@ -143,15 +193,15 @@ function newMidiManager(take)
     if not take then return end
 
     local uuidTxt = toBase36(uuid)
-    local entry   = uuids[uuid]
+    local evt   = eventsByUuid[uuid]
 
-    if not entry then
+    if not evt then
       print('Error! uuid not found')
       return
     end
 
-    local strip = entry.msgType and ccEventFields or noteEventFields
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util.serialise(entry, strip), true)
+    local strip = evt.msgType and ccEventFields or noteEventFields
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util.serialise(evt, strip), true)
 
     -- Ensure this UUID is in the keys list so loadMetadata() finds it on reload
     local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
@@ -166,7 +216,7 @@ function newMidiManager(take)
 
     -- Collect uuids as both a set (for stale-key check) and a list (for serialisation)
     local newKeys, keyList = {}, {}
-    for uuid in pairs(uuids) do
+    for uuid in pairs(eventsByUuid) do
       local uuidTxt = toBase36(uuid)
       newKeys[uuidTxt] = true
       util.add(keyList, uuidTxt)
@@ -195,10 +245,10 @@ function newMidiManager(take)
     return out
   end
 
-  local function assignNewUUID(entry)
+  local function assignNewUUID(evt)
     maxUUID = maxUUID + 1
-    entry.uuid = maxUUID
-    uuids[maxUUID] = entry
+    evt.uuid = maxUUID
+    eventsByUuid[maxUUID] = evt
     return maxUUID
   end
 
@@ -215,29 +265,34 @@ function newMidiManager(take)
     local takeSwapped = take ~= newTake
     if takeSwapped then take = newTake end
 
-    notes, ccs, uuids, maxUUID, lock = {}, {}, {}, 0, false
+    notes, ccs, eventsByUuid, maxUUID, lock = {}, {}, {}, 0, false
     local ccSidecars, noteSidecars = {}, {}
-    local noteDedupEvents, ccDedupEvents, reassignEvents, reconcileEvents = {}, {}, {}, {}
     local sidecarRewrites, sidecarInserts, sidecarDeletes, ccDeletes = {}, {}, {}, {}
+    local noteDedupEvents, ccDedupEvents, reassignEvents, reconcileEvents = {}, {}, {}, {}
+
+    local metadata = loadMetadata()
+    for uuid in pairs(metadata) do if uuid > maxUUID then maxUUID = uuid end end
+
+    ----- Helper functions
+    local function noteKey(n)   return n.ppq .. '|' .. n.chan .. '|' .. n.pitch end
+    local function idOf(cc)     return cc.cc or cc.pitch or 0 end
+    local function ccIdKey(e)   return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
+    local function ccPPQKey(e)  return ccIdKey(e)  .. '|' .. e.ppq end
+    local function ccFullKey(e) return ccPPQKey(e) .. '|' .. (e.val or 0) end
 
     ----- Read notes
     local _, noteCount = reaper.MIDI_CountEvts(take)
     for i = 0, noteCount-1 do
       local ok, _, muted, ppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
       if ok then
-        local entry = { idx = i, ppq = ppq, endppq = endppq, chan = chan + 1, pitch = pitch, vel = vel }
-        if muted then entry.muted = true end
-        util.add(notes, entry)
+        local evt = { idx = i, ppq = ppq, endppq = endppq, chan = chan + 1, pitch = pitch, vel = vel }
+        if muted then evt.muted = true end
+        util.add(notes, evt)
       end
     end
 
     ----- Note dedup → flush. Longest endppq wins; flush before sysex read so
     ----- the cascade-deleted notation events don't leave us with stale idxs.
-    local function noteKey(n)   return n.ppq .. '|' .. n.chan .. '|' .. n.pitch end
-    local function idOf(cc)     return cc.cc or cc.pitch or 0 end
-    local function ccIdKey(e)   return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
-    local function ccPPQKey(e)  return ccIdKey(e)  .. '|' .. e.ppq end
-    local function ccFullKey(e) return ccPPQKey(e) .. '|' .. (e.val or 0) end
 
     local notesKeyed = {}
     do
@@ -279,40 +334,31 @@ function newMidiManager(take)
       local ok, _, muted, ppq, chanmsg, chan, msg2, msg3 = reaper.MIDI_GetCC(take, i)
       if ok then
         local msgType = chanMsgTypes[chanmsg] or ('chanmsg_' .. chanmsg)
-        local entry = { idx = i, ppq = ppq, msgType = msgType, chan = chan + 1}
-        if muted then entry.muted = true end
-        if     msgType == 'pa' then entry.pitch, entry.val = msg2, msg3
-        elseif msgType == 'cc' then entry.cc,    entry.val = msg2, msg3
-        elseif msgType == 'pc' or msgType == 'at' then entry.val = msg2
-        elseif msgType == 'pb' then entry.val = ((msg3 << 7) | msg2) - 8192
+        local evt = { idx = i, ppq = ppq, msgType = msgType, chan = chan + 1}
+        if muted then evt.muted = true end
+        if     msgType == 'pa' then evt.pitch, evt.val = msg2, msg3
+        elseif msgType == 'cc' then evt.cc,    evt.val = msg2, msg3
+        elseif msgType == 'pc' or msgType == 'at' then evt.val = msg2
+        elseif msgType == 'pb' then evt.val = ((msg3 << 7) | msg2) - 8192
         end
         local _, shape, tension = reaper.MIDI_GetCCShape(take, i)
-        entry.shape = shapeNames[shape] or 'step'
-        if entry.shape == 'bezier' then entry.tension = tension end
-        util.add(ccs, entry)
+        evt.shape = shapeNames[shape] or 'step'
+        if evt.shape == 'bezier' then evt.tension = tension end
+        util.add(ccs, evt)
       end
     end
 
     for i = 0, textCount-1 do
       local ok, _, _, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
-        local uuidTxt, chan, pitch = parseUUIDNotation(msg)
-        if uuidTxt then
-          local sc = { idx = i, ppq = ppq, chan = chan, pitch = pitch, uuid = fromBase36(uuidTxt) }
-          util.add(noteSidecars, sc)
-        end
+        local sc = noteSidecarDecode(msg)
+        if sc then util.add(noteSidecars, util.assign(sc, { idx = i, ppq = ppq})) end
       elseif ok and eventtype == -1 then
-        local sc = sr:decode(msg)
-        if sc then
-          util.assign(sc, { idx = i, ppq = ppq })
-          util.add(ccSidecars, sc)
-        end
+        local sc = ccSidecarDecode(msg)
+        if sc then util.add(ccSidecars, util.assign(sc, { idx = i, ppq = ppq})) end
       end
     end
     local sidecarCount = #ccSidecars
-
-    local metadata = loadMetadata()
-    for uuid in pairs(metadata) do if uuid > maxUUID then maxUUID = uuid end end
 
     ----- CC dedup (in-memory only — flush is bundled into the single bracket below)
 
@@ -370,7 +416,9 @@ function newMidiManager(take)
             body = string.format('NOTE %d %d custom rdm_%s', note.chan-1, note.pitch, toBase36(newUUID)),
           })
           util.add(reassignEvents, util.pick(note, 'ppq chan pitch', { oldUuid = oldUUID, newUuid = newUUID }))
-        elseif not uuid then
+        elseif uuid then
+          eventsByUuid[uuid] = note
+        else
           local newUUID = assignNewUUID(note)
           uuidCount[newUUID] = 1
           metadata[newUUID] = {}
@@ -382,23 +430,19 @@ function newMidiManager(take)
     ----- Sidecar reconcile (ccs ↔ ccSidecars). Snapshot the live (non-nil) entries
     ----- — sr:reconcile is generic over its args.
     do
-      local liveCcs, liveCcSidecars = {}, {}
-      for _, c in pairs(ccs)        do util.add(liveCcs,        c) end
-      for _, s in pairs(ccSidecars) do util.add(liveCcSidecars, s) end
-
-      if #liveCcSidecars > 0 then
-        local r = sr:reconcile(liveCcSidecars, liveCcs)
+      if next(ccSidecars) then
+        local r = sr:reconcile(ccSidecars, ccs)
         reconcileEvents = r.events
         for _, b in ipairs(r.binds) do
           b.cc.uuid, b.cc.uuidIdx = b.sidecar.uuid, b.sidecar.idx
           if b.cc.uuid > maxUUID then maxUUID = b.cc.uuid end
           if not b.silent then
-            util.add(sidecarRewrites, { idx = b.sidecar.idx, ppq = b.cc.ppq, type = -1, body = sr:encode(b.cc) })
+            util.add(sidecarRewrites, { idx = b.sidecar.idx, ppq = b.cc.ppq, type = -1, body = ccSidecarEncode(b.cc) })
           end
         end
-        if #r.unboundSidecars > 0 then
+        if next(r.unboundSidecars) then
           local unbound = {}
-          for _, s in ipairs(r.unboundSidecars) do unbound[s] = true end
+          for _, s in pairs(r.unboundSidecars) do unbound[s] = true end
           for loc, sc in pairs(ccSidecars) do
             if unbound[sc] then
               util.add(sidecarDeletes, sc.idx)
@@ -435,12 +479,13 @@ function newMidiManager(take)
     ccSidecars = compact(ccSidecars, sidecarCount)
 
     ----- Final read pass: refresh idx / uuidIdx from current REAPER state.
-    local notesKeyedPost, ccsByTag, ccsByUuid = {}, {}, {}
+    notesKeyed = {}
+    local ccsKeyed, ccsByUuid = {}, {}
     for _, n in ipairs(notes) do
-      notesKeyedPost[noteKey(n)] = n
+      notesKeyed[noteKey(n)] = n
     end
     for _, c in ipairs(ccs) do
-      ccsByTag[ccPPQKey(c)] = c
+      ccsKeyed[ccPPQKey(c)] = c
       if c.uuid then ccsByUuid[c.uuid] = c end
     end
 
@@ -449,7 +494,7 @@ function newMidiManager(take)
       local ok, _, _, ppq, _, chan, pitch = reaper.MIDI_GetNote(take, i)
       if ok then
         local evt = { ppq = ppq, chan = chan + 1, pitch = pitch }
-        local n = notesKeyedPost[noteKey(evt)]
+        local n = notesKeyed[noteKey(evt)]
         if n then n.idx = i end
       end
     end
@@ -460,21 +505,20 @@ function newMidiManager(take)
         local evt = { ppq = ppq, chan = chan + 1, msgType = msgType }
         if msgType == 'cc' then evt.cc = msg2 end
         if msgType == 'pa' then evt.pitch = msg2 end
-        local c = ccsByTag[ccPPQKey(evt)]
+        local c = ccsKeyed[ccPPQKey(evt)]
         if c then c.idx = i end
       end
     end
     for i = 0, textCount2-1 do
       local ok, _, _, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
-        local uuidTxt, chan, pitch = parseUUIDNotation(msg)
-        if uuidTxt then
-          local evt = { ppq = ppq, chan = chan, pitch = pitch }
-          local n = notesKeyedPost[noteKey(evt)]
+        local sc = noteSidecarDecode(msg)
+        if sc then
+          local n = notesKeyed[noteKey(util.assign(sc, { ppq = ppq }))]
           if n then n.uuidIdx = i end
         end
       elseif ok and eventtype == -1 then
-        local sc = sr:decode(msg)
+        local sc = ccSidecarDecode(msg)
         if sc and ccsByUuid[sc.uuid] then ccsByUuid[sc.uuid].uuidIdx = i end
       end
     end
@@ -482,12 +526,12 @@ function newMidiManager(take)
     ----- Metadata merge + persist + signals
     for _, note in ipairs(notes) do
       util.assign(note, metadata[note.uuid])
-      uuids[note.uuid] = note
+      -- eventsByUuid[note.uuid] = note
     end
     for _, cc in ipairs(ccs) do
       if cc.uuid then
         util.assign(cc, metadata[cc.uuid])
-        uuids[cc.uuid] = cc
+        eventsByUuid[cc.uuid] = cc
       end
     end
     saveMetadata()
@@ -552,7 +596,7 @@ function newMidiManager(take)
     reaper.MIDI_DeleteNote(take, note.idx)
 
     -- clean up internal tables
-    uuids[note.uuid] = nil
+    eventsByUuid[note.uuid] = nil
     notes[loc] = nil
   end
 
@@ -643,7 +687,7 @@ function newMidiManager(take)
     reaper.MIDI_DeleteCC(take, msg.idx)
     if msg.uuid then
       reaper.MIDI_DeleteTextSysexEvt(take, msg.uuidIdx)
-      uuids[msg.uuid] = nil
+      eventsByUuid[msg.uuid] = nil
       -- saveMetadata at end-of-modify purges the rdm_<uuid> ext-data slot
     end
     ccs[loc] = nil
@@ -726,14 +770,14 @@ function newMidiManager(take)
     -- First metadata stamp: allocate uuid + insert its sidecar.
     if hasMetadata and not msg.uuid then
       assignNewUUID(msg)
-      reaper.MIDI_InsertTextSysexEvt(take, false, false, msg.ppq, -1, sr:encode(msg))
+      reaper.MIDI_InsertTextSysexEvt(take, false, false, msg.ppq, -1, ccSidecarEncode(msg))
       local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
       msg.uuidIdx = sysexCount - 1
     end
 
     -- Resync sidecar ppq + fingerprint so the next load is tier-1 clean.
     if msg.uuid and hasStructural then
-      reaper.MIDI_SetTextSysexEvt(take, msg.uuidIdx, nil, nil, msg.ppq, -1, sr:encode(msg), true)
+      reaper.MIDI_SetTextSysexEvt(take, msg.uuidIdx, nil, nil, msg.ppq, -1, ccSidecarEncode(msg), true)
     end
 
     if msg.uuid then saveMetadatum(msg.uuid) end
@@ -850,58 +894,11 @@ end
 function newSidecarReconciler()
   local sr = {}
 
-  local SIDECAR_MAGIC = '\x7D\x52\x44\x4D'  -- '}RDM'
-
-  -- wire `id` byte: controller for cc, pitch for pa, 0 for the rest.
-  local function idOf(cc) return cc.cc or cc.pitch or 0 end
-
-  function sr:encode(cc)
-    local typeByte = chanMsgLUT[cc.msgType]
-    if not typeByte then return nil end
-    local typeNib = typeByte >> 4
-
-    local lo, hi
-    if cc.msgType == 'pb' then
-      local raw = (cc.val or 0) + 8192
-      lo, hi = raw & 0x7F, (raw >> 7) & 0x7F
-    else
-      lo, hi = (cc.val or 0) & 0x7F, 0
-    end
-
-    return SIDECAR_MAGIC
-      .. string.char(typeNib)
-      .. string.char((cc.chan or 1) - 1)
-      .. string.char(idOf(cc))
-      .. string.char(lo)
-      .. string.char(hi)
-      .. toBase36(cc.uuid)
-  end
-
-  function sr:decode(body)
-    if not body or #body < 10 then return nil end
-    if body:sub(1, 4) ~= SIDECAR_MAGIC then return nil end
-
-    local out = {}
-    out.msgType = chanMsgTypes[body:byte(5) << 4]
-    out.uuid = tonumber(body:sub(10), 36)
-    if not out.msgType or not out.uuid then return nil end
-    local lo, hi = body:byte(8), body:byte(9)
-    out.chan = body:byte(6) + 1
-    out.val = (out.msgType == 'pb') and (((hi << 7) | lo) - 8192) or lo
-    if     out.msgType == 'cc' then out.cc    = body:byte(7)
-    elseif out.msgType == 'pa' then out.pitch = body:byte(7)
-    end
-
-    return out
-  end
-
-
   -- Payload for rebind kinds; orphaned/ambiguous build payloads inline.
   local function payload(kind, sidecar, cc, extras)
     local from = cc or sidecar
     local p = util.pick(from, 'ppq chan msgType cc pitch', { kind = kind, uuid = sidecar.uuid})
-    if extras then for k, v in pairs(extras) do p[k] = v end end
-    return p
+    return util.assign(p, extras or {})
   end
 
   -- Four-stage reconciler — see docs/midiManager.md for the staging.
@@ -917,12 +914,12 @@ function newSidecarReconciler()
     local scBuckets, ccBuckets
     local function bucketBy(keyFn)
       scBuckets, ccBuckets = {}, {}
-      for _, s in ipairs(sidecars) do util.bucket(scBuckets, keyFn(s), s) end
-      for _, c in ipairs(ccs)      do util.bucket(ccBuckets, keyFn(c), c) end
+      for _, s in pairs(sidecars) do util.bucket(scBuckets, keyFn(s), s) end
+      for _, c in pairs(ccs)      do util.bucket(ccBuckets, keyFn(c), c) end
     end
 
     local function removeFirst(t, e)
-      for i, x in ipairs(t) do if x == e then table.remove(t, i); return end end
+      for i, x in pairs(t) do if x == e then t[i] = nil; return end end
     end
 
     local binds, events = {}, {}
@@ -931,6 +928,7 @@ function newSidecarReconciler()
       removeFirst(sidecars, s); removeFirst(ccs, c)
     end
 
+    local function idOf(cc)     return cc.cc or cc.pitch or 0 end
     local function idKey(e)   return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
     local function ppqKey(e)  return idKey(e)  .. '|' .. e.ppq end
     local function fullKey(e) return ppqKey(e) .. '|' .. (e.val or 0) end
@@ -1007,9 +1005,7 @@ function newSidecarReconciler()
       local cs = ccBuckets[k] or {}
       for _, s in ipairs(scs) do
         if #cs == 0 then
-          util.add(events, { kind = 'orphaned', uuid = s.uuid, lastPpq = s.ppq,
-                             chan = s.chan, msgType = s.msgType,
-                             cc = s.cc, pitch = s.pitch })
+          util.add(events, util.pick(s, 'uuid ppq chan msgType cc pitch', { kind = 'orphaned' }))
         elseif #cs == 1 then
           bind(s, cs[1])
           util.add(events, payload('guessedRebound', s, cs[1]))
@@ -1022,7 +1018,7 @@ function newSidecarReconciler()
       end
     end
 
-    return { binds = binds, events = events, unboundSidecars = sidecars, unboundCcs = ccs }
+    return { binds = binds, events = events, unboundSidecars = sidecars }
   end
 
   return sr
