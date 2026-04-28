@@ -36,11 +36,9 @@ function newMidiManager(take)
 
   local notes      = {}
   local ccs        = {}
-  local ccSidecars = {}     -- Readium-magic sysex events
   local uuids      = {}
   local maxUUID    = 0
   local lock       = false
-  local fire  -- installed below, once mm exists
 
   local sr = newSidecarReconciler()
 
@@ -207,7 +205,7 @@ function newMidiManager(take)
   ---------- PUBLIC
 
   local mm = {}
-  fire = util.installHooks(mm)
+  local fire = util.installHooks(mm)
 
   ----- Load
 
@@ -217,28 +215,31 @@ function newMidiManager(take)
     local takeSwapped = take ~= newTake
     if takeSwapped then take = newTake end
 
-    notes, ccs, ccSidecars, uuids, maxUUID, lock = {}, {}, {}, {}, 0, false
-
-    local ok, noteCount = reaper.MIDI_CountEvts(take)
-    if not ok then return end
+    notes, ccs, uuids, maxUUID, lock = {}, {}, {}, 0, false
+    local ccSidecars, noteSidecars = {}, {}
+    local noteDedupEvents, ccDedupEvents, reassignEvents, reconcileEvents = {}, {}, {}, {}
+    local sidecarRewrites, sidecarInserts, sidecarDeletes, ccDeletes = {}, {}, {}, {}
 
     ----- Read notes
+    local _, noteCount = reaper.MIDI_CountEvts(take)
     for i = 0, noteCount-1 do
       local ok, _, muted, ppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
       if ok then
-        chan = chan + 1
-        local entry = { idx = i, ppq = ppq, endppq = endppq, chan = chan, pitch = pitch, vel = vel }
+        local entry = { idx = i, ppq = ppq, endppq = endppq, chan = chan + 1, pitch = pitch, vel = vel }
         if muted then entry.muted = true end
         util.add(notes, entry)
       end
     end
-    local noteCount0 = #notes
 
     ----- Note dedup → flush. Longest endppq wins; flush before sysex read so
     ----- the cascade-deleted notation events don't leave us with stale idxs.
-    local function noteKey(n) return n.ppq .. '|' .. n.chan .. '|' .. n.pitch end
+    local function noteKey(n)   return n.ppq .. '|' .. n.chan .. '|' .. n.pitch end
+    local function idOf(cc)     return cc.cc or cc.pitch or 0 end
+    local function ccIdKey(e)   return e.msgType .. '|' .. e.chan .. '|' .. idOf(e) end
+    local function ccPPQKey(e)  return ccIdKey(e)  .. '|' .. e.ppq end
+    local function ccFullKey(e) return ccPPQKey(e) .. '|' .. (e.val or 0) end
 
-    local notesByTag, noteDedupEvents = {}, {}
+    local notesKeyed = {}
     do
       local groups, noteDeletes = {}, {}
       for loc, n in ipairs(notes) do
@@ -254,9 +255,9 @@ function newMidiManager(take)
       end
       for key, g in pairs(groups) do
         local kept = notes[g.kept]
-        notesByTag[key] = kept
+        notesKeyed[key] = kept
         if #g.dropped > 0 then
-          util.add(noteDedupEvents, { ppq = kept.ppq, chan = kept.chan, pitch = kept.pitch, droppedCount = #g.dropped })
+          util.add(noteDedupEvents, util.pick(kept, 'ppq chan pitch', { droppedCount = #g.dropped }))
           for _, loc in ipairs(g.dropped) do
             util.add(noteDeletes, notes[loc].idx)
             notes[loc] = nil
@@ -277,9 +278,8 @@ function newMidiManager(take)
     for i = 0, ccCount-1 do
       local ok, _, muted, ppq, chanmsg, chan, msg2, msg3 = reaper.MIDI_GetCC(take, i)
       if ok then
-        chan = chan + 1
         local msgType = chanMsgTypes[chanmsg] or ('chanmsg_' .. chanmsg)
-        local entry = { idx = i, ppq = ppq, msgType = msgType, chan = chan }
+        local entry = { idx = i, ppq = ppq, msgType = msgType, chan = chan + 1}
         if muted then entry.muted = true end
         if     msgType == 'pa' then entry.pitch, entry.val = msg2, msg3
         elseif msgType == 'cc' then entry.cc,    entry.val = msg2, msg3
@@ -292,62 +292,51 @@ function newMidiManager(take)
         util.add(ccs, entry)
       end
     end
-    local ccCount0 = #ccs
 
-    local noteSidecars = {}
     for i = 0, textCount-1 do
       local ok, _, _, ppq, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
       if ok and eventtype == 15 then
         local uuidTxt, chan, pitch = parseUUIDNotation(msg)
         if uuidTxt then
-          util.add(noteSidecars, { idx = i, ppq = ppq, chan = chan, pitch = pitch,
-                                   uuid = fromBase36(uuidTxt) })
+          local sc = { idx = i, ppq = ppq, chan = chan, pitch = pitch, uuid = fromBase36(uuidTxt) }
+          util.add(noteSidecars, sc)
         end
       elseif ok and eventtype == -1 then
         local sc = sr:decode(msg)
         if sc then
-          sc.idx, sc.ppq = i, ppq
+          util.assign(sc, { idx = i, ppq = ppq })
           util.add(ccSidecars, sc)
         end
       end
     end
-    local sidecarCount0 = #ccSidecars
+    local sidecarCount = #ccSidecars
 
     local metadata = loadMetadata()
     for uuid in pairs(metadata) do if uuid > maxUUID then maxUUID = uuid end end
 
     ----- CC dedup (in-memory only — flush is bundled into the single bracket below)
-    local ccDeletes, ccDedupEvents = {}, {}
+
     do
       local stageOneHit = {}
       for _, s in ipairs(ccSidecars) do
-        stageOneHit[s.ppq..'|'..s.chan..'|'..s.msgType..'|'..(s.cc or s.pitch or 0)..'|'..(s.val or 0)] = true
+        stageOneHit[ccFullKey(s)] = true
       end
-      local function dupKey(c)
-        return c.ppq..'|'..c.chan..'|'..c.msgType..'|'..(c.cc or c.pitch or 0)
-      end
-      local function valKey(c) return dupKey(c)..'|'..(c.val or 0) end
 
       local groups = {}
-      for loc, c in ipairs(ccs) do util.bucket(groups, dupKey(c), loc) end
+      for loc, c in ipairs(ccs) do util.bucket(groups, ccPPQKey(c), loc) end
 
       for _, locs in pairs(groups) do
         if #locs > 1 then
           local candidates, fallbacks = {}, {}
           for _, loc in ipairs(locs) do
-            util.add(stageOneHit[valKey(ccs[loc])] and candidates or fallbacks, loc)
+            util.add(stageOneHit[ccFullKey(ccs[loc])] and candidates or fallbacks, loc)
           end
           local pool = #candidates > 0 and candidates or fallbacks
           local winnerLoc = pool[#pool]
           local kept = ccs[winnerLoc]
-          util.add(ccDedupEvents, { ppq = kept.ppq, chan = kept.chan, msgType = kept.msgType,
-                                    cc = kept.cc, pitch = kept.pitch,
-                                    droppedCount = #locs - 1 })
+          util.add(ccDedupEvents, util.pick(kept, 'ppq chan msgType cc pitch', { droppedCount = #locs - 1 }))
           for _, loc in ipairs(locs) do
-            if loc ~= winnerLoc then
-              util.add(ccDeletes, ccs[loc].idx)
-              ccs[loc] = nil
-            end
+            if loc ~= winnerLoc then util.add(ccDeletes, ccs[loc].idx); ccs[loc] = nil end
           end
         end
       end
@@ -355,13 +344,11 @@ function newMidiManager(take)
 
     ----- UUID unification (notes ↔ noteSidecars). First-arrival wins per tag;
     ----- duplicates and orphans get queued for deletion.
-    local sidecarRewrites, sidecarInserts, sidecarDeletes = {}, {}, {}
-    local reassignEvents = {}
 
     do
       local uuidCount = {}
       for _, ns in ipairs(noteSidecars) do
-        local note = notesByTag[noteKey(ns)]
+        local note = notesKeyed[noteKey(ns)]
         if note and not note.uuid then
           note.uuid, note.uuidIdx = ns.uuid, ns.idx
           uuidCount[ns.uuid] = (uuidCount[ns.uuid] or 0) + 1
@@ -370,7 +357,7 @@ function newMidiManager(take)
         end
       end
 
-      for _, note in pairs(notesByTag) do
+      for _, note in pairs(notesKeyed) do
         local uuid = note.uuid
         if uuid and uuidCount[uuid] > 1 then
           local oldUUID = uuid
@@ -382,47 +369,45 @@ function newMidiManager(take)
             idx = note.uuidIdx, ppq = note.ppq, type = 15,
             body = string.format('NOTE %d %d custom rdm_%s', note.chan-1, note.pitch, toBase36(newUUID)),
           })
-          util.add(reassignEvents, { oldUuid = oldUUID, newUuid = newUUID,
-            ppq = note.ppq, chan = note.chan, pitch = note.pitch })
+          util.add(reassignEvents, util.pick(note, 'ppq chan pitch', { oldUuid = oldUUID, newUuid = newUUID }))
         elseif not uuid then
           local newUUID = assignNewUUID(note)
           uuidCount[newUUID] = 1
           metadata[newUUID] = {}
-          util.add(sidecarInserts,
-                   { ppq = note.ppq, chan = note.chan, pitch = note.pitch, uuid = newUUID })
+          util.add(sidecarInserts, util.pick(note, 'ppq chan pitch', { uuid = newUUID }))
         end
       end
     end
 
     ----- Sidecar reconcile (ccs ↔ ccSidecars). Snapshot the live (non-nil) entries
     ----- — sr:reconcile is generic over its args.
-    local liveCcs, liveCcSidecars = {}, {}
-    for _, c in pairs(ccs)        do util.add(liveCcs,        c) end
-    for _, s in pairs(ccSidecars) do util.add(liveCcSidecars, s) end
+    do
+      local liveCcs, liveCcSidecars = {}, {}
+      for _, c in pairs(ccs)        do util.add(liveCcs,        c) end
+      for _, s in pairs(ccSidecars) do util.add(liveCcSidecars, s) end
 
-    local reconcileEvents = {}
-    if #liveCcSidecars > 0 then
-      local r = sr:reconcile(liveCcSidecars, liveCcs)
-      reconcileEvents = r.events
-      for _, b in ipairs(r.binds) do
-        b.cc.uuid, b.cc.uuidIdx = b.sidecar.uuid, b.sidecar.idx
-        if b.cc.uuid > maxUUID then maxUUID = b.cc.uuid end
-        if not b.silent then
-          util.add(sidecarRewrites, { idx = b.sidecar.idx, ppq = b.cc.ppq, type = -1, body = sr:encode(b.cc) })
+      if #liveCcSidecars > 0 then
+        local r = sr:reconcile(liveCcSidecars, liveCcs)
+        reconcileEvents = r.events
+        for _, b in ipairs(r.binds) do
+          b.cc.uuid, b.cc.uuidIdx = b.sidecar.uuid, b.sidecar.idx
+          if b.cc.uuid > maxUUID then maxUUID = b.cc.uuid end
+          if not b.silent then
+            util.add(sidecarRewrites, { idx = b.sidecar.idx, ppq = b.cc.ppq, type = -1, body = sr:encode(b.cc) })
+          end
         end
-      end
-      if #r.unboundSidecars > 0 then
-        local unbound = {}
-        for _, s in ipairs(r.unboundSidecars) do unbound[s] = true end
-        for loc, sc in pairs(ccSidecars) do
-          if unbound[sc] then
-            util.add(sidecarDeletes, sc.idx)
-            ccSidecars[loc] = nil
+        if #r.unboundSidecars > 0 then
+          local unbound = {}
+          for _, s in ipairs(r.unboundSidecars) do unbound[s] = true end
+          for loc, sc in pairs(ccSidecars) do
+            if unbound[sc] then
+              util.add(sidecarDeletes, sc.idx)
+              ccSidecars[loc] = nil
+            end
           end
         end
       end
     end
-
     ----- Single bracketed flush: sets first (idx-stable), deletes descending,
     ----- inserts last (their idxs aren't tracked — final read will pick them up).
     local hasFlush = #sidecarRewrites + #ccDeletes + #sidecarDeletes + #sidecarInserts > 0
@@ -431,7 +416,7 @@ function newMidiManager(take)
       for _, r in ipairs(sidecarRewrites) do
         reaper.MIDI_SetTextSysexEvt(take, r.idx, nil, nil, r.ppq, r.type, r.body, true)
       end
-      
+
       table.sort(ccDeletes, function(a, b) return a > b end)
       table.sort(sidecarDeletes, function(a, b) return a > b end)
       for _, idx in ipairs(ccDeletes) do reaper.MIDI_DeleteCC(take, idx) end
@@ -445,17 +430,17 @@ function newMidiManager(take)
     end
 
     ----- Compact in-memory tables to dense.
-    notes      = compact(notes,      noteCount0)
-    ccs        = compact(ccs,        ccCount0)
-    ccSidecars = compact(ccSidecars, sidecarCount0)
+    notes      = compact(notes,      noteCount)
+    ccs        = compact(ccs,        ccCount)
+    ccSidecars = compact(ccSidecars, sidecarCount)
 
     ----- Final read pass: refresh idx / uuidIdx from current REAPER state.
-    local notesByTagPost, ccsByTag, ccsByUuid = {}, {}, {}
+    local notesKeyedPost, ccsByTag, ccsByUuid = {}, {}, {}
     for _, n in ipairs(notes) do
-      notesByTagPost[noteKey(n)] = n
+      notesKeyedPost[noteKey(n)] = n
     end
     for _, c in ipairs(ccs) do
-      ccsByTag[c.ppq..'|'..c.chan..'|'..c.msgType..'|'..(c.cc or c.pitch or 0)] = c
+      ccsByTag[ccPPQKey(c)] = c
       if c.uuid then ccsByUuid[c.uuid] = c end
     end
 
@@ -463,7 +448,8 @@ function newMidiManager(take)
     for i = 0, noteCount2-1 do
       local ok, _, _, ppq, _, chan, pitch = reaper.MIDI_GetNote(take, i)
       if ok then
-        local n = notesByTagPost[ppq..'|'..(chan+1)..'|'..pitch]
+        local evt = { ppq = ppq, chan = chan + 1, pitch = pitch }
+        local n = notesKeyedPost[noteKey(evt)]
         if n then n.idx = i end
       end
     end
@@ -471,8 +457,10 @@ function newMidiManager(take)
       local ok, _, _, ppq, chanmsg, chan, msg2 = reaper.MIDI_GetCC(take, i)
       if ok then
         local msgType = chanMsgTypes[chanmsg] or ('chanmsg_'..chanmsg)
-        local id = (msgType == 'cc' or msgType == 'pa') and msg2 or 0
-        local c = ccsByTag[ppq..'|'..(chan+1)..'|'..msgType..'|'..id]
+        local evt = { ppq = ppq, chan = chan + 1, msgType = msgType }
+        if msgType == 'cc' then evt.cc = msg2 end
+        if msgType == 'pa' then evt.pitch = msg2 end
+        local c = ccsByTag[ccPPQKey(evt)]
         if c then c.idx = i end
       end
     end
@@ -481,7 +469,8 @@ function newMidiManager(take)
       if ok and eventtype == 15 then
         local uuidTxt, chan, pitch = parseUUIDNotation(msg)
         if uuidTxt then
-          local n = notesByTagPost[ppq..'|'..chan..'|'..pitch]
+          local evt = { ppq = ppq, chan = chan, pitch = pitch }
+          local n = notesKeyedPost[noteKey(evt)]
           if n then n.uuidIdx = i end
         end
       elseif ok and eventtype == -1 then
@@ -910,9 +899,7 @@ function newSidecarReconciler()
   -- Payload for rebind kinds; orphaned/ambiguous build payloads inline.
   local function payload(kind, sidecar, cc, extras)
     local from = cc or sidecar
-    local p = { kind = kind, uuid = sidecar.uuid, ppq = from.ppq,
-                chan = from.chan, msgType = from.msgType,
-                cc = from.cc, pitch = from.pitch }
+    local p = util.pick(from, 'ppq chan msgType cc pitch', { kind = kind, uuid = sidecar.uuid})
     if extras then for k, v in pairs(extras) do p[k] = v end end
     return p
   end
@@ -1035,8 +1022,7 @@ function newSidecarReconciler()
       end
     end
 
-    return { binds = binds, events = events,
-             unboundSidecars = sidecars, unboundCcs = ccs }
+    return { binds = binds, events = events, unboundSidecars = sidecars, unboundCcs = ccs }
   end
 
   return sr

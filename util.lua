@@ -55,6 +55,17 @@ function util.add(tbl, val)
   return val
 end
 
+function util.pick(src, keys, adds)
+  local dst = {}
+  for k in keys:gmatch("%S+") do
+    dst[k] = src[k]
+  end
+  if adds then
+    util.assign(dst, adds)
+  end
+  return dst
+end
+
 function util.bucket(buckets, key, val)
   local b = buckets[key]
   if not b then b = {}; buckets[key] = b end
