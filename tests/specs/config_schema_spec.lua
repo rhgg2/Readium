@@ -69,14 +69,16 @@ return {
   -- Schema defaults are the source of truth
   --------------------------------------------------------------------
   {
-    name = 'schema defaults are returned when no level has set the key',
+    -- Pin the mechanism (no level has set → schema default surfaces) on
+    -- one structurally-meaningful key. pbRange feeds detune/pb arithmetic
+    -- downstream, so its default leaking would break unrelated tests
+    -- loudly. Other defaults (defaultVelocity, noteLayout, …) are UX
+    -- choices and shouldn't be pinned here — that just makes tests fight
+    -- with everyday tweaks.
+    name = 'schema default surfaces when no level has set the key',
     run = function(harness)
       local h = harness.mk()
-      t.eq(h.cm:get('pbRange'),         2,  'pbRange default')
-      t.eq(h.cm:get('rowPerBeat'),      4,  'rowPerBeat default')
-      t.eq(h.cm:get('defaultVelocity'), 100,'defaultVelocity default')
-      t.eq(h.cm:get('polyAftertouch'),  true, 'polyAftertouch default')
-      t.eq(h.cm:get('noteLayout'),      'colemak', 'noteLayout default')
+      t.eq(h.cm:get('pbRange'), 2, 'pbRange default surfaces with no level set')
     end,
   },
   {

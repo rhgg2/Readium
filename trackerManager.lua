@@ -394,8 +394,9 @@ function newTrackerManager(mm, cm)
       end
     end
 
-    -- A delay change with no ppq update pins intent and shifts realised
-    -- by the delay delta.
+    -- Delay shifts only the note-on; endppq is intent and never carries
+    -- the delay offset. A delay change with no ppq update pins intent
+    -- and shifts realised onset by the delta.
     local function realiseNoteUpdate(evt, update)
       local dOld = delayToPPQ(evt.delay)
       local dNew = delayToPPQ(update.delay ~= nil and update.delay or evt.delay)
@@ -403,11 +404,6 @@ function newTrackerManager(mm, cm)
         update.ppq = update.ppq + dNew
       elseif dNew ~= dOld then
         update.ppq = evt.ppq + (dNew - dOld)
-      end
-      if update.endppq ~= nil then
-        update.endppq = update.endppq + dNew
-      elseif dNew ~= dOld and evt.endppq then
-        update.endppq = evt.endppq + (dNew - dOld)
       end
     end
 
@@ -729,14 +725,13 @@ function newTrackerManager(mm, cm)
       if grew then cm:set('take', 'extraColumns', extras) end
     end
 
-    -- 5) Shift into intent frame and sort by intent ppq.
+    -- 5) Shift into intent frame and sort by intent ppq. Endppq is
+    -- intent in storage too — only the note-on (or fake-pb anchor)
+    -- carries the delay offset.
     local function tidyCol(col)
       for _, evt in ipairs(col.events) do
         local d = delayToPPQ(evt.delay)
-        if d ~= 0 then
-          evt.ppq = evt.ppq - d
-          if evt.endppq then evt.endppq = evt.endppq - d end
-        end
+        if d ~= 0 then evt.ppq = evt.ppq - d end
       end
       sortByPPQ(col.events)
     end

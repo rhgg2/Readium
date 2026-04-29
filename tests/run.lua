@@ -38,6 +38,8 @@ local specs = {
   'vm_transient_frame_spec',
   'vm_reswing_cc_spec',
   'vm_straight_ppq_spec',
+  'vm_delay_entry_spec',
+  'vm_lane_drag_spec',
 }
 
 local pass, fail, failures = 0, 0, {}

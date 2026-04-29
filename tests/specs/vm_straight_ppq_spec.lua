@@ -97,13 +97,15 @@ return {
   ---------- DELAY NUDGE
 
   {
-    name = 'delay nudge shifts realised but leaves straightPPQ + frame intact',
+    name = 'delay nudge shifts realised onset but leaves end + straightPPQ intact',
     run = function(harness)
+      -- Note covers intent ppq 120..360 (duration 240). Delay 500
+      -- milli-QN = 120 ppq fits below the duration-1 collapse bound.
       local h = harness.mk{
         seed = {
           notes = {
-            { ppq = 120, endppq = 240, chan = 1, pitch = 60, vel = 100,
-              straightPPQ = 120, straightEndPPQ = 240,
+            { ppq = 120, endppq = 360, chan = 1, pitch = 60, vel = 100,
+              straightPPQ = 120, straightEndPPQ = 360,
               frame = { swing = nil, colSwing = nil, rpb = 4 } },
           },
         },
@@ -112,18 +114,17 @@ return {
       h.vm:setGridSize(80, 40)
 
       -- Edit delay on the existing note. Note delay is decimal, stops 5..7.
-      -- Set first nibble of delay magnitude to 5 → +50 ms-QN ≈ 12 ppq.
+      -- Set first nibble of delay magnitude to 5 → +500 ms-QN = 120 ppq.
       local cells = h.vm.grid.cols[1].cells
       local note  = cells[2]
       h.vm:editEvent(h.vm.grid.cols[1], note, 5, string.byte('5'), false)
 
       local n = noteByPitch(h.fm:dump(), 60)
       t.eq(n.straightPPQ, 120,    'straightPPQ untouched by delay nudge')
-      t.eq(n.straightEndPPQ, 240, 'straightEndPPQ untouched by delay nudge')
-      t.eq(n.delay, 500,          'delay applied (centi-QN, first digit slot)')
-      -- Realised ppq shifted by delayToPPQ(500) = round(240 * 0.5) = 120.
-      t.eq(n.ppq,    240,         'realised ppq shifted by delay')
-      t.eq(n.endppq, 360,         'realised endppq shifted by same delta')
+      t.eq(n.straightEndPPQ, 360, 'straightEndPPQ untouched by delay nudge')
+      t.eq(n.delay, 500,          'delay applied (milli-QN, first digit slot)')
+      t.eq(n.ppq,    240,         'realised onset shifted by delay')
+      t.eq(n.endppq, 360,         'endppq stays put — delay shifts only the note-on')
     end,
   },
 

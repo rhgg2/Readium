@@ -4,14 +4,17 @@ local t = require('support')
 
 return {
   -- Delete on a note's delay stop (selGrp 3, no block selection) resets
-  -- the delay metadata to 0 and lets the realisation line shift ppq
-  -- back to the intent row. The view layer speaks intent only: it must
-  -- not edit realised ppq directly.
+  -- the delay metadata to 0 and lets the realisation line shift the
+  -- note-on back to the intent row. Endppq is intent in storage and
+  -- never carries the delay offset, so it doesn't move when delay is
+  -- cleared. The view layer speaks intent only: it must not edit
+  -- realised ppq directly.
   {
     name = 'delete on delay stop zeroes delay metadata',
     run = function(harness)
       -- resolution=240, 4 rpb → 1 row = 60 ppq. delay=500 milli-QN = +120 ppq.
-      -- Seed realised ppq=180 so intent ppq=60 → row 1.
+      -- Seed realised onset ppq=180 so intent ppq=60 → row 1. Endppq=420
+      -- is already intent (= realised end under the new delay model).
       local h = harness.mk{
         seed = {
           notes = {
@@ -30,7 +33,7 @@ return {
       local note = h.fm:dump().notes[1]
       t.eq(note.delay, 0, 'delay metadata zeroed')
       t.eq(note.ppq,   60, 'realised ppq shifted back to intent row')
-      t.eq(note.endppq, 300, 'endppq shifted by the same delta')
+      t.eq(note.endppq, 420, 'endppq stays put (delay never shifted it)')
     end,
   },
 

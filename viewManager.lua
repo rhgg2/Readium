@@ -145,6 +145,9 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Note geometry (used by editing, adjust*, nudge, quantizeKeepRealised)
 
+  -- Realised onset/offset bounds for a note's neighbours under the
+  -- "delay shifts only the note-on" model: prev.endppq is intent (=
+  -- realised end), next.ppq + next-delay is realised onset.
   local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
     local off  = allowOverlap and cm:get('overlapOffset') * resolution or 0
     local pred = excludeEvt
@@ -152,15 +155,26 @@ function newViewManager(tm, cm, cmgr)
       or util.isNote
     local prev = util.seek(col.events, 'before', ppq, pred)
     local next = util.seek(col.events, 'after',  ppq, pred)
-    local minStart = prev and (prev.endppq + timing.delayToPPQ(prev.delay, resolution) - off) or 0
-    local maxEnd   = next and (next.ppq    + timing.delayToPPQ(next.delay, resolution) + off) or length
+    local minStart = prev and (prev.endppq - off) or 0
+    local maxEnd   = next and (next.ppq + timing.delayToPPQ(next.delay, resolution) + off) or length
     return minStart, maxEnd
   end
 
-    local function delayRange(col, n)
-        local minStart, maxEnd = overlapBounds(col, n.ppq, n, true)
-        return timing.ppqToDelay(minStart - n.ppq, resolution), timing.ppqToDelay(maxEnd - n.endppq, resolution)
-    end
+  -- Bounds on a note's `delay` field. Realised onset must stay between
+  -- prev's end and next's onset (no item-edge cap — delay is a tiny
+  -- nudge, not a position move) and the realised duration must remain
+  -- ≥ 1 ppq so the note doesn't collapse.
+  local function delayRange(col, n)
+    local off  = cm:get('overlapOffset') * resolution
+    local pred = function(e) return util.isNote(e) and e ~= n end
+    local prev = util.seek(col.events, 'before', n.ppq, pred)
+    local next = util.seek(col.events, 'after',  n.ppq, pred)
+    local minStart = prev and (prev.endppq - off) or 0
+    local maxStart = next and (next.ppq + timing.delayToPPQ(next.delay, resolution) + off) or math.huge
+    maxStart = math.min(maxStart, n.endppq - 1)
+    return timing.ppqToDelay(minStart - n.ppq, resolution),
+           timing.ppqToDelay(maxStart - n.ppq, resolution)
+  end
 
   ----- Show events by column, used by lots of selection ops
 
@@ -657,6 +671,43 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
+  ----- Lane-strip drag
+
+  -- Move event i in a cc/pb/at column to (toRow, toVal). Caller passes
+  -- toRow as either an integer (snap-to-row) or a fractional row (shift-
+  -- drag, off-grid). Identity-by-index survives the post-flush rebuild
+  -- because the ppq is clamped strictly inside (prev.ppq, next.ppq) and
+  -- col.events is sorted by ppq each rebuild.
+  function vm:moveLaneEvent(col, i, toRow, toVal)
+    if not col or not col.events then return end
+    if not util.oneOf('cc pb at', col.type) then return end
+    local evt = col.events[i]
+    if not evt then return end
+
+    local chan       = col.midiChan
+    local prev, next = col.events[i-1], col.events[i+1]
+    local newPPQ     = ctx:rowToPPQ(toRow, chan)
+    local newRow     = toRow
+    if prev and newPPQ <= prev.ppq then
+      newPPQ = prev.ppq + 1
+      newRow = ctx:ppqToRow(newPPQ, chan)
+    end
+    if next and newPPQ >= next.ppq then
+      newPPQ = next.ppq - 1
+      newRow = ctx:ppqToRow(newPPQ, chan)
+    end
+    if prev and newPPQ <= prev.ppq then return end  -- gap < 2 ppq, nowhere to go
+
+    local f, sppr = frameAndSppr(chan)
+    tm:assignEvent(col.type, evt, {
+      val         = toVal,
+      ppq         = newPPQ,
+      straightPPQ = newRow * sppr,
+      frame       = f,
+    })
+    tm:flush()
+  end
+
   ----- Interpolation
 
   local interpolate, interpolateValues do
@@ -869,6 +920,16 @@ function newViewManager(tm, cm, cmgr)
       ec:shiftSelection(rowDelta)
     end
 
+    -- All-or-nothing rigid translation by rowDelta. Preserves note length
+    -- (no shrinking when bounded) and stays grid-aligned. Bounds are
+    -- compared in row space — ceil(minRow) / floor(maxEndRow) — so an
+    -- off-grid prev.endppq pulls the integer row inward rather than
+    -- being collapsed by rowToPPQ's edge-clamps (which would otherwise
+    -- accept a -1 newStart at item-start by reporting ppq 0). On success
+    -- the cursor follows by rowDelta so repeated nudges keep targeting
+    -- the same note — unless that row already holds a different note,
+    -- in which case the cursor stays put rather than jumping onto the
+    -- neighbour.
     function adjustPosition(rowDelta)
       if ec:hasSelection() then return adjustPositionMulti(rowDelta) end
 
@@ -876,40 +937,24 @@ function newViewManager(tm, cm, cmgr)
       if not col or not note then return end
       local chan = col.midiChan
 
-      local absDelta = math.abs(rowDelta)
-      local rawRow   = ctx:ppqToRow(note.ppq, chan) + rowDelta
-      local reqRow   = (rowDelta > 0 and math.ceil(rawRow / absDelta) or math.floor(rawRow / absDelta)) * absDelta
-
-      local curLen    = ctx:snapRow(note.endppq, chan) - ctx:snapRow(note.ppq, chan)
-      local minLen    = math.min(absDelta, curLen)
+      local newStart = ctx:snapRow(note.ppq,    chan) + rowDelta
+      local newEnd   = ctx:snapRow(note.endppq, chan) + rowDelta
       local minPPQ, maxEndPPQ = overlapBounds(col, note.ppq, note, false)
-      local minRow    = ctx:ppqToRow(minPPQ, chan)
-      local maxEndRow = ctx:ppqToRow(maxEndPPQ, chan)
+      if newStart < math.ceil (ctx:ppqToRow(minPPQ,    chan)) then return end
+      if newEnd   > math.floor(ctx:ppqToRow(maxEndPPQ, chan)) then return end
 
-      local newEndRow, newRow
-      if rowDelta > 0 then
-        newEndRow = math.min(reqRow + curLen, maxEndRow)
-        newRow    = math.min(reqRow, newEndRow - minLen)
-      else
-        newRow    = math.max(reqRow, minRow)
-        newEndRow = math.max(reqRow + curLen, newRow + minLen)
-      end
-      local newPPQ    = ctx:rowToPPQ(newRow, chan)
-      local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
-
-      if newPPQ == note.ppq and newEndPPQ == note.endppq then return end
-
-      local finalDur = newEndPPQ - newPPQ
-      if finalDur ~= note.endppq - note.ppq then
-        if rowDelta > 0 then
-          tm:assignEvent('note', note, { endppq = note.ppq + finalDur })
-        else
-          tm:assignEvent('note', note, { ppq = note.endppq - finalDur })
+      local newCursorRow = ec:row() + rowDelta
+      local cursorBlocked = false
+      for _, e in ipairs(col.events) do
+        if util.isNote(e) and e ~= note
+           and ctx:snapRow(e.ppq, chan) == newCursorRow then
+          cursorBlocked = true; break
         end
       end
-      local at = stamping(chan)
-      tm:assignEvent('note', note, at(newRow, newEndRow))
+
+      tm:assignEvent('note', note, stamping(chan)(newStart, newEnd))
       tm:flush()
+      if not cursorBlocked then ec:setPos(newCursorRow) end
     end
   end
 
@@ -1017,9 +1062,11 @@ function newViewManager(tm, cm, cmgr)
       tm:flush()
     end
 
-    -- Shift intent onto grid; delay absorbs the inverse so realised is
-    -- preserved. When the required delay exceeds delayRange, clamp —
-    -- realised still preserved, intent partially off-grid.
+    -- Shift intent onset onto grid; delay absorbs the inverse so
+    -- realised onset is preserved. Endppq is intent (= realised end)
+    -- and stays put — only the note-on moves. When the required delay
+    -- exceeds delayRange, clamp — realised onset still preserved,
+    -- intent partially off-grid.
     local function quantizeKeepRealisedScope(groups)
       local clamped = 0
       for _, g in ipairs(groups) do
@@ -1036,10 +1083,8 @@ function newViewManager(tm, cm, cmgr)
               local newPPQ     = util.round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
               if newPPQ ~= e.ppq or newDelay ~= e.delay then
                 if newDelay ~= wantDelay then clamped = clamped + 1 end
-                -- Intent moves to newRow; realised duration in straight space is preserved.
                 local s = at(newRow)
-                s.ppq, s.endppq, s.delay = newPPQ, newPPQ + (e.endppq - e.ppq), newDelay
-                s.straightEndPPQ = s.straightPPQ + (straightEndOf(e) - straightOf(e))
+                s.ppq, s.delay = newPPQ, newDelay
                 tm:assignEvent('note', e, s)
               end
             end

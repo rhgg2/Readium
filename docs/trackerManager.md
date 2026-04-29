@@ -97,34 +97,41 @@ carries no marker — it's recovered geometrically.
 ## Intent vs realised frame
 
 **Delay** is a per-note metadata field (signed milli-QN, defaulted to
-0) that nudges a note off its nominal ppq. It creates two views of the
-same note:
+0) that nudges only the note-on off its nominal ppq. The note-off
+stays at intent. This creates two views of the note's onset:
 
 - **Intent ppq** is where the note nominally sits (the musician's
   authored position, and what vm renders).
-- **Realised ppq** is where mm stores it (intent plus the delay
-  offset).
+- **Realised ppq** is where mm stores the note-on (intent plus the
+  delay offset).
+
+`endppq` is intent in both views — it never carries the delay
+offset. A positive delay therefore shrinks the realised duration by
+exactly `delayToPPQ(delay)`; a negative delay extends it. This is
+classical tracker semantics (sub-row note-on nudge).
 
 vm speaks intent; mm and `um` internals speak realised. The invariant:
 
 ```
-realised = intent + delayToPPQ(delay)
+realised.ppq    = intent.ppq + delayToPPQ(delay)
+realised.endppq = intent.endppq                      -- delay does not shift the end
 ```
 
 is maintained at the vm boundary:
 
-- `tm:rebuild` strips delay via `tidyCol` before exposing events (intent
-  frame out).
-- `um:addEvent` / `um:assignEvent` add delay back before routing writes
-  to mm (realised frame in).
+- `tm:rebuild` strips delay from `ppq` via `tidyCol` before exposing
+  events (intent frame out). `endppq` is left alone — already intent.
+- `um:addEvent` / `um:assignEvent` add delay back to `ppq` before
+  routing writes to mm (realised frame in). `endppq` passes through.
 
-A delay change with no ppq update pins intent and shifts realised by
-the delay delta (`realiseNoteUpdate`). Ppq comparisons inside rebuild
-run in the realised frame — `tidyCol` is the sole shift into intent.
+A delay change with no ppq update pins intent and shifts realised
+onset by the delta (`realiseNoteUpdate`). Ppq comparisons inside
+rebuild run in the realised frame — `tidyCol` is the sole shift into
+intent.
 
-Fake pbs inherit their host note's `delay` at rebuild time so `tidyCol`
-shifts both into intent frame together. Without this, a delayed note
-and its absorber would desynchronise at the vm boundary.
+Fake pbs inherit their host note's `delay` at rebuild time so
+`tidyCol` shifts both into intent frame together. Without this, a
+delayed note and its absorber would desynchronise at the vm boundary.
 
 ## Swing
 

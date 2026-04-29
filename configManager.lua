@@ -65,8 +65,10 @@ local declarations = {
   { 'colour.laneAxis',     {138/256, 134/256, 121/256, 0.6 } },
   { 'colour.laneRowDivider',{138/256, 134/256, 121/256, 0.15} },
   { 'colour.laneAnchor',   { 48/256,  48/256,  33/256, 1   } },
+  { 'colour.laneAnchorActive',{218/256, 48/256,  33/256, 1   } },
   { 'colour.laneEnvelope', {159/256, 147/256, 115/256, 1   } },
-  { 'laneStrip.rows',      4 },
+  { 'laneStrip.rows',      4    },
+  { 'laneStrip.visible',   true },
 }
 
 local declared, defaults = {}, {}

@@ -22,15 +22,16 @@ The atoms document their `|a|` bound explicitly; pushing past it
 collapses a segment. Atoms do **not** clamp — callers read
 `timing.atomMeta[name].range` and clamp there.
 
-**Smooth atoms are sampled.** `arc`, `pocket`, `lilt`, `shuffle`, `tilt`
-are continuous parametric curves that emit dense PWL approximations
-(240 segments per unit square). The runtime treats them identically to
-hand-built PWL — eval/invert/tile/compose all consume the canonical
-control-point form. Smoothness is a property of how the shape is
-generated, not of the runtime. The sample count is a multiple of 12 so
-the principal-pulse breakpoints (x = 1/4, 1/3, 1/2, 2/3, 3/4) all land
-on exact sample points — the cross-atom drop-in invariant stays
-algebraic.
+**Smooth atoms are sampled.** `classic`, `pocket`, `lilt`, `shuffle`,
+`tilt` are continuous parametric curves that emit dense PWL
+approximations (240 segments per unit square). The runtime treats them
+identically to hand-built PWL — eval/invert/tile/compose all consume
+the canonical control-point form. Smoothness is a property of how the
+shape is generated, not of the runtime. The sample count is a multiple
+of 12 so the principal-pulse breakpoints (x = 1/4, 1/3, 1/2, 2/3, 3/4)
+all land on exact sample points — the cross-atom drop-in invariant
+stays algebraic. `id` is the only atom that returns a sparse 2-point
+shape.
 
 ## Tiled extension
 
@@ -58,18 +59,19 @@ composite = { {atom = 'classic', shift = 0.12, period = 1}, ... }
 ```
 
 `atom` names an entry in `timing.atoms`, `period` is the *user pulse*
-in QN, and `shift` is the principal pulse-1 breakpoint's displacement,
-**also in QN**. The realised view transform is the composition of the
-factors' tiled extensions — earlier factors are inner, later are outer
-(`applyFactors`). An empty array is identity.
+in QN, and `shift` is the QN-displacement of the atom's principal —
+i.e. the principal lands at `principal_qn + shift` after the factor
+applies, regardless of atom or period. The realised view transform is
+the composition of the factors' tiled extensions — earlier factors are
+inner, later are outer (`applyFactors`). An empty array is identity.
 
-`shift` is **atom-independent**: at fixed `period`, the same numeric
-`shift` lands the principal pulse-1 breakpoint at the same absolute
-time across {classic, arc, pocket, lilt, shuffle, tilt}. Atoms become
-drop-in replacements; switching `atom` preserves `shift` and only the
-interior shape of the period changes. (`drag` is the documented
-exception: same sign convention, but its non-linear x-shift means the
-magnitude only agrees in the small-`shift` limit.)
+`shift` is **atom-independent in QN**: switching `atom` preserves the
+QN-amount of `shift`. The principal it shifts is atom-specific — its
+unit-x location is in the table below, and its qn-position is
+`T_tile · x_principal`. Atoms with the same `x_principal` *and* the
+same `pulsesPerCycle` are drop-in replacements at fixed `period` (the
+principal lands in the same qn slot, only the interior shape between
+principals changes).
 
 ### Tile period vs user period
 
@@ -77,12 +79,14 @@ magnitude only agrees in the small-`shift` limit.)
 T_tile(factor) = periodQN(factor.period) × atomMeta[atom].pulsesPerCycle
 ```
 
-Only `lilt` has `pulsesPerCycle = 2` — its alternating push/pull
-covers two user-pulses per atom cycle, so its actual repeat period is
-double what the user picks. The unit-square parameter consumed by the
-atom shape is `a = shift / T_tile`. `compositePeriodQN` and the
-editor's per-factor preview both use `atomTilePeriod` so the displayed
-repeat matches the realised one.
+`lilt` and `pocket` have `pulsesPerCycle = 2` — one atom cycle spans
+two user-pulses, so the actual repeat period is double what the user
+picks. (lilt's alternating sin covers a push/pull pair; pocket's
+flat-top bump centres on the period boundary, peaking between every
+pair of user-pulses.) The unit-square parameter consumed by the atom
+shape is `a = shift / T_tile`. `compositePeriodQN` and the editor's
+per-factor preview both use `atomTilePeriod` so the displayed repeat
+matches the realised one.
 
 The runtime library lives in `cfg.swings` at project scope; slots in
 `cfg` reference composites **by name only**. Name lookup is done via
@@ -121,25 +125,23 @@ are algebraic rather than approximate.
 
 ```
 timing.atoms[name](a)            -> shape S    (a is unit-square; = shift/T_tile)
-  PWL:    id, classic, drag
-  smooth: arc, pocket, lilt, shuffle, tilt
+  PWL:    id
+  smooth: classic, pocket, lilt, shuffle, tilt
 timing.atomMeta[name]            -- { range = max |a|, pulsesPerCycle = N }
 timing.atomTilePeriod(factor)    -- periodQN(factor.period) × pulsesPerCycle
 ```
 
-| atom | shape | principal | range (max \|a\|) | pulsesPerCycle |
+| atom | shape | principal (unit-x) | range (max \|a\|) | pulsesPerCycle |
 |---|---|---|---|---|
-| `classic` | PWL tent: kink at x=0.5, height +a            | x = 0.5      | `0.5`           | 1 |
-| `drag`    | PWL: kink slides along y=0.5 to x=0.5+a       | x ≈ 0.5      | `0.5` (loose)   | 1 |
-| `arc`     | y = x + a·sin(πx)                             | x = 0.5      | `1/π ≈ 0.318`   | 1 |
-| `pocket`  | y = x + a·(1 − (2x−1)⁶) — flat-topped bump    | x = 0.5      | `1/12 ≈ 0.083`  | 1 |
-| `lilt`    | y = x + a·sin(2πx) — alternating push/pull    | x = 0.25 (peak), 0.75 (trough) | `1/(2π) ≈ 0.159` | 2 |
-| `shuffle` | y = x + a·k·(−2sin(2πx)+sin(4πx)), k = 2/(3√3) — anti-symmetric, extrema on the triplet positions | x = 1/3 (trough), 2/3 (peak) | `9/(16π√3) ≈ 0.103` | 1 |
-| `tilt`    | y = x + a·(27/4)·x·(1−x)² — asymmetric forward bump | x = 1/3 | `4/27 ≈ 0.148` | 1 |
+| `classic` | y = x + a·sin(πx) — single sin bump                                                                | x = 0.5                        | `1/π ≈ 0.318`     | 1 |
+| `pocket`  | y = x + a·(1 − (2x−1)⁶) — flat-topped bump                                                          | x = 0.5                        | `1/12 ≈ 0.083`    | 2 |
+| `lilt`    | y = x + a·sin(2πx) — alternating push/pull                                                          | x = 0.25 (peak), 0.75 (trough) | `1/(2π) ≈ 0.159`  | 2 |
+| `shuffle` | y = x + a·k·(−2sin(2πx)+sin(4πx)), k = 2/(3√3) — anti-symmetric, extrema on the triplet positions   | x = 1/3 (trough), 2/3 (peak)   | `9/(16π√3) ≈ 0.103` | 1 |
+| `tilt`    | y = x + a·(27/4)·x·(1−x)² — asymmetric forward bump                                                 | x = 1/3                        | `4/27 ≈ 0.148`    | 1 |
 
-The shift convention pins each atom's principal at exactly `x_principal + shift`
-in tile units, so atoms drop in for one another at fixed `period` (the
-interior of each pulse changes, not the principal's location).
+The shift convention pins each atom's principal at exactly
+`(x_principal · T_tile) + shift` in QN — the displacement of the
+principal is faithfully `shift` regardless of atom or period.
 
 ### Composite registry
 
@@ -196,5 +198,7 @@ compare with a small ε when checking row alignment.
 The straight grid is the canonical authoring frame: a row at index `r`
 sits at `r · straightPPQPerRow(rpb, denom, res)` PPQ. Swing realisation
 applies on top — `apply(swing, straight)` produces the realised intent
-ppq, and `delayToPPQ(delay)` shifts further into the realised+delay
-frame stored by REAPER.
+ppq, and `delayToPPQ(delay)` shifts the note-*on* further into the
+realised+delay frame stored by REAPER. The note-off (`endppq`) does
+not carry the delay offset; see `docs/trackerManager.md` for the
+asymmetric-shift model.

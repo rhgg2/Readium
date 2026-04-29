@@ -4,27 +4,22 @@ local t = require('support')
 
 return {
   {
-    name = 'empty take produces an empty grid',
-    run = function(harness)
-      local h = harness.mk()
-      t.eq(h.cm:get('rowPerBeat'), 4,  'default rowPerBeat')
-      t.eq(h.vm:rowPerBar(),       16, 'default rowPerBar (4/4)')
-      t.truthy(h.tm:resolution(),       'resolution set')
-    end,
-  },
-
-  {
-    name = 'one note on channel 1 creates one grid column',
+    name = 'one note on channel 1 surfaces as one note col with that event',
     run = function(harness)
       local h = harness.mk{
         seed = {
           notes = { { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100 } },
         },
       }
-      -- grid is private; reach in via chanFirstCol/chanLastCol by selecting col 1.
-      h.vm:setGridSize(80, 40)
-      h.ec:selectColumn(1)
-      t.eq(h.ec:col(), 1, 'cursor lands on first column')
+      local notesOnChan1 = {}
+      for _, col in ipairs(h.vm.grid.cols) do
+        if col.type == 'note' and col.midiChan == 1 then
+          notesOnChan1[#notesOnChan1 + 1] = col
+        end
+      end
+      t.eq(#notesOnChan1, 1, 'exactly one note col for chan 1')
+      t.eq(notesOnChan1[1].lane, 1, 'the note col is lane 1')
+      t.eq(#notesOnChan1[1].events, 1, 'the seeded event lives in it')
     end,
   },
 
@@ -50,11 +45,17 @@ return {
   },
 
   {
-    name = 'rowBeatInfo reports bar/beat for row 0 under 4/4',
+    -- rowBeatInfo(row) → (isBarBoundary, isBeatBoundary). Under default
+    -- 4/4 with rpb=4: row 0 is both, row 4 is a beat boundary only, row 1
+    -- is neither, row 16 is the next bar boundary.
+    name = 'rowBeatInfo flags bar and beat boundaries under 4/4',
     run = function(harness)
       local h = harness.mk()
-      local info = h.vm:rowBeatInfo(0)
-      t.truthy(info, 'rowBeatInfo returns a table')
+      local function info(row) return { h.vm:rowBeatInfo(row) } end
+      t.deepEq(info(0),  { true,  true  }, 'row 0 is bar+beat')
+      t.deepEq(info(1),  { false, false }, 'row 1 is interior')
+      t.deepEq(info(4),  { false, true  }, 'row 4 is beat-only')
+      t.deepEq(info(16), { true,  true  }, 'row 16 is the next bar')
     end,
   },
 
@@ -199,9 +200,12 @@ return {
   },
 
   {
-    name = 'grid.lane1Col has an entry per channel even on an empty take',
+    -- Empty-take grid shape: one implicit lane-1 note col per channel and
+    -- nothing else. lane1Col is populated for all 16 chans.
+    name = 'empty take: 16 implicit lane-1 note cols, lane1Col covers all chans',
     run = function(harness)
       local h = harness.mk()
+      t.eq(#h.vm.grid.cols, 16, 'one col per channel, no extras')
       for chan = 1, 16 do
         local c = h.vm.grid.lane1Col[chan]
         t.truthy(c, 'chan ' .. chan .. ' has a lane-1 col')

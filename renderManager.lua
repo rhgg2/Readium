@@ -60,6 +60,14 @@ function newRenderManager(vm, cm, cmgr)
   local swingEditor = nil  -- nil = closed, else { name, snapshot, createBuf, createError }
   local quitting   = false -- set by the quit command, observed by rm:loop
 
+  -- Lane-strip mouse interaction. drawLaneStrip publishes laneLayout each
+  -- frame (or nils it if the strip isn't showing an envelope); handleMouse
+  -- reads it for hover/drag dispatch.
+  local laneLayout  = nil  -- { x0, yTop, yBot, w, valSpan, valMin, valMax,
+                           --   scrollRow, rowSpan, col, colIdx, chan }
+  local laneHover   = nil  -- event index in laneLayout.col.events, or nil
+  local laneDrag    = nil  -- { colIdx, idx, shifted }
+
   ----- Cell renderers
 
   local function renderNote(evt, col, row)
@@ -202,6 +210,13 @@ function newRenderManager(vm, cm, cmgr)
     return pt
   end
 
+  -- Effective lane-strip row count: 0 when hidden, else the configured size.
+  -- Single point of truth for both layout and rendering.
+  local function laneStripRows()
+    if not cm:get('laneStrip.visible') then return 0 end
+    return cm:get('laneStrip.rows') or 0
+  end
+
   local function drawToolbar()
     local rowPerBeat = cm:get('rowPerBeat')
 
@@ -215,6 +230,10 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.SetNextItemWidth(ctx, textW + btnW * 2 + 16)
     local changed, n = ImGui.InputInt(ctx, '##rpb', rowPerBeat, 1, 4)
     if changed then vm:setRowPerBeat(util.clamp(n, 1, 32)) end
+
+    ImGui.SameLine(ctx, 0, 20)
+    local cv, newVis = ImGui.Checkbox(ctx, 'Graph', cm:get('laneStrip.visible'))
+    if cv then cm:set('global', 'laneStrip.visible', newVis) end
 
     ImGui.Separator(ctx)
   end
@@ -235,7 +254,7 @@ function newRenderManager(vm, cm, cmgr)
     local windowWidth, windowHeight = ImGui.GetContentRegionAvail(ctx)
     gridWidth  = math.max(1, math.floor(windowWidth  / gridX) - GUTTER)
     -- Lane strip eats a fixed number of rows above the tracker header.
-    local laneRows = cm:get('laneStrip.rows') or 0
+    local laneRows = laneStripRows()
     gridHeight = math.max(1, math.floor(windowHeight / gridY) - HEADER - 1 - laneRows)
     vm:setGridSize(gridWidth, gridHeight)
 
@@ -250,8 +269,14 @@ function newRenderManager(vm, cm, cmgr)
   -- shape (step/linear/curve) honoured between consecutive events.
   local laneRenderable = { cc = true, pb = true, at = true }
 
+  -- Min/max are in *configured* rows. The strip pads a half-row top and
+  -- bottom, so visible inner-band height = (rows - 1) gridY. A min of 3
+  -- gives the requested 2-row visible floor.
+  local LANE_ROW_MIN = 3
+  local LANE_ROW_MAX = 32
+
   local function drawLaneStrip()
-    local laneRows = cm:get('laneStrip.rows') or 0
+    local laneRows = laneStripRows()
     if laneRows <= 0 then return end
 
     local px, py    = ImGui.GetCursorScreenPos(ctx)
@@ -292,7 +317,10 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    local col = vm.grid.cols[vm:ec():col()]
+    laneLayout = nil
+    laneHover  = nil
+    local colIdx = vm:ec():col()
+    local col    = vm.grid.cols[colIdx]
     if w > 0 and col and laneRenderable[col.type] and #col.events > 0 then
       local chan   = col.midiChan
       local events = col.events
@@ -312,9 +340,10 @@ function newRenderManager(vm, cm, cmgr)
         return yBot - t * valSpan
       end
 
-      local axisCol   = colour('laneAxis')
-      local envCol    = colour('laneEnvelope')
-      local anchorCol = colour('laneAnchor')
+      local axisCol         = colour('laneAxis')
+      local envCol          = colour('laneEnvelope')
+      local anchorCol       = colour('laneAnchor')
+      local anchorActiveCol = colour('laneAnchorActive')
 
       local axisY = valToY(0)
       ImGui.DrawList_AddLine(drawList, x0, axisY, x0 + w, axisY, axisCol, 1)
@@ -354,11 +383,40 @@ function newRenderManager(vm, cm, cmgr)
 
       ImGui.DrawList_AddPolyline(drawList, reaper.new_array(pts), envCol, 0, 1.5)
 
+      -- Anchor positions, then hover hit-test, then draw with the active
+      -- index promoted to bigger+red. Drag wins over hover for active-ness.
+      local ax, ay = {}, {}
       for i = 1, n do
-        ImGui.DrawList_AddCircleFilled(drawList, ppqToX(events[i].ppq), valToY(events[i].val), 2.5, anchorCol)
+        ax[i], ay[i] = ppqToX(events[i].ppq), valToY(events[i].val)
+      end
+
+      if not laneDrag then
+        local mx, my = ImGui.GetMousePos(ctx)
+        local best2  = 36   -- 6px squared
+        for i = 1, n do
+          local dx, dy = mx - ax[i], my - ay[i]
+          local d2 = dx*dx + dy*dy
+          if d2 < best2 then best2, laneHover = d2, i end
+        end
+      end
+
+      local activeIdx = (laneDrag and laneDrag.colIdx == colIdx and laneDrag.idx) or laneHover
+      for i = 1, n do
+        if i == activeIdx then
+          ImGui.DrawList_AddCircleFilled(drawList, ax[i], ay[i], 4.5, anchorActiveCol)
+        else
+          ImGui.DrawList_AddCircleFilled(drawList, ax[i], ay[i], 2.5, anchorCol)
+        end
       end
 
       ImGui.DrawList_PopClipRect(drawList)
+
+      laneLayout = {
+        x0      = x0,      yTop    = yTop,    yBot    = yBot,    w = w,
+        valSpan = valSpan, valMin  = valMin,  valMax  = valMax,
+        scrollRow = scrollRow, rowSpan = rowSpan,
+        col     = col,     colIdx  = colIdx,  chan    = chan,
+      }
     end
 
     if w > 0 then
@@ -366,6 +424,22 @@ function newRenderManager(vm, cm, cmgr)
     end
 
     ImGui.Dummy(ctx, (totalWidth + GUTTER) * gridX, h)
+
+    -- Height nudges in the gutter, top-aligned with the strip's visible
+    -- box (yTop). Side-by-side; SetCursorScreenPos jumps in, SameLine
+    -- chains the second button, then we restore cursor so subsequent
+    -- widgets resume below the strip.
+    local cx, cy = ImGui.GetCursorScreenPos(ctx)
+    local rows = cm:get('laneStrip.rows') or 0
+    ImGui.SetCursorScreenPos(ctx, px - 2, yTop)
+    if ImGui.SmallButton(ctx, '-##laneRows') then
+      cm:set('global', 'laneStrip.rows', math.max(LANE_ROW_MIN, rows - 1))
+    end
+    ImGui.SameLine(ctx, 0, 2)
+    if ImGui.SmallButton(ctx, '+##laneRows') then
+      cm:set('global', 'laneStrip.rows', math.min(LANE_ROW_MAX, rows + 1))
+    end
+    ImGui.SetCursorScreenPos(ctx, cx, cy)
   end
 
   local function drawTracker()
@@ -592,7 +666,107 @@ function newRenderManager(vm, cm, cmgr)
     return bestCol, bestStop, fracX
   end
 
+  -- Lane-strip click/drag dispatch. Returns true when the strip claims
+  -- the gesture; handleMouse skips its tracker-grid path in that case.
+  --
+  -- Snap rule (unmodified drag) is direction-aware: round(mouseRow) is
+  -- only accepted as the target if it lies on the same side of currRow
+  -- as mouseRow does. This keeps off-grid events from jittering to the
+  -- nearest integer row on every twitch, and gracefully degrades to
+  -- "no move" when an off-grid event is sandwiched between off-grid
+  -- neighbours with no integer row between them. Identity-by-index is
+  -- enforced by vm:moveLaneEvent's ppq clamp.
+  local function handleLaneStrip()
+    local clicked = ImGui.IsMouseClicked(ctx, 0)
+    local held    = ImGui.IsMouseDown(ctx, 0)
+
+    if laneDrag and not held then
+      laneDrag, dragging = nil, false
+      return false
+    end
+
+    if not laneDrag and clicked and laneHover and laneLayout
+       and ImGui.IsWindowHovered(ctx) then
+      local mx = ImGui.GetMousePos(ctx)
+      laneDrag = {
+        colIdx        = laneLayout.colIdx,
+        idx           = laneHover,
+        startMouseRow = laneLayout.scrollRow + (mx - laneLayout.x0)
+                                              / laneLayout.w * laneLayout.rowSpan,
+      }
+      -- Pin window position for the duration of the drag (same shimmy
+      -- as the tracker-grid drag — without it ImGui repositions the
+      -- window when the mouse clips offscreen).
+      dragging = true
+      dragWinX, dragWinY = ImGui.GetWindowPos(ctx)
+      return true
+    end
+
+    if not (laneDrag and held and laneLayout) then return false end
+
+    local L   = laneLayout
+    local col = vm.grid.cols[laneDrag.colIdx]
+    if not (col and laneRenderable[col.type] and col.events[laneDrag.idx]) then
+      laneDrag, dragging = nil, false
+      return true
+    end
+
+    local mx, my   = ImGui.GetMousePos(ctx)
+    local shifted  = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
+    local mouseRow = L.scrollRow + (mx - L.x0) / L.w * L.rowSpan
+    local i        = laneDrag.idx
+    local currRow  = vm:ppqToRow(col.events[i].ppq, L.chan)
+    local startRow = laneDrag.startMouseRow
+
+    -- Direction is mouse-vs-start (not mouse-vs-event): clicking inside
+    -- the 6 px hit-circle of an off-grid anchor used to compare against
+    -- the event's exact row, so a click landing pixel-wise on either
+    -- side of that row would snap the event on frame 1. Comparing to
+    -- startMouseRow makes the click frame a no-op by construction.
+    -- The inner geometric check still uses currRow — it's about which
+    -- side of the event's row the snap target lands on.
+    local toRow = currRow
+    if shifted then
+      toRow = mouseRow
+    else
+      local target = util.round(mouseRow)
+      if mouseRow > startRow and target > currRow then
+        if i < #col.events then
+          local nextRow = vm:ppqToRow(col.events[i+1].ppq, L.chan)
+          target = math.min(target, math.ceil(nextRow) - 1)
+        end
+        if target > currRow then toRow = target end
+      elseif mouseRow < startRow and target < currRow then
+        if i > 1 then
+          local prevRow = vm:ppqToRow(col.events[i-1].ppq, L.chan)
+          target = math.max(target, math.floor(prevRow) + 1)
+        end
+        if target < currRow then toRow = target end
+      end
+    end
+
+    local rawVal = L.valMin + (L.yBot - my) / L.valSpan * (L.valMax - L.valMin)
+    local toVal  = util.clamp(util.round(rawVal), L.valMin, L.valMax)
+
+    vm:moveLaneEvent(col, i, toRow, toVal)
+
+    -- Re-anchor startMouseRow whenever a horizontal move actually
+    -- happens. Without this, after the event snaps from row 3.7 to
+    -- row 5 (mouse went up past startRow), back-tracking the mouse
+    -- below startRow but still above the new currRow=5 wouldn't bring
+    -- the event back: mouseRow > startRow stays true, so the "down"
+    -- branch never fires. Re-anchoring resets the directional reference
+    -- to where the mouse currently is, restoring smooth follow-back.
+    if toRow ~= currRow then
+      laneDrag.startMouseRow = mouseRow
+    end
+
+    return true
+  end
+
   local function handleMouse()
+    if handleLaneStrip() then return end
+
     local grid = vm.grid
     local ec = vm:ec()
     local cursorRow, cursorCol, cursorStop = ec:pos()

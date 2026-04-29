@@ -322,19 +322,118 @@ return {
   },
 
   -- 5a. adjustPosition (nudgeForward) with no sel moves the cursor-row
-  -- note's ppq forward by rowPerBeat-unit. cursorNoteBefore → at-or-
-  -- before means cursor on the note's row picks up the note.
+  -- note's ppq forward by rowPerBeat-unit, and the cursor follows so a
+  -- repeated keypress keeps targeting the same note (cursorNoteBefore
+  -- would otherwise lose it once the note's ppq passed the cursor row).
   {
-    name = 'nudgeForward with no sel advances cursor-row note by 1 row',
+    name = 'nudgeForward with no sel advances cursor-row note by 1 row and cursor follows',
     run = function(harness)
-      local h = mkNoteHarness(harness)  -- note at ppq 240
+      local h = mkNoteHarness(harness)  -- note at ppq 240..360 (rows 4..6)
       h.ec:setPos(4, 1, 1)
       h.cmgr.commands.nudgeForward()
 
       local n = h.fm:dump().notes[1]
       t.eq(n.ppq,    300, 'note.ppq advanced by 1 row (60 ppq)')
-      -- Duration preserved (both ends shift).
       t.eq(n.endppq - n.ppq, 120, 'note duration preserved')
+      t.eq(h.ec:row(), 5, 'cursor follows note forward by one row')
+    end,
+  },
+
+  -- 5a-i. Length-preservation against a hard wall. With prev.endppq on the
+  -- cursor-note's onset row, nudgeBack has nowhere to go without
+  -- shortening the note. The pre-fix code shrank the note to fit; the
+  -- contract now is all-or-nothing — refuse the move outright.
+  {
+    name = 'nudgeBack against adjacent prev refuses move; length preserved',
+    run = function(harness)
+      local h = harness.mk{ seed = { notes = {
+        { ppq = 0,   endppq = 120, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+        { ppq = 120, endppq = 240, chan = 1, pitch = 62, vel = 100, detune = 0, delay = 0 },
+      } } }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(2, 1, 1)  -- on note B's onset row
+      h.cmgr.commands.nudgeBack()
+
+      local notes = h.fm:dump().notes
+      local b
+      for _, n in ipairs(notes) do if n.pitch == 62 then b = n end end
+      t.truthy(b, 'second note still present')
+      t.eq(b.ppq,    120, 'note B onset unchanged (move refused)')
+      t.eq(b.endppq, 240, 'note B endppq unchanged (length preserved)')
+      t.eq(h.ec:row(), 2, 'cursor stays put when move refused')
+    end,
+  },
+
+  -- 5a-ii. Off-grid bound. Prev.endppq sits between rows; pre-fix code
+  -- clamped to the fractional row and landed the moved note off-grid.
+  -- The new comparison is candidate-ppq vs bound-ppq, so a sub-row
+  -- collision blocks the whole move rather than producing an off-grid
+  -- onset.
+  {
+    name = 'nudgeBack with off-grid prev.endppq does not land note off grid',
+    run = function(harness)
+      local h = harness.mk{ seed = { notes = {
+        -- prev ends at ppq 50 — between row 0 (ppq 0) and row 1 (ppq 60)
+        { ppq = 0,  endppq = 50,  chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+        { ppq = 60, endppq = 120, chan = 1, pitch = 62, vel = 100, detune = 0, delay = 0 },
+      } } }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(1, 1, 1)  -- on note B's onset row
+      h.cmgr.commands.nudgeBack()
+
+      local b
+      for _, n in ipairs(h.fm:dump().notes) do if n.pitch == 62 then b = n end end
+      t.eq(b.ppq,    60,  'note B onset unchanged (move refused — would-be ppq 0 < bound 50)')
+      t.eq(b.endppq, 120, 'note B endppq unchanged')
+      -- Critical: ppq is on a row, never the off-grid bound (50).
+      t.truthy(b.ppq % 60 == 0, 'note B ppq is grid-aligned')
+    end,
+  },
+
+  -- 5a-ii-bis. Item-start guard. ctx:rowToPPQ clamps row -1 to ppq 0, so
+  -- a candidate-ppq check would pass for a note already at ppq 0 and
+  -- we'd author at row -1, shrinking the note. Bounds in row space
+  -- (ceil(minRow) = 0) catch newStart = -1 cleanly.
+  {
+    name = 'nudgeBack on a note at ppq 0 refuses move; length preserved',
+    run = function(harness)
+      local h = harness.mk{ seed = { notes = {
+        { ppq = 0, endppq = 120, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+      } } }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(0, 1, 1)
+      h.cmgr.commands.nudgeBack()
+
+      local n = h.fm:dump().notes[1]
+      t.eq(n.ppq,    0,   'ppq stays at 0')
+      t.eq(n.endppq, 120, 'endppq unchanged (length not shrunk)')
+      t.eq(h.ec:row(), 0, 'cursor stays at row 0')
+    end,
+  },
+
+  -- 5a-iii. Cursor-follow guard. When the row the cursor would advance
+  -- into already holds a different note, leave the cursor where it is
+  -- so a follow-up nudge doesn't silently retarget the neighbour.
+  {
+    name = 'nudgeForward leaves cursor put when destination row holds another note',
+    run = function(harness)
+      local h = harness.mk{ seed = { notes = {
+        { ppq = 60,  endppq = 120, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+        { ppq = 180, endppq = 240, chan = 1, pitch = 62, vel = 100, detune = 0, delay = 0 },
+      } } }
+      h.vm:setGridSize(80, 40)
+      h.ec:setPos(2, 1, 1)  -- on A's endRow; cursorNoteBefore picks A
+      h.cmgr.commands.nudgeForward()
+
+      local a, b
+      for _, n in ipairs(h.fm:dump().notes) do
+        if     n.pitch == 60 then a = n
+        elseif n.pitch == 62 then b = n end
+      end
+      t.eq(a.ppq,    120, 'note A advanced by one row')
+      t.eq(a.endppq, 180, 'note A endppq advanced; just touches B')
+      t.eq(b.ppq,    180, 'note B unmoved')
+      t.eq(h.ec:row(), 2, 'cursor stays — row 3 is occupied by B')
     end,
   },
 

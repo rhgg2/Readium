@@ -522,12 +522,25 @@ vm:showDelay()                     -- applies to selection, else cursor col; non
 
 ```
 vm:editEvent(col, evt, stop, char, half)
+vm:moveLaneEvent(col, i, toRow, toVal)
 ```
 
-`col` is a grid column table, `evt` the currently-resident event or
-nil, `stop` the 1-indexed caret stop, `char` the typed character
-code, `half` the sub-nibble index for multi-digit fields. Routes
-through tm; commits and advances on success.
+`editEvent`: `col` is a grid column table, `evt` the currently-resident
+event or nil, `stop` the 1-indexed caret stop, `char` the typed
+character code, `half` the sub-nibble index for multi-digit fields.
+Routes through tm; commits and advances on success.
+
+`moveLaneEvent`: row-typed write surface for the lane-strip drag in
+rm. `i` is an index into `col.events`; `toRow` is integer (snap to
+row) or fractional (off-grid, shift-drag); `toVal` is the new value.
+Only `cc`/`pb`/`at` columns are eligible — other types silently
+no-op. The newPPQ is clamped strictly inside `(prev.ppq, next.ppq)`
+by ±1 ppq, which is the necessary-and-sufficient invariant for
+identity-by-index to survive the post-flush rebuild (tm sorts
+`col.events` by ppq each rebuild, so a strictly-bounded ppq lands
+back at the same index). `straightPPQ` is derived from the actual
+post-clamp row so reswing remembers the authored fractional position
+under shift-drag.
 
 ### Commands exposed to cmgr
 

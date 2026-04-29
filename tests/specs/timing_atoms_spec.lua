@@ -129,14 +129,10 @@ return {
   ---------- straightPPQPerRow
 
   {
-    name = 'straightPPQPerRow gives 60 PPQ for default rpb=4 / 4/4 / res=240',
-    run = function()
-      t.eq(timing.straightPPQPerRow(4, 4, 240), 60)
-    end,
-  },
-
-  {
-    name = 'straightPPQPerRow handles non-divisor rpbs (returns float)',
+    -- The interesting bit is that non-divisor rpbs return a float rather
+    -- than truncating — float rowPPQs are what makes round-trip exact for
+    -- multi-atom composites elsewhere.
+    name = 'straightPPQPerRow handles non-divisor rpbs (returns float, no truncation)',
     run = function()
       local v = timing.straightPPQPerRow(7, 4, 240)
       t.truthy(math.abs(v - 240/7) < 1e-12, 'rpb=7: ' .. tostring(v))

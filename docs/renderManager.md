@@ -118,10 +118,72 @@ tracker rows below. Anchor dots may overlap the strip's top and bottom
 edges — the clip rect is padded vertically so values at the extremes
 aren't half-clipped.
 
-Strip height is `laneStrip.rows * gridY`; setting `laneStrip.rows = 0`
-suppresses the strip entirely. The strip inherits the window's ambient
-background. Colour keys: `colour.laneAxis`, `colour.laneRowDivider`,
-`colour.laneEnvelope`, `colour.laneAnchor`.
+Strip height is `laneStrip.rows * gridY`. Visibility is controlled by
+`laneStrip.visible` (toolbar checkbox "Graph"); when false, the strip
+draws nothing and `computeLayout` reclaims its rows for the tracker.
+A pair of `+`/`-` `SmallButton`s in the strip's gutter nudge
+`laneStrip.rows` between 3 and 32 (the half-row pad on each side eats
+one row, so `rows = 3` is the floor that still shows 2 rows of
+envelope). Both keys live at the `global`
+level. The strip inherits the window's ambient background. Colour
+keys: `colour.laneAxis`, `colour.laneRowDivider`, `colour.laneEnvelope`,
+`colour.laneAnchor`, `colour.laneAnchorActive`.
+
+### Lane-strip mouse interaction
+
+`drawLaneStrip` publishes a per-frame `laneLayout` (or `nil` when the
+strip isn't showing an envelope) carrying the rect, value scale, row
+window, and the active column. `handleMouse` reads it for hit-testing
+and dispatch.
+
+State:
+
+- **`laneHover`** — index into `col.events` of the anchor under the
+  cursor (within ~6 px), or `nil`. Recomputed each frame inside
+  `drawLaneStrip`; suppressed while `laneDrag` is active so the
+  highlight stays pinned to the dragged anchor.
+- **`laneDrag`** — `{ colIdx, idx }` while a drag is in flight, else
+  `nil`. The pinned `colIdx` survives a rebuild that swaps the col
+  table; if the column is no longer cc/pb/at the drag aborts.
+
+Active anchor (drag wins over hover) draws at radius 4.5 in
+`colour.laneAnchorActive`; inactive anchors stay at 2.5 in
+`colour.laneAnchor`.
+
+Click on a hovered anchor starts a drag. Per held frame, rm computes:
+
+- `mouseRow = scrollRow + (mx − x0) / w · rowSpan`
+- `toVal = clamp(round(valMin + (yBot − my) / valSpan · (valMax − valMin)))`
+
+and a `toRow` that depends on the modifier:
+
+- **Unmodified.** Direction-aware integer snap. Let
+  `currRow = vm:ppqToRow(evt.ppq, chan)`, `target = round(mouseRow)`,
+  and `startRow = laneDrag.startMouseRow` (mouse row captured at
+  click). The direction predicate compares `mouseRow` to `startRow` —
+  *not* to `currRow`. That makes the click frame a no-op by
+  construction: any click landing inside the 6 px hit-circle on
+  either side of an off-grid event's exact row would otherwise snap
+  the event on frame 1. The inner check `target > currRow` /
+  `target < currRow` still uses `currRow` because it's a geometric
+  question (which side of the event's row does the snap target land
+  on?), not a direction one. Neighbour clamps: `≥ floor(prev)+1`
+  going down, `≤ ceil(next)−1` going up. If the clamp pushes `target`
+  back across `currRow`, `toRow = currRow` (no move) — this is what
+  leaves an off-grid event sandwiched between off-grid neighbours
+  stationary in time when no integer row fits.
+
+  After any horizontal move, `startMouseRow` is re-anchored to the
+  current `mouseRow`. Without this, once the event has snapped past
+  `startRow`, `mouseRow > startRow` (or `<`) would stay one-sided and
+  the opposite-direction branch could never fire — back-tracking
+  would silently break.
+- **Shift.** `toRow = mouseRow` (fractional). The result lands ppq
+  off-grid; `vm:moveLaneEvent`'s `±1 ppq` clamp is the only floor.
+
+`vm:moveLaneEvent(col, i, toRow, toVal)` is the only write surface;
+identity-by-index survives the per-frame flush via the ppq clamp (see
+`docs/viewManager.md`). Drag ends when the button releases.
 
 ## Input
 
@@ -129,9 +191,16 @@ Three independent dispatches, gated by focus:
 
 ### Mouse (`handleMouse`)
 
-`nearestStop(mouseX, mouseY)` converts a pixel to `(col, stop, fracX)`.
-`fracX` is kept separately from `col` so callers can tell "past the end
-of any column" from "inside col N". Behaviours:
+Lane-strip first: `handleLaneStrip` claims the gesture if `laneDrag`
+is active or a click lands on a hovered anchor (see
+*Lane-strip mouse interaction* above). When the strip claims,
+`handleMouse` returns immediately and the tracker-grid path below
+doesn't run.
+
+For the tracker grid: `nearestStop(mouseX, mouseY)` converts a pixel
+to `(col, stop, fracX)`. `fracX` is kept separately from `col` so
+callers can tell "past the end of any column" from "inside col N".
+Behaviours:
 
 - right-click on channel-label row → toggle that channel's mute.
 - click on channel-label row → `selectChannel`.

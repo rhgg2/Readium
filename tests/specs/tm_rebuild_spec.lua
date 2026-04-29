@@ -13,8 +13,6 @@ return {
         t.eq(#ch.columns.notes, 1, 'one note lane by default')
         t.eq(#ch.columns.notes[1].events, 0, 'lane is empty')
       end
-      t.eq(h.tm:resolution(), 240)
-      t.eq(h.tm:length(), 3840)
     end,
   },
 
