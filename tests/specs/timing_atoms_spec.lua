@@ -1,9 +1,7 @@
 -- Pin the shift semantics: composite factors carry `shift` in QN, and
 -- materialise/applyFactors consume it via a = shift / atomTilePeriod(f).
--- The drop-in invariant: at fixed period, the principal pulse-breakpoint
--- of pulse 1 lands at (nominal_input + shift) regardless of atom
--- (classic, arc, pocket, lilt, shuffle, tilt). Drag is the documented
--- exception.
+-- The shift invariant: at fixed period, the atom's principal lands at
+-- (nominal + shift) for every atom (classic, pocket, lilt, shuffle, tilt).
 
 local t = require('support')
 require('util')
@@ -20,11 +18,13 @@ local function realise(composite, ppqPerQN)
   return out
 end
 
--- Where pulse 1's principal breakpoint sits, in user-pulse units (QN).
-local pulse1PrincipalQN = {
+-- Where the atom's principal sits, in QN. For PPC=1 atoms this is the
+-- principal feature within pulse 1; for PPC=2 atoms it sits at unit-x=0.5
+-- of the tile, which maps to qn = T·0.5 = P (the user-period boundary
+-- for pocket; mid-pulse for lilt because lilt's peak is at unit-x=0.25).
+local principalQN = {
   classic = function(P) return 0.5 * P end,
-  arc     = function(P) return 0.5 * P end,
-  pocket  = function(P) return 0.5 * P end,
+  pocket  = function(P) return P end,
   lilt    = function(P) return 0.5 * P end,
   shuffle = function(P) return (2/3) * P end,
   tilt    = function(P) return (1/3) * P end,
@@ -32,28 +32,26 @@ local pulse1PrincipalQN = {
 
 return {
   {
-    name = 'atomTilePeriod doubles for lilt, passes through for the rest',
+    name = 'atomTilePeriod doubles for lilt and pocket, passes through for the rest',
     run = function()
       t.eq(timing.atomTilePeriod{ atom = 'classic', shift = 0, period = 1 }, 1)
-      t.eq(timing.atomTilePeriod{ atom = 'drag',    shift = 0, period = 1 }, 1)
-      t.eq(timing.atomTilePeriod{ atom = 'arc',     shift = 0, period = 1 }, 1)
-      t.eq(timing.atomTilePeriod{ atom = 'pocket',  shift = 0, period = 1 }, 1)
       t.eq(timing.atomTilePeriod{ atom = 'shuffle', shift = 0, period = 1 }, 1)
       t.eq(timing.atomTilePeriod{ atom = 'tilt',    shift = 0, period = 1 }, 1)
       t.eq(timing.atomTilePeriod{ atom = 'lilt',    shift = 0, period = 1 }, 2)
       t.eq(timing.atomTilePeriod{ atom = 'lilt',    shift = 0, period = 3 }, 6)
+      t.eq(timing.atomTilePeriod{ atom = 'pocket',  shift = 0, period = 1 }, 2)
+      t.eq(timing.atomTilePeriod{ atom = 'pocket',  shift = 0, period = 3 }, 6)
     end,
   },
 
   {
-    name = 'principal pulse-1 breakpoint lands at nominal + shift, atom-independent',
+    name = 'principal lands at nominal + shift, atom-independent',
     run = function()
-      for _, atom in ipairs{ 'classic', 'arc', 'pocket', 'lilt',
-                             'shuffle', 'tilt' } do
+      for _, atom in ipairs{ 'classic', 'pocket', 'lilt', 'shuffle', 'tilt' } do
         for _, P in ipairs{ 1, 2, 4 } do
           for _, shift in ipairs{ 0.05, 0.10 } do
             local factors = realise({ { atom = atom, shift = shift, period = P } })
-            local nominal = pulse1PrincipalQN[atom](P)
+            local nominal = principalQN[atom](P)
             local got     = timing.applyFactors(factors, nominal)
             local want    = nominal + shift
             t.truthy(math.abs(got - want) < 1e-9,
@@ -89,41 +87,15 @@ return {
   },
 
   {
-    name = 'pocket and classic agree at the principal, disagree off it',
-    run = function()
-      -- The drop-in property: at the same period, pocket and classic put
-      -- the principal in the same place. Off the principal, pocket's
-      -- flat-top plateau diverges from classic's sharp tent — the
-      -- interior shape differs even when the principals coincide.
-      local fc = realise({ { atom = 'classic', shift = 0.1, period = 1 } })
-      local fp = realise({ { atom = 'pocket',  shift = 0.1, period = 1 } })
-      local gotC = timing.applyFactors(fc, 0.5)
-      local gotP = timing.applyFactors(fp, 0.5)
-      t.truthy(math.abs(gotC - gotP) < 1e-9,
-        'principal: classic→' .. tostring(gotC) .. ' vs pocket→' .. tostring(gotP))
-      -- At x=0.25 classic is on its first ramp (0.5+0.1)·0.5 = 0.3,
-      -- pocket's plateau already lifts it close to 0.25+0.0984 ≈ 0.3484.
-      local offC = timing.applyFactors(fc, 0.25)
-      local offP = timing.applyFactors(fp, 0.25)
-      t.truthy(math.abs(offC - offP) > 0.01,
-        'interiors should differ at x=0.25: classic→' .. tostring(offC) ..
-        ' vs pocket→' .. tostring(offP))
-    end,
-  },
-
-  {
-    name = 'smooth atoms produce densely-sampled shapes, PWL stays sparse',
+    name = 'smooth atoms produce densely-sampled shapes, id stays sparse',
     -- Structural pin: smooth-by-sampling means the shape carries many
-    -- control points, where the PWL counterparts have only a handful.
+    -- control points; id is the lone PWL atom and stays a 2-point line.
     run = function()
-      for _, name in ipairs{ 'arc', 'pocket', 'lilt', 'shuffle', 'tilt' } do
+      for _, name in ipairs{ 'classic', 'pocket', 'lilt', 'shuffle', 'tilt' } do
         t.truthy(#timing.atoms[name](0.05) > 100,
           name .. ' should be densely sampled')
       end
-      for _, name in ipairs{ 'classic', 'drag' } do
-        t.truthy(#timing.atoms[name](0.05) <= 5,
-          name .. ' should stay sparse')
-      end
+      t.truthy(#timing.atoms.id(0.05) <= 5, 'id should stay sparse')
     end,
   },
 
@@ -132,7 +104,7 @@ return {
     -- Sample-at-boundary slope hits 0; test slightly inside (95% of range)
     -- and verify every sample step is strictly increasing.
     run = function()
-      for _, name in ipairs{ 'arc', 'pocket', 'lilt', 'shuffle', 'tilt' } do
+      for _, name in ipairs{ 'classic', 'pocket', 'lilt', 'shuffle', 'tilt' } do
         local a = 0.95 * timing.atomMeta[name].range
         local S = timing.atoms[name](a)
         for i = 2, #S do

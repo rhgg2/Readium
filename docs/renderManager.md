@@ -112,10 +112,16 @@ Value range:
 - `cc` / `at` — `[0, 127]`, bottom-up.
 - `pb` — `[-pbRange*100, +pbRange*100]` cents, axis line at zero.
 
+Bar and beat row-cells are shaded (`rowBarStart`, `rowBeat`) and a 1px
+divider sits at every row boundary (`laneRowDivider`), aligned with the
+tracker rows below. Anchor dots may overlap the strip's top and bottom
+edges — the clip rect is padded vertically so values at the extremes
+aren't half-clipped.
+
 Strip height is `laneStrip.rows * gridY`; setting `laneStrip.rows = 0`
-suppresses the strip entirely. Colour keys: `colour.laneBg`,
-`colour.laneAxis`, `colour.laneEnvelope`, `colour.laneAnchor`,
-`colour.laneLabel`.
+suppresses the strip entirely. The strip inherits the window's ambient
+background. Colour keys: `colour.laneAxis`, `colour.laneRowDivider`,
+`colour.laneEnvelope`, `colour.laneAnchor`.
 
 ## Input
 

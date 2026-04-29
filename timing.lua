@@ -37,23 +37,15 @@ M.atoms = {
 
   -- classic: PWL tent, single sharp kink at x=0.5. The reference shape
   -- against which the smooth atoms are calibrated.
-  classic = function(a)
-    if not a or a == 0 then return { {0, 0}, {1, 1} } end
-    return { {0, 0}, {0.5, 0.5 + a}, {1, 1} }
-  end,
-
-  -- drag: PWL x-mirror of classic — the breakpoint slides along y=0.5.
-  -- With the uniform a = shift/T convention, +shift slides the
-  -- breakpoint later, so events near the midpoint arrive earlier than
-  -- nominal. Magnitude only agrees with the others in the small-a limit.
-  drag = function(a)
-    if not a or a == 0 then return { {0, 0}, {1, 1} } end
-    return { {0, 0}, {0.5 + a, 0.5}, {1, 1} }
-  end,
+  -- classic = function(a)
+  --   if not a or a == 0 then return { {0, 0}, {1, 1} } end
+  --   return { {0, 0}, {0.5, 0.5 + a}, {1, 1} }
+  -- end,
 
   -- arc: smooth, single sin bump. y = x + a·sin(πx). Peak +a at x=0.5;
   -- slope 1 ± aπ at the endpoints. Smooth analogue of classic.
-  arc = function(a)
+  -- Adopting its name for now -- don't delete the original though!
+  classic = function(a)
     if not a or a == 0 then return { {0, 0}, {1, 1} } end
     return sampled(function(x) return x + a * math.sin(math.pi * x) end)
   end,
@@ -107,10 +99,9 @@ M.atoms = {
 -- its tile period is doubled.
 M.atomMeta = {
   id      = { range = 0,                           pulsesPerCycle = 1 },
-  classic = { range = 0.5,                         pulsesPerCycle = 1 },
-  drag    = { range = 0.5,                         pulsesPerCycle = 1 },
-  arc     = { range = 1/math.pi,                   pulsesPerCycle = 1 },
-  pocket  = { range = 1/12,                        pulsesPerCycle = 1 },
+--  classic = { range = 0.5,                         pulsesPerCycle = 1 },
+  classic = { range = 1/math.pi,                   pulsesPerCycle = 1 },
+  pocket  = { range = 1/12,                        pulsesPerCycle = 2 },
   lilt    = { range = 1/(2*math.pi),               pulsesPerCycle = 2 },
   shuffle = { range = 9/(16*math.pi*math.sqrt(3)), pulsesPerCycle = 1 },
   tilt    = { range = 4/27,                        pulsesPerCycle = 1 },

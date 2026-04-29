@@ -254,21 +254,49 @@ function newRenderManager(vm, cm, cmgr)
     local laneRows = cm:get('laneStrip.rows') or 0
     if laneRows <= 0 then return end
 
-    local px, py   = ImGui.GetCursorScreenPos(ctx)
-    local x0       = px + GUTTER * gridX
-    local y0       = py
-    local w        = totalWidth * gridX
-    local h        = laneRows  * gridY
-    local drawList = ImGui.GetWindowDrawList(ctx)
+    local px, py    = ImGui.GetCursorScreenPos(ctx)
+    local x0        = px + GUTTER * gridX
+    local y0        = py
+    local w         = totalWidth * gridX
+    local h         = laneRows  * gridY
+    local drawList  = ImGui.GetWindowDrawList(ctx)
+    local scrollRow = select(1, vm:scroll())
+    local numRows   = vm.grid.numRows or 0
+    -- The strip's horizontal extent maps to the rows actually rendered:
+    -- min of viewport height and remaining data. This makes rowToX agree
+    -- with the lastRow bound used by the bar/beat shading below.
+    local rowSpan = math.max(1, math.min(gridHeight, numRows - scrollRow))
+    local function rowToX(row) return x0 + (row - scrollRow) / rowSpan * w end
 
-    ImGui.DrawList_AddRectFilled(drawList, x0, y0, x0 + w, y0 + h, colour('laneBg'))
+    -- Half-row padding top and bottom: bar/beat shading, dividers, and the
+    -- envelope value-axis are all confined to this inner band so anchor
+    -- dots at the value extremes have breathing room.
+    local pad     = gridY / 2
+    local yTop    = y0 + pad
+    local yBot    = y0 + h - pad
+    local valSpan = math.max(1, h - 2 * pad)
+
+    -- Bar/beat cell shading + 1px row dividers, aligned with the tracker
+    -- rows below. The strip inherits the window's ambient bg.
+    if w > 0 then
+      local barCol, beatCol, dividerCol =
+        colour('rowBarStart'), colour('rowBeat'), colour('laneRowDivider')
+      for row = scrollRow, scrollRow + rowSpan - 1 do
+        local x = math.floor(rowToX(row)) + 0.5
+        local isBar, isBeat = vm:rowBeatInfo(row)
+        if isBar or isBeat then
+          local x2 = math.floor(rowToX(row + 1)) + 0.5
+          ImGui.DrawList_AddRectFilled(drawList, x, yTop, x2, yBot, isBar and barCol or beatCol)
+        end
+        ImGui.DrawList_AddLine(drawList, x, yTop, x, yBot, dividerCol, 1)
+      end
+    end
 
     local col = vm.grid.cols[vm:ec():col()]
     if w > 0 and col and laneRenderable[col.type] and #col.events > 0 then
-      local scrollRow = select(1, vm:scroll())
-      local chan      = col.midiChan
-      local events    = col.events
-      local n         = #events
+      local chan   = col.midiChan
+      local events = col.events
+      local n      = #events
 
       local valMin, valMax
       if col.type == 'pb' then
@@ -278,22 +306,22 @@ function newRenderManager(vm, cm, cmgr)
         valMin, valMax = 0, 127
       end
 
-      local rowSpan = math.max(1, gridHeight)
-      local function rowToX(row) return x0 + (row - scrollRow) / rowSpan * w end
       local function ppqToX(ppq) return rowToX(vm:ppqToRow(ppq, chan)) end
       local function valToY(v)
         local t = util.clamp((v - valMin) / (valMax - valMin), 0, 1)
-        return y0 + h - t * h
+        return yBot - t * valSpan
       end
 
       local axisCol   = colour('laneAxis')
       local envCol    = colour('laneEnvelope')
       local anchorCol = colour('laneAnchor')
 
-      local axisY = col.type == 'pb' and valToY(0) or (y0 + h - 0.5)
+      local axisY = valToY(0)
       ImGui.DrawList_AddLine(drawList, x0, axisY, x0 + w, axisY, axisCol, 1)
 
-      ImGui.DrawList_PushClipRect(drawList, x0, y0, x0 + w, y0 + h, true)
+      -- Pad on the clip rect lets anchor dots near the value extremes
+      -- overlap the strip edges instead of being half-clipped.
+      ImGui.DrawList_PushClipRect(drawList, x0 - 4, y0 - 4, x0 + w + 4, y0 + h + 4, true)
 
       -- One sample per pixel column. We work in row-space (vm:ppqToRow is
       -- exact), and compute a fractional ppq by lerping inside the segment
@@ -331,11 +359,10 @@ function newRenderManager(vm, cm, cmgr)
       end
 
       ImGui.DrawList_PopClipRect(drawList)
+    end
 
-      -- Label in the top-left corner.
-      local label = string.format('Ch%d %s', chan, col.label)
-      if col.type == 'cc' then label = label .. ' ' .. tostring(col.cc) end
-      ImGui.DrawList_AddText(drawList, x0 + 4, y0 + 2, colour('laneLabel'), label)
+    if w > 0 then
+      ImGui.DrawList_AddRect(drawList, x0, yTop, x0 + w, yBot, colour('rowBeat'), 0, 0, 1)
     end
 
     ImGui.Dummy(ctx, (totalWidth + GUTTER) * gridX, h)
@@ -386,8 +413,7 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    -- Header separator sits 1/3 up from the sub-label row.
-    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header', -1/3)
+    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header', -0.25)
 
     for i = 1, #chanOrder - 1 do
       local chan = chanOrder[i]
@@ -861,8 +887,7 @@ function newRenderManager(vm, cm, cmgr)
   ----- Swing editor
 
   local SWING_ATOMS   = { 'id',
-                          'classic', 'drag',
-                          'arc', 'pocket', 'lilt', 'shuffle', 'tilt' }
+                          'classic', 'pocket', 'lilt', 'shuffle', 'tilt' }
   local SWING_ATOMS_Z = table.concat(SWING_ATOMS, '\0') .. '\0\0'
 
   -- Plain narration uses the theme's text colour; the editor's outer

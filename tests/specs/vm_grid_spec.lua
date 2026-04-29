@@ -166,6 +166,39 @@ return {
   },
 
   {
+    -- Regression: vm:addExtraCol must not erase the implicit lane-1 note
+    -- column when extras[chan] was previously absent. tm:rebuild treats
+    -- absence as `{ notes = 1 }`; addExtraCol's seed has to match.
+    name = 'addExtraCol on a channel with no notes preserves the implicit note column',
+    run = function(harness)
+      local h = harness.mk()
+      h.vm:setGridSize(80, 40)
+      h.ec:selectChannel(1)
+
+      local function chan1Cols()
+        local notes, ccs = 0, 0
+        for _, col in ipairs(h.vm.grid.cols) do
+          if col.midiChan == 1 then
+            if col.type == 'note' then notes = notes + 1
+            elseif col.type == 'cc' then ccs = ccs + 1 end
+          end
+        end
+        return notes, ccs
+      end
+
+      local n0, c0 = chan1Cols()
+      t.eq(n0, 1, 'chan 1 starts with one implicit note col')
+      t.eq(c0, 0, 'chan 1 starts with no cc cols')
+
+      h.vm:addExtraCol('cc', 1)
+
+      local n1, c1 = chan1Cols()
+      t.eq(n1, 1, 'note col survives cc add (was 0 before fix — implicit col erased)')
+      t.eq(c1, 1, 'cc col added')
+    end,
+  },
+
+  {
     name = 'grid.lane1Col has an entry per channel even on an empty take',
     run = function(harness)
       local h = harness.mk()

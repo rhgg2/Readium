@@ -86,17 +86,31 @@ return {
         },
       }
       local snap = h.tm:swingSnapshot()
-      -- At ppq=120: column first pulls to 0.67 * 240 = 160.8, then global
-      -- classic-58 applied to that: t = 160.8/240 = 0.67; S_58(0.67)?
-      -- classic(0.08) is piecewise-linear {{0,0},{0.5,0.58},{1,1}} — at
-      -- x=0.67 the slope is (1-0.58)/(1-0.5) = 0.84, so
-      -- y = 0.58 + 0.84 * (0.67 - 0.5) = 0.58 + 0.1428 = 0.7228; tile=173.472.
-      local got = snap.apply(1, 120)
-      local expected = 240 * (0.58 + ((1 - 0.58) / (1 - 0.5)) * (160.8/240 - 0.5))
-      t.truthy(math.abs(got - expected) < 1e-6,
-        'composed swing mismatch: got ' .. tostring(got) .. ', expected ' .. tostring(expected))
 
-      -- And inversion still round-trips.
+      -- Compose by hand using the same factor build tm uses, so the
+      -- ordering pin doesn't depend on the closed form of the active atom.
+      local function factors(comp)
+        local f = {}
+        for i, x in ipairs(comp) do
+          local T = timing.atomTilePeriod(x)
+          f[i] = { S = timing.atoms[x.atom](x.shift / T),
+                   T = T * h.tm:resolution() }
+        end
+        return f
+      end
+      local fc58, fc67 = factors(classic58), factors(classic67)
+      local colInner = timing.applyFactors(fc58, timing.applyFactors(fc67, 120))
+      local colOuter = timing.applyFactors(fc67, timing.applyFactors(fc58, 120))
+
+      local got = snap.apply(1, 120)
+      t.truthy(math.abs(got - colInner) < 1e-9,
+        'snap matches column-inner ordering: got ' .. tostring(got)
+        .. ', column-then-global = ' .. tostring(colInner))
+      t.truthy(math.abs(colInner - colOuter) > 1e-6,
+        'orders should produce distinguishable results: ' ..
+        tostring(colInner) .. ' vs ' .. tostring(colOuter))
+
+      -- Inversion still round-trips.
       local round = snap.unapply(1, got)
       t.truthy(math.abs(round - 120) < 1e-9, 'composed round-trip failed: ' .. tostring(round))
     end,

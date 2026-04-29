@@ -70,14 +70,14 @@ return {
     end,
   },
   {
-    name = 'pocket no longer doubles: classic@1 + pocket@1 → lcm(1,1) = 1',
+    name = 'pocket doubles: classic@1 + pocket@1 → lcm(1,2) = 2',
     run = function()
-      -- pocket is now pulsesPerCycle=1, contributes its declared period
-      -- to the LCM directly.
+      -- pocket has pulsesPerCycle=2, so its tile period doubles its
+      -- declared period (matches lilt).
       t.eq(timing.compositePeriodQN{
         { atom = 'classic', shift = 0.1,  period = 1 },
         { atom = 'pocket',  shift = 0.05, period = 1 },
-      }, 1)
+      }, 2)
     end,
   },
 }

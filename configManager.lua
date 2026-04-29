@@ -61,14 +61,12 @@ local declarations = {
   { 'colour.tailBord',     {140/256, 170/256, 200/256, 1  } },
   { 'colour.ghost',        {100/256, 130/256, 160/256, 0.9} },
   { 'colour.ghostNegative',{218/256, 130/256, 120/256, 0.9} },
-
   -- Lane strip (CC/PB/AT envelope visualiser above the tracker grid).
-  { 'laneStrip.rows',      4 },
-  { 'colour.laneBg',       {198/256, 194/256, 181/256, 1   } },
   { 'colour.laneAxis',     {138/256, 134/256, 121/256, 0.6 } },
+  { 'colour.laneRowDivider',{138/256, 134/256, 121/256, 0.15} },
   { 'colour.laneAnchor',   { 48/256,  48/256,  33/256, 1   } },
   { 'colour.laneEnvelope', {159/256, 147/256, 115/256, 1   } },
-  { 'colour.laneLabel',    { 48/256,  48/256,  33/256, 0.7 } },
+  { 'laneStrip.rows',      4 },
 }
 
 local declared, defaults = {}, {}

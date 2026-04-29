@@ -1460,7 +1460,9 @@ function newViewManager(tm, cm, cmgr)
       local chan = col.midiChan
       if not seen[chan] then
         seen[chan] = true
-        local want = extras[chan] or { notes = 0 }
+        -- Absence-default mirrors tm:rebuild's: no entry means one implicit
+        -- note col. Seeding 0 here would erase that col on the next rebuild.
+        local want = extras[chan] or { notes = 1 }
         extras[chan] = want
         if type == 'note' then
           want.notes = want.notes + 1
