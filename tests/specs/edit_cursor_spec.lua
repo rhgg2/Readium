@@ -556,6 +556,82 @@ return {
     end,
   },
 
+  -- 5a-iv. Same family as growNote-under-c58: under non-trivial swing,
+  -- the next-note's onset row, recovered via floor(ppqToRow(B.ppq)),
+  -- can drift below its true value because B.ppq is round(fromLogical(B.ppqL))
+  -- — a rounding hop that ppqToRow can't undo exactly. nudgeForward
+  -- compared `newEnd > floor(ppqToRow(maxEndPPQ))` and refused
+  -- legitimate moves where newEnd was the row B already sits on.
+  {
+    name = 'nudgeForward under c58 swing reaches a row-aligned next-note onset',
+    run = function(harness)
+      local classic58 = { { atom = 'classic', shift = 0.08, period = 1 } }
+      -- 4 rpb, c58. rowPPQs[1]=74, rowPPQs[2]=139, rowPPQs[3]=194.
+      -- A: row 0..1 (ppq 0..74). B: row 2..3 (ppq 139..194), diff pitch.
+      -- nudgeForward(A) → A.ppq=74, A.endppq=139, just touching B.
+      local h = harness.mk{
+        seed = { notes = {
+          { ppq = 0,   endppq = 74,  chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0,
+            ppqL = 0,   endppqL = 60,
+            frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
+          { ppq = 139, endppq = 194, chan = 1, pitch = 62, vel = 80,  detune = 0, delay = 0,
+            ppqL = 120, endppqL = 180,
+            frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
+        } },
+        config = {
+          project = { swings = { c58 = classic58 } },
+          take    = { swing = 'c58', rowPerBeat = 4 },
+        },
+      }
+      h.vm:setGridSize(80, 16)
+
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 1, 'A and B share lane 1 (different pitch, no overlap)')
+
+      h.ec:setPos(0, 1, 1)  -- cursorNoteBefore picks A
+      h.cmgr.commands.nudgeForward()
+
+      local a
+      for _, n in ipairs(h.fm:dump().notes) do
+        if n.pitch == 60 then a = n end
+      end
+      t.eq(a.ppq,    74,  'A.ppq advanced one row to row 1 onset')
+      t.eq(a.endppq, 139, 'A.endppq lands on B.ppq exactly (legato touch)')
+      t.eq(h.ec:row(), 1, 'cursor follows the moved note by one row')
+    end,
+  },
+
+  -- 5a-v. Symmetry with growNote's lenient bound. growNote allows A's
+  -- endppq to land 15 ppq past B's onset (overlapOffset for diff-pitch
+  -- col-mates). nudgeBack on B back into that lenient zone must be
+  -- allowed — otherwise the user can grow but can't reposition into
+  -- the same overlap state, an asymmetry against the column
+  -- allocator's lenient acceptance criterion.
+  {
+    name = 'nudgeBack into a grown lenient overlap is allowed (diff-pitch)',
+    run = function(harness)
+      -- A: ppq 0..135 (grown into 15-ppq leniency past row 2). B at row 3.
+      -- Both diff-pitch col-mates in the same lane.
+      local h = harness.mk{ seed = { notes = {
+        { ppq = 0,   endppq = 135, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+        { ppq = 180, endppq = 240, chan = 1, pitch = 62, vel = 100, detune = 0, delay = 0 },
+      } } }
+      h.vm:setGridSize(80, 40)
+
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 1, 'A and B share lane 1 (overlap within lenient threshold)')
+
+      h.ec:setPos(3, 1, 1)  -- on B's onset row
+      h.cmgr.commands.nudgeBack()
+
+      local b
+      for _, n in ipairs(h.fm:dump().notes) do if n.pitch == 62 then b = n end end
+      t.eq(b.ppq,    120, 'B.ppq moved back to row 2 (within A.endppq + lenient)')
+      t.eq(b.endppq, 180, 'B duration preserved')
+      t.eq(h.ec:row(), 2, 'cursor follows by one row')
+    end,
+  },
+
   -- 5b. nudgeFineUp with no sel on a pitch-stop cursor raises pitch by 1
   -- (untuned: pitchStep(coarse=false) = 1 semitone).
   {

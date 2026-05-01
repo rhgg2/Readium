@@ -2,6 +2,10 @@
 
 loadModule('util')
 
+local function print(...)
+  return util.print(...)
+end
+
 function newEditCursor(deps)
 
   ---------- PRIVATE

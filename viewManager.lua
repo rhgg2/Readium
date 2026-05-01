@@ -147,16 +147,24 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Note geometry (used by editing, adjust*, nudge, quantizeKeepRealised)
 
-  -- Tightest prev.endppq and next.ppq across cols.events matching pred.
-  local function neighbourBounds(cols, ppq, pred)
-    local prevEnd, nextStart
+  -- Closest matching events on each side of `ppq`, across `cols.events`.
+  -- prev maximises endppq; nxt minimises ppq. Returns the events themselves
+  -- so callers can read whichever frame (intent ppq or logical ppqL) suits.
+  local function neighbourEvents(cols, ppq, pred)
+    local prev, nxt
     for _, c in ipairs(cols) do
       local p = util.seek(c.events, 'before', ppq, pred)
       local n = util.seek(c.events, 'after',  ppq, pred)
-      if p and (not prevEnd   or p.endppq > prevEnd  ) then prevEnd   = p.endppq end
-      if n and (not nextStart or n.ppq    < nextStart) then nextStart = n.ppq    end
+      if p and (not prev or p.endppq > prev.endppq) then prev = p end
+      if n and (not nxt  or n.ppq    < nxt.ppq    ) then nxt  = n end
     end
-    return prevEnd, nextStart
+    return prev, nxt
+  end
+
+  local function notePreds(excludeEvt)
+    local pitch = excludeEvt and excludeEvt.pitch
+    return function(e) return util.isNote(e) and e ~= excludeEvt and e.pitch ~= pitch end,
+           function(e) return util.isNote(e) and e ~= excludeEvt and e.pitch == pitch end
   end
 
   -- Bounds on placing/extending a note. Different-pitch neighbours
@@ -166,16 +174,151 @@ function newViewManager(tm, cm, cmgr)
   -- leniency: MIDI permits only one voice per (chan, pitch).
   local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
     local lenient = allowOverlap and cm:get('overlapOffset') * resolution or 0
-    local pitch   = excludeEvt and excludeEvt.pitch
-    local diff = function(e) return util.isNote(e) and e ~= excludeEvt and e.pitch ~= pitch end
-    local same = function(e) return util.isNote(e) and e ~= excludeEvt and e.pitch == pitch end
+    local diff, same = notePreds(excludeEvt)
 
-    local prevD, nextD = neighbourBounds({col}, ppq, diff)
-    local prevS, nextS = neighbourBounds(tm:getChannel(col.midiChan).columns.notes, ppq, same)
+    local prevD, nextD = neighbourEvents({col}, ppq, diff)
+    local prevS, nextS = neighbourEvents(tm:getChannel(col.midiChan).columns.notes, ppq, same)
 
-    local minStart = math.max(prevD and (prevD - lenient) or 0,      prevS or 0)
-    local maxEnd   = math.min(nextD and (nextD + lenient) or length, nextS or length)
+    local minStart = math.max(prevD and (prevD.endppq - lenient) or 0,      prevS and prevS.endppq or 0)
+    local maxEnd   = math.min(nextD and (nextD.ppq    + lenient) or length, nextS and nextS.ppq    or length)
     return minStart, maxEnd
+  end
+
+  -- Row-space sibling of overlapBounds for row-aligned moves. Reads
+  -- ppqL/endppqL when present — exact for editor-authored notes, since
+  -- they're written as row*logPerRow. Going via ppqToRow(.ppq) loses a
+  -- fractional row to the fromLogical→round→toLogical round-trip and
+  -- can refuse a slot the neighbour's row already permits (e.g. row 2
+  -- under c58 reads back as 1.997, collapsing the upper bound to row
+  -- 1). Same lenient-diff / strict-same model as overlapBounds;
+  -- leniency lives in intent ppq, so the lenient diff edges go through
+  -- ppqToRow (lenient pushes us off-row anyway) while the strict edges
+  -- prefer the exact ppqL. Off-grid neighbours still pull the integer
+  -- row inward via ceil/floor.
+  local function rowBounds(col, ppq, excludeEvt, allowOverlap)
+    local chan, logPerRow = col.midiChan, ctx:ppqPerRow()
+    local lenient = allowOverlap and cm:get('overlapOffset') * resolution or 0
+    local diff, same = notePreds(excludeEvt)
+
+    local prevD, nextD = neighbourEvents({col}, ppq, diff)
+    local prevS, nextS = neighbourEvents(tm:getChannel(chan).columns.notes, ppq, same)
+
+    -- slack > 0 ⇒ go through swing (leniency is an intent-ppq quantity).
+    -- slack == 0 ⇒ prefer ppqL/endppqL; fall back to ppq via swing.
+    local function startL(e, slack)
+      if slack ~= 0 then return ctx:ppqToRow(e.ppq + slack, chan) * logPerRow end
+      return e.ppqL or ctx:ppqToRow(e.ppq, chan) * logPerRow
+    end
+    local function endL(e, slack)
+      if slack ~= 0 then return ctx:ppqToRow(e.endppq + slack, chan) * logPerRow end
+      return e.endppqL or ctx:ppqToRow(e.endppq, chan) * logPerRow
+    end
+
+    local fullL = grid.numRows * logPerRow
+    local prevEndL   = math.max(prevD and endL  (prevD, -lenient) or 0,     prevS and endL  (prevS, 0) or 0)
+    local nextStartL = math.min(nextD and startL(nextD,  lenient) or fullL, nextS and startL(nextS, 0) or fullL)
+    return math.ceil(prevEndL / logPerRow), math.floor(nextStartL / logPerRow)
+  end
+
+  -- Resolve overlap excess in a per-column plan list. After path-side
+  -- rounding (reswing/quantize/insertRow), two col-mates can land past
+  -- noteColumnAccepts' threshold (0 same-pitch, lenient diff-pitch) or
+  -- onto identical ppqs. We fix it in-plan, never in the allocator:
+  --
+  --   * tail-overlap: predecessor's tail is the preferred clip target
+  --     (legato — onset stays put, duration shrinks); when the
+  --     predecessor is unplanned/fixed, successor's onset clips up
+  --     instead (its newEndppq stays put, so duration shrinks the same
+  --     direction).
+  --   * same-onset collision: shift the later-source-`ppqL` one by 1
+  --     ppq. All four callers are monotone, so reordering is impossible
+  --     — only collapse, which 1 ppq separates.
+  --
+  -- Each plan entry: `{ col, e, newppq, [newEndppq] }`. Mutates
+  -- `newppq` / `newEndppq` on plan entries in place. Non-note plans
+  -- and non-note cols are skipped. Unplanned col-mates are read from
+  -- `col.events` and treated as fixed.
+  local function conformOverlaps(plans)
+    local lenient = cm:get('overlapOffset') * resolution
+    local plansByCol = {}
+    for _, p in ipairs(plans) do
+      if util.isNote(p.e) then
+        plansByCol[p.col] = plansByCol[p.col] or {}
+        util.add(plansByCol[p.col], p)
+      end
+    end
+    for col, colPlans in pairs(plansByCol) do
+      local planByEvt = {}
+      for _, p in ipairs(colPlans) do planByEvt[p.e] = p end
+
+      local timeline = {}
+      for _, e in ipairs(col.events) do
+        if util.isNote(e) then
+          local p = planByEvt[e]
+          util.add(timeline, { e = e, plan = p,
+            ppq    = (p and p.newppq)    or e.ppq,
+            endppq = (p and p.newEndppq) or e.endppq })
+        end
+      end
+      table.sort(timeline, function(a, b)
+        if a.ppq ~= b.ppq then return a.ppq < b.ppq end
+        return (a.e.ppqL or 0) < (b.e.ppqL or 0)
+      end)
+
+      for i = 2, #timeline do
+        local prev, curr = timeline[i - 1], timeline[i]
+        -- Same-onset shift first. The later-source-ppqL one (curr by
+        -- sort tie-break) moves up 1 ppq; if it's fixed, prev moves
+        -- back instead — rare, only when a planned event happens to
+        -- round onto an unplanned col-mate's ppq.
+        if prev.ppq == curr.ppq then
+          if curr.plan then
+            curr.plan.newppq = curr.ppq + 1
+            curr.ppq         = curr.ppq + 1
+          elseif prev.plan then
+            prev.plan.newppq = prev.ppq - 1
+            prev.ppq         = prev.ppq - 1
+          end
+        end
+        -- Tail-overlap clip on the post-shift state. Predecessor's
+        -- tail clips first (legato — onset stays); only when the
+        -- predecessor is fixed does the successor's onset lift.
+        local threshold = (prev.e.pitch == curr.e.pitch) and 0 or lenient
+        local excess    = prev.endppq - curr.ppq - threshold
+        if excess > 0 then
+          if prev.plan then
+            local clipped = math.max(prev.ppq + 1,
+                                     (prev.plan.newEndppq or prev.e.endppq) - excess)
+            prev.plan.newEndppq = clipped
+            prev.endppq         = clipped
+          elseif curr.plan then
+            local lifted = math.min(curr.endppq - 1, curr.ppq + excess)
+            curr.plan.newppq = lifted
+            curr.ppq         = lifted
+          end
+        end
+      end
+    end
+  end
+
+  -- Write a plan list through `tm:assignEvent`. Each plan: any subset
+  -- of `newppq, newEndppq, newPpqL, newEndppqL, newFrame, newDelay`.
+  -- The corresponding update keys are emitted only for fields present
+  -- on the plan; endppq/endppqL only for notes.
+  local function writePlans(plans)
+    for _, p in ipairs(plans) do
+      local kind = util.isNote(p.e) and 'note' or p.col.type
+      local u    = {}
+      if p.newppq    ~= nil then u.ppq    = p.newppq    end
+      if p.newPpqL   ~= nil then u.ppqL   = p.newPpqL   end
+      if p.newFrame  ~= nil then u.frame  = p.newFrame  end
+      if p.newDelay  ~= nil then u.delay  = p.newDelay  end
+      if util.isNote(p.e) then
+        if p.newEndppq  ~= nil then u.endppq  = p.newEndppq  end
+        if p.newEndppqL ~= nil then u.endppqL = p.newEndppqL end
+      end
+      tm:assignEvent(kind, p.e, u)
+    end
   end
 
   -- Bounds on a note's `delay` field. Two constraints, both natural
@@ -191,7 +334,8 @@ function newViewManager(tm, cm, cmgr)
   -- duration stays ≥ 1 ppq.
   local function delayRange(col, n)
     local sameP = function(e) return util.isNote(e) and e ~= n and e.pitch == n.pitch end
-    local prevSameEnd = neighbourBounds(tm:getChannel(col.midiChan).columns.notes, n.ppq, sameP)
+    local prevSame    = neighbourEvents(tm:getChannel(col.midiChan).columns.notes, n.ppq, sameP)
+    local prevSameEnd = prevSame and prevSame.endppq
 
     local prev  = util.seek(col.events, 'before', n.ppq, util.isNote)
     local nextE = util.seek(col.events, 'after',  n.ppq, util.isNote)
@@ -921,22 +1065,20 @@ function newViewManager(tm, cm, cmgr)
 
     local function adjustPositionMulti(rowDelta)
       if rowDelta == 0 then return end
+      local logPerRow = ctx:ppqPerRow()
       local runs = {}
       for _, g in ipairs(eventsByCol()) do
         if g.col.type == 'note' then
-          local chan = g.col.midiChan
           local ns = {}
           for _, n in pairs(g.locs) do util.add(ns, n) end
           if #ns > 0 then
             table.sort(ns, function(a, b) return a.ppq < b.ppq end)
             if rowDelta > 0 then
-              local _, maxEnd = overlapBounds(g.col, ns[#ns].ppq, ns[#ns], false)
-              local room = math.floor(ctx:ppqToRow(maxEnd, chan) - ctx:snapRow(ns[#ns].endppq, chan))
-              if room < rowDelta then return end
+              local _, maxRow = rowBounds(g.col, ns[#ns].ppq, ns[#ns], true)
+              if maxRow - ns[#ns].endppqL / logPerRow < rowDelta then return end
             else
-              local minStart = overlapBounds(g.col, ns[1].ppq, ns[1], false)
-              local room = math.ceil(ctx:ppqToRow(minStart, chan) - ctx:snapRow(ns[1].ppq, chan))
-              if room > rowDelta then return end
+              local minRow = rowBounds(g.col, ns[1].ppq, ns[1], true)
+              if minRow - ns[1].ppqL / logPerRow > rowDelta then return end
             end
             util.add(runs, { col = g.col, notes = ns })
           end
@@ -963,11 +1105,14 @@ function newViewManager(tm, cm, cmgr)
     end
 
     -- All-or-nothing rigid translation by rowDelta. Preserves note length
-    -- (no shrinking when bounded) and stays grid-aligned. Bounds are
-    -- compared in row space — ceil(minRow) / floor(maxEndRow) — so an
-    -- off-grid prev.endppq pulls the integer row inward rather than
-    -- being collapsed by rowToPPQ's edge-clamps (which would otherwise
-    -- accept a -1 newStart at item-start by reporting ppq 0). On success
+    -- (no shrinking when bounded) and stays grid-aligned. Bounds come
+    -- from rowBounds with the same lenient diff-pitch threshold growNote
+    -- uses — so a note grown into the lenient overlap zone can also be
+    -- nudged back into it, matching the column allocator's acceptance
+    -- criterion. Off-grid neighbours pull the integer row inward via
+    -- ceil/floor (item-start guard: ceil(0) = 0 catches newStart = -1);
+    -- on-grid neighbours under non-trivial swing read out of ppqL
+    -- exactly so the round-trip noise can't refuse the slot. On success
     -- the cursor follows by rowDelta so repeated nudges keep targeting
     -- the same note — unless that row already holds a different note,
     -- in which case the cursor stays put rather than jumping onto the
@@ -981,9 +1126,8 @@ function newViewManager(tm, cm, cmgr)
 
       local newStart = ctx:snapRow(note.ppq,    chan) + rowDelta
       local newEnd   = ctx:snapRow(note.endppq, chan) + rowDelta
-      local minPPQ, maxEndPPQ = overlapBounds(col, note.ppq, note, false)
-      if newStart < math.ceil (ctx:ppqToRow(minPPQ,    chan)) then return end
-      if newEnd   > math.floor(ctx:ppqToRow(maxEndPPQ, chan)) then return end
+      local minRow, maxRow = rowBounds(col, note.ppq, note, true)
+      if newStart < minRow or newEnd > maxRow then return end
 
       local newCursorRow = ec:row() + rowDelta
       local cursorBlocked = false
@@ -1083,7 +1227,13 @@ function newViewManager(tm, cm, cmgr)
         end
       end
 
-      -- Monotone reparameterisation + the clamp above: the end-state
+      -- Pass 2: conform overlaps that monotone-but-rounded
+      -- swing.fromLogical may have nudged past noteColumnAccepts'
+      -- threshold (or onto the same ppq). Without this, allocator
+      -- rejects the persisted lane and the successor drifts.
+      conformOverlaps(plans)
+
+      -- Monotone reparameterisation + the clamps above: the end-state
       -- can't introduce new same-(chan, pitch) overlaps, so opt out of
       -- tm's per-write clamp. Without this, the first-processed of
       -- two legato siblings would see its endppq clipped against the
@@ -1136,9 +1286,16 @@ function newViewManager(tm, cm, cmgr)
       })
     end
 
+    -- Plan-then-write so conformOverlaps can clip plan geometry against
+    -- col-mates before the writes commit. Two off-grid col-mates can
+    -- otherwise quantize-collapse onto the same ppq (or onto adjacent
+    -- rows whose post-snap distance crosses the lenient threshold),
+    -- and the allocator would reject the persisted lane on rebuild.
     local function quantizeScope(groups)
+      local plans = {}
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
+        local f, logPerRow = frameAndLogPerRow(chan)
         for _, e in pairs(g.locs) do
           local sRow   = ctx:ppqToRow(e.ppq, chan)
           local newRow = util.round(sRow)
@@ -1147,57 +1304,65 @@ function newViewManager(tm, cm, cmgr)
             local newEndRow = newRow + util.round(ctx:ppqToRow(e.endppq, chan) - sRow)
             local newEndppq = ctx:rowToPPQ(newEndRow, chan)
             if newppq ~= e.ppq or newEndppq ~= e.endppq then
-              assignStamp('note', e, chan, newRow, newEndRow)
+              util.add(plans, { col = col, e = e, newFrame = f,
+                newppq    = newppq,    newEndppq  = newEndppq,
+                newPpqL   = newRow * logPerRow,
+                newEndppqL = newEndRow * logPerRow })
             end
           elseif newppq ~= e.ppq then
-            assignStamp(col.type, e, chan, newRow)
+            util.add(plans, { col = col, e = e, newFrame = f,
+              newppq = newppq, newPpqL = newRow * logPerRow })
           end
         end
       end
+
+      conformOverlaps(plans)
+      writePlans(plans)
       tm:flush()
     end
 
     -- Shift intent onset onto grid; delay absorbs the inverse so
     -- realised onset is preserved. Endppq is intent (= realised end)
-    -- and stays put — only the note-on moves. When the required delay
-    -- exceeds delayRange, clamp — realised onset still preserved,
-    -- intent partially off-grid.
+    -- and stays put — only the note-on moves. Plan-then-write so
+    -- conformOverlaps can adjust newppq for L2; delay is then re-derived
+    -- against the conformed newppq so realised onset is preserved up
+    -- to the delayRange clamp.
     local function quantizeKeepRealisedScope(groups)
-      local clamped = 0
+      local plans, clamped = {}, 0
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
+        local f, logPerRow = frameAndLogPerRow(chan)
         for _, e in pairs(g.locs) do
-          if util.isNote(e) then
-            local newRow    = ctx:snapRow(e.ppq, chan)
-            local targetppq = ctx:rowToPPQ(newRow, chan)
-            if targetppq ~= e.ppq then
-              local wantDelay  = e.delay + timing.ppqToDelay(e.ppq - targetppq, resolution)
-              local dMin, dMax = delayRange(col, e)
-              local newDelay   = util.clamp(wantDelay, dMin, dMax)
-              local newppq     = util.round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
-              if newppq ~= e.ppq or newDelay ~= e.delay then
-                if newDelay ~= wantDelay then clamped = clamped + 1 end
-                -- endppq stays put (intent), but endppqL must be re-expressed
-                -- in the new frame's logPerRow for coherence with the rebased head.
-                local f, logPerRow = frameAndLogPerRow(chan)
-                tm:assignEvent('note', e, {
-                  ppq     = newppq,
-                  ppqL    = newRow * logPerRow,
-                  delay   = newDelay,
-                  endppqL = ctx:ppqToRow(e.endppq, chan) * logPerRow,
-                  frame   = f,
-                })
-              end
+          local newRow = ctx:snapRow(e.ppq, chan)
+          local newppq = ctx:rowToPPQ(newRow, chan)
+          if newppq ~= e.ppq then
+            local entry = { col = col, e = e, newFrame = f,
+              newppq = newppq, newPpqL = newRow * logPerRow }
+            if util.isNote(e) then
+              -- endppq stays (intent), but endppqL must be re-expressed
+              -- in the new frame's logPerRow for coherence with the head.
+              entry.newEndppqL = ctx:ppqToRow(e.endppq, chan) * logPerRow
             end
-          else
-            local newRow = ctx:snapRow(e.ppq, chan)
-            if ctx:rowToPPQ(newRow, chan) ~= e.ppq then
-              assignStamp(col.type, e, chan, newRow)
-            end
+            util.add(plans, entry)
           end
         end
       end
+
+      conformOverlaps(plans)
+
+      for _, p in ipairs(plans) do
+        if util.isNote(p.e) then
+          local realised = p.e.ppq + timing.delayToPPQ(p.e.delay, resolution)
+          local ideal    = timing.ppqToDelay(realised - p.newppq, resolution)
+          local dMin, dMax = delayRange(p.col, p.e)
+          p.newDelay = util.clamp(ideal, dMin, dMax)
+          if p.newDelay ~= ideal then clamped = clamped + 1 end
+        end
+      end
+
+      writePlans(plans)
       tm:flush()
+
       if clamped > 0 then
         reaper.ShowMessageBox(
           clamped .. ' note(s) partially quantized — delay clamped at overlap bound.',
@@ -1219,25 +1384,23 @@ function newViewManager(tm, cm, cmgr)
   end
 
   local insertRow, deleteRow do
-    -- Shift one event by dLogical rows under frame f. ppq is re-realised
-    -- from the new ppqL via current swing — a constant ±dppq shift would
-    -- only be correct under identity swing, since under non-trivial swing
-    -- rowToPPQ is non-linear and events at heterogeneous source rows
-    -- would land at non-grid realised positions.
-    local function shiftEvent(col, e, dLogical, swing, f)
+    -- Build a shift plan for one event by `dLogical` rows under `swing`
+    -- and `f`. ppq is re-realised from the new ppqL via swing — a
+    -- constant ±dppq would only be right under identity, since under
+    -- non-trivial swing rowToPPQ is non-linear and per-event ppqs round
+    -- independently. The plan list is then conformed and written.
+    local function shiftPlan(col, e, dLogical, swing, f)
       local chan    = col.midiChan
-      local kind    = util.isNote(e) and 'note' or col.type
       local newppqL = logicalOf(e) + dLogical
-      local update  = {
-        ppq   = util.round(swing.fromLogical(chan, newppqL)),
-        ppqL  = newppqL,
-        frame = f,
+      local entry   = { col = col, e = e, newFrame = f,
+        newppq = util.round(swing.fromLogical(chan, newppqL)),
+        newPpqL = newppqL,
       }
       if util.isNote(e) then
-        update.endppqL = endLogicalOf(e) + dLogical
-        update.endppq  = math.min(util.round(swing.fromLogical(chan, update.endppqL)), length)
+        entry.newEndppqL = endLogicalOf(e) + dLogical
+        entry.newEndppq  = math.min(util.round(swing.fromLogical(chan, entry.newEndppqL)), length)
       end
-      tm:assignEvent(kind, e, update)
+      return entry
     end
 
     local function insertRowCore(col, topRow, numRows)
@@ -1247,14 +1410,16 @@ function newViewManager(tm, cm, cmgr)
       local C        = ctx:rowToPPQ(topRow, chan)
       local dLogical = numRows * logPerRow
 
-      local shifted = {}
-      for e in util.between(col.events, C, length) do util.add(shifted, e) end
-      for i = #shifted, 1, -1 do
-        local e = shifted[i]
-        local newppq = util.round(swing.fromLogical(chan, logicalOf(e) + dLogical))
-        if newppq >= length then tm:deleteEvent(col.type, e)
-        else                     shiftEvent(col, e, dLogical, swing, f) end
+      local plans, deletes = {}, {}
+      for e in util.between(col.events, C, length) do
+        local p = shiftPlan(col, e, dLogical, swing, f)
+        if p.newppq >= length then util.add(deletes, { col = col, evt = e })
+        else                       util.add(plans, p) end
       end
+
+      conformOverlaps(plans)
+      for _, d in ipairs(deletes) do tm:deleteEvent(d.col.type, d.evt) end
+      writePlans(plans)
 
       if col.type == 'note' then
         local spanning = util.seek(col.events, 'before', C, util.isNote)
@@ -1291,12 +1456,15 @@ function newViewManager(tm, cm, cmgr)
         end
       end
 
-      local touched = {}
-      for e in util.between(col.events, C, length) do util.add(touched, e) end
-      for _, e in ipairs(touched) do
-        if e.ppq < D then tm:deleteEvent(col.type, e)
-        else              shiftEvent(col, e, -dLogical, swing, f) end
+      local plans, deletes = {}, {}
+      for e in util.between(col.events, C, length) do
+        if e.ppq < D then util.add(deletes, { col = col, evt = e })
+        else              util.add(plans, shiftPlan(col, e, -dLogical, swing, f)) end
       end
+
+      conformOverlaps(plans)
+      for _, d in ipairs(deletes) do tm:deleteEvent(d.col.type, d.evt) end
+      writePlans(plans)
     end
 
     local function forEachRowOp(core, preSel)
@@ -1654,28 +1822,11 @@ function newViewManager(tm, cm, cmgr)
         if c.type == 'note' then util.add(noteCols, c) end
       end
       if #noteCols <= 1 then return end
-      local k = col.lane
-
-      -- Queue lane shifts for higher-lane notes.
-      for lane = k + 1, #noteCols do
-        for _, evt in ipairs(noteCols[lane].events) do
-          tm:assignEvent('note', evt, { lane = lane - 1 })
-        end
-      end
-
-      -- Shift noteDelay keys in this channel.
-      local nd = cm:get('noteDelay')
-      local chanMap = nd[chan]
-      if chanMap then
-        local newMap = {}
-        for lane, v in pairs(chanMap) do
-          if lane < k then newMap[lane] = v
-          elseif lane > k then newMap[lane - 1] = v end
-        end
-        nd[chan] = next(newMap) and newMap
-        cm:set('take', 'noteDelay', next(nd) and nd)
-      end
-
+      -- Lane is rebuild-only at tm (assignNote rejects lane writes), so
+      -- we can't shift higher lanes down to close an interior hole. Only
+      -- the topmost empty lane can be hidden; to drop interior empties,
+      -- the user hides from the right inwards.
+      if col.lane ~= #noteCols then return end
       want.notes = #noteCols - 1
     elseif col.type == 'cc' then
       if want.ccs then
@@ -1690,8 +1841,7 @@ function newViewManager(tm, cm, cmgr)
       extras[chan] = nil
     end
     cm:set('take', 'extraColumns', next(extras) and extras)
-
-    if col.type == 'note' then tm:flush() else vm:rebuild() end
+    vm:rebuild()
   end
 
   -- Enables delay sub-col on every note col covered by

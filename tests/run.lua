@@ -43,6 +43,11 @@ local specs = {
   'vm_delay_entry_spec',
   'vm_lane_drag_spec',
   'vm_slot_writers_spec',
+  'vm_extra_cols_spec',
+  'vm_reswing_lane_stability_spec',
+  'vm_quantize_lane_stability_spec',
+  'vm_quantize_keep_realised_lane_spec',
+  'vm_insert_delete_row_lane_spec',
 }
 
 local pass, fail, failures = 0, 0, {}
