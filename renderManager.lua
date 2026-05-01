@@ -19,6 +19,7 @@ function newRenderManager(vm, cm, cmgr)
 
   local GUTTER      = 4    -- in grid chars
   local HEADER      = 3    -- in grid rows
+  local CHROME_PAD_X, CHROME_PAD_Y = 8, 4   -- inner padding for chrome bands and grid
 
   local gridX       = nil
   local gridY       = nil
@@ -53,12 +54,17 @@ function newRenderManager(vm, cm, cmgr)
   end
 
   local ctx         = nil
-  local font        = nil
+  local font        = nil   -- monospace, used inside the tracker grid
+  local uiFont      = nil   -- system sans-serif, used for chrome (toolbar, status, modals, swing editor)
   local dragging    = false
   local dragWinX, dragWinY = 0, 0
   local modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
   local swingEditor = nil  -- nil = closed, else { name, snapshot, createBuf, createError }
   local quitting   = false -- set by the quit command, observed by rm:loop
+  local pickerOpenRequest = nil -- 'temper' | 'swing' | nil; consumed next frame by drawSlotPicker
+  local pickerFilter = {}       -- kind -> typeahead buffer; reset on each open
+  local pickerCursor = {}       -- kind -> 1-based highlight index into filtered matches
+  local pickerActive  = false   -- a picker popup owned input this frame; handleKeys must skip
 
   -- Lane-strip mouse interaction. drawLaneStrip publishes laneLayout each
   -- frame (or nils it if the strip isn't showing an envelope); handleMouse
@@ -134,11 +140,39 @@ function newRenderManager(vm, cm, cmgr)
 
   local colourCache = {}
 
+  -- Walk the colour table from a starting cm key to a terminal atom.
+  -- Entries: {r,g,b,a} atom | 'fullKey' alias | {'fullKey', a} alias-with-
+  -- alpha-override. Outermost override wins (`override or v[2]` is safe
+  -- because Lua treats 0 as truthy). Cycles raise with the chain.
+  local function resolveColour(key)
+    local seen, override = {}, nil
+    while true do
+      if seen[key] then
+        seen[#seen+1] = key
+        error('colour cycle: ' .. table.concat(seen, ' → '))
+      end
+      seen[#seen+1] = key; seen[key] = true
+      local v = cm:get(key)
+      if v == nil then error('unknown colour: ' .. key) end
+      if type(v) == 'string' then
+        key = v
+      elseif type(v[1]) == 'string' then
+        key      = v[1]
+        override = override or v[2]
+      else
+        return v[1], v[2], v[3], override or v[4]
+      end
+    end
+  end
+
+  -- Roles live under `colour.*`; callers pass the bare role name and we
+  -- prepend the namespace once at the entry point. The cache is keyed by
+  -- the bare name and invalidated by configChanged below.
   local function colour(name)
     name = name or 'text'
     if not colourCache[name] then
-      local c = cm:get('colour.' .. name)
-      colourCache[name] = ImGui.ColorConvertDouble4ToU32(c[1], c[2], c[3], c[4])
+      local r, g, b, a = resolveColour('colour.' .. name)
+      colourCache[name] = ImGui.ColorConvertDouble4ToU32(r, g, b, a)
     end
     return colourCache[name]
   end
@@ -175,8 +209,14 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    function pt:text(x, y, txt, c)
+    function pt:text(x, y, txt, c, font)
+      if font then
+        ImGui.PushFont(ctx, font, 15)
+      end
       drawTextAt(x0 + x * gX, y0 + y * gY - 1, txt, c)
+      if font then
+        ImGui.PopFont(ctx)
+      end
     end
 
     function pt:textCentred(x1, x2, y, txt, c)
@@ -217,31 +257,272 @@ function newRenderManager(vm, cm, cmgr)
     return cm:get('laneStrip.rows') or 0
   end
 
+  -- reaper-imgui has no Separator(Vertical); draw a 1px vertical line
+  -- via the window draw list and reserve a Dummy slot so SameLine works.
+  local function verticalSeparator()
+    local x, y = ImGui.GetCursorScreenPos(ctx)
+    local h    = ImGui.GetFrameHeight(ctx)
+    ImGui.DrawList_AddLine(ImGui.GetWindowDrawList(ctx),
+      x, y, x, y + h, colour('separator'), 1)
+    ImGui.Dummy(ctx, 1, h)
+  end
+
+  -- One picker = a "<heading>:" label followed by a button "<preview> ▾"
+  -- that opens a popup containing Off, current library entries, and any
+  -- unseeded presets (prefixed '+ '). `onPick(name)` receives nil for Off,
+  -- a lib name for a normal entry, or a preset name for an unseeded preset —
+  -- the callback is responsible for seeding the lib in that case.
+  --
+  -- The popup carries a typeahead filter (autofocused on open). Enter
+  -- picks the first surviving match; group separators show only when
+  -- the filter is empty (groups become incoherent under filtering).
+  local function drawSlotPicker(d)
+    local popupId = '##picker_' .. d.kind
+
+    -- Heading inherits the toolbar's outer Col_Text push (chrome.shade);
+    -- no inner push needed.
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, d.heading .. ':  ')
+    ImGui.SameLine(ctx)
+
+    -- ##d.kind disambiguates the ImGui ID — different pickers may all show
+    -- "Off ▾" once the heading is no longer part of the button label.
+    local btnTxt  = (d.current or 'Off') .. ' \xe2\x96\xbe##' .. d.kind
+    local opening = ImGui.Button(ctx, btnTxt)
+    -- Anchor popup to the button rect; otherwise OpenPopup uses the mouse
+    -- position at call time, which puts a keyboard-triggered popup at the
+    -- text cursor instead of under the toolbar.
+    local btnX = ImGui.GetItemRectMin(ctx)
+    local _, btnY = ImGui.GetItemRectMax(ctx)
+    if pickerOpenRequest == d.kind then
+      pickerOpenRequest = nil
+      opening = true
+    end
+    if opening then
+      pickerFilter[d.kind] = ''
+      ImGui.OpenPopup(ctx, popupId)
+    end
+
+    ImGui.SetNextWindowPos(ctx, btnX, btnY, ImGui.Cond_Appearing)
+    -- NoNav: kill ImGui's built-in keyboard nav highlight on the popup —
+    -- otherwise it draws a second cursor that fights ours and steals
+    -- arrow keys / character input from the filter InputText.
+    if not ImGui.BeginPopup(ctx, popupId, ImGui.WindowFlags_NoNav) then return end
+    pickerActive = true  -- block handleKeys this frame so Enter doesn't leak through
+
+    -- Build candidate items with a group tag for separator placement.
+    local items = { { group = 1, label = 'Off', name = nil, current = d.current == nil } }
+    local libNames = {}
+    for k in pairs(d.lib) do libNames[#libNames + 1] = k end
+    table.sort(libNames)
+    for _, name in ipairs(libNames) do
+      items[#items + 1] = { group = 2, label = name, name = name, current = d.current == name }
+    end
+    local presetNames = {}
+    for k in pairs(d.presets) do
+      if not (d.excludePresets and d.excludePresets[k]) and not d.lib[k] then
+        presetNames[#presetNames + 1] = k
+      end
+    end
+    table.sort(presetNames)
+    for _, name in ipairs(presetNames) do
+      items[#items + 1] = { group = 3, label = '+ ' .. name, name = name, current = false }
+    end
+
+    if ImGui.IsWindowAppearing(ctx) then ImGui.SetKeyboardFocusHere(ctx) end
+    ImGui.SetNextItemWidth(ctx, 180)
+    local prevFilter = pickerFilter[d.kind] or ''
+    -- Plain InputText (no EnterReturnsTrue): with that flag, ReaImGui only
+    -- commits the buffer back on Enter, so the live filter would never
+    -- update during typing. We watch Enter ourselves below.
+    local _, filter = ImGui.InputText(ctx, '##filter_' .. d.kind, prevFilter)
+    pickerFilter[d.kind] = filter
+    local entered = ImGui.IsKeyPressed(ctx, ImGui.Key_Enter)
+                 or ImGui.IsKeyPressed(ctx, ImGui.Key_KeypadEnter)
+    ImGui.Separator(ctx)
+
+    local lf = filter:lower()
+    local matches, currentMatch = {}, nil
+    for _, it in ipairs(items) do
+      if filter == '' or it.label:lower():find(lf, 1, true) then
+        matches[#matches + 1] = it
+        if it.current then currentMatch = #matches end
+      end
+    end
+
+    -- Initial highlight: on open or on filter change, jump to the current
+    -- pick if it survived; otherwise top of list. Arrow keys then walk
+    -- the filtered list with wrap; Enter picks the highlighted match.
+    if ImGui.IsWindowAppearing(ctx) or filter ~= prevFilter then
+      pickerCursor[d.kind] = currentMatch or 1
+    end
+    local cursor = pickerCursor[d.kind] or 1
+    local n = #matches
+    if n > 0 then
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_DownArrow) then
+        cursor = cursor % n + 1
+      elseif ImGui.IsKeyPressed(ctx, ImGui.Key_UpArrow) then
+        cursor = (cursor - 2) % n + 1
+      end
+    end
+    cursor = math.min(math.max(cursor, 1), math.max(n, 1))
+    pickerCursor[d.kind] = cursor
+
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
+      ImGui.CloseCurrentPopup(ctx)
+    elseif entered then
+      if matches[cursor] then d.onPick(matches[cursor].name) end
+      ImGui.CloseCurrentPopup(ctx)
+    else
+      local lastGroup
+      for i, it in ipairs(matches) do
+        if filter == '' and lastGroup and lastGroup ~= it.group then
+          ImGui.Separator(ctx)
+        end
+        if ImGui.Selectable(ctx, it.label, i == cursor) then d.onPick(it.name) end
+        lastGroup = it.group
+      end
+    end
+
+    ImGui.EndPopup(ctx)
+  end
+
+  -- Seed-and-select wrappers: the picker hands us a name and we ensure
+  -- the lib has it before committing to the slot.
+  local function pickTemper(name)
+    if name and not cm:get('tempers')[name] then
+      vm:setTemper(name, tuning.presets[name])
+    end
+    vm:setTemperSlot(name)
+  end
+
+  local function pickSwing(name)
+    if name and not cm:get('swings')[name] then
+      vm:setSwingComposite(name, timing.presets[name])
+    end
+    vm:setSwingSlot(name)
+  end
+
+  local function pickColSwing(chan, name)
+    if name and not cm:get('swings')[name] then
+      vm:setSwingComposite(name, timing.presets[name])
+    end
+    vm:setColSwingSlot(chan, name)
+  end
+
+  -- Identity composite ('id') is the no-swing default — represented in
+  -- the UI as "Off" rather than as a pickable preset row.
+  local SWING_PRESET_EXCLUDE = { id = true }
+
+  -- Chrome styling shared by the toolbar and the swing editor: hairline
+  -- frame border + the toolbar palette for buttons, frames, popups, and
+  -- text. Caller pairs with popChromeStyles().
+  local function pushChromeStyles()
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameBorderSize, 1)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text,           colour('toolbar.text'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Button,         colour('toolbar.button'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,  colour('toolbar.buttonHover'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive,   colour('toolbar.buttonActive'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_FrameBg,        colour('toolbar.button'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_FrameBgHovered, colour('toolbar.buttonHover'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_FrameBgActive,  colour('toolbar.buttonActive'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_CheckMark,      colour('toolbar.checkMark'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_PopupBg,        colour('toolbar.popupBg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Border,         colour('toolbar.buttonBorder'))
+  end
+
+  local function popChromeStyles()
+    ImGui.PopStyleColor(ctx, 10)
+    ImGui.PopStyleVar(ctx, 1)
+  end
+
   local function drawToolbar()
+    pickerActive = false
     local rowPerBeat = cm:get('rowPerBeat')
 
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
+    pushChromeStyles()
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 10, 3)
+
+    -- The outer push is `toolbar.text`; the label inherits it.
+    ImGui.AlignTextToFramePadding(ctx)
     ImGui.Text(ctx, 'Rows/beat:')
-    ImGui.PopStyleColor(ctx)
-    ImGui.SameLine(ctx)
+    ImGui.SameLine(ctx, 0, 12)
 
     local textW = ImGui.CalcTextSize(ctx, '32')
     local btnW  = ImGui.GetFrameHeight(ctx)
     ImGui.SetNextItemWidth(ctx, textW + btnW * 2 + 16)
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, rowPerBeat > 9 and 5 or 8, 3)
     local changed, n = ImGui.InputInt(ctx, '##rpb', rowPerBeat, 1, 4)
+    ImGui.PopStyleVar(ctx, 1)
     if changed then vm:setRowPerBeat(util.clamp(n, 1, 32)) end
 
-    ImGui.SameLine(ctx, 0, 20)
-    local cv, newVis = ImGui.Checkbox(ctx, 'Graph', cm:get('laneStrip.visible'))
+    ImGui.SameLine(ctx, 0, 12)
+    verticalSeparator()
+    ImGui.SameLine(ctx, 0, 12)
+
+    -- Col_Text is already 'text' from the toolbar's outer push, so the
+    -- checkbox label inherits it.
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 0, 0)
+    local cy = ImGui.GetCursorPosY(ctx)
+    ImGui.SetCursorPosY(ctx, cy + 3)
+    local cv, newVis = ImGui.Checkbox(ctx, '  Graph', cm:get('laneStrip.visible'))
+    ImGui.PopStyleVar(ctx, 1)
     if cv then cm:set('global', 'laneStrip.visible', newVis) end
 
-    ImGui.Separator(ctx)
+    ImGui.SameLine(ctx, 0, 12)
+    verticalSeparator()
+    ImGui.SameLine(ctx, 0, 12)
+
+    drawSlotPicker {
+      kind     = 'temper',  heading = 'Tuning',
+      current  = cm:get('temper'),
+      lib      = cm:get('tempers'),
+      presets  = tuning.presets,
+      onPick   = pickTemper,
+    }
+
+    ImGui.SameLine(ctx, 0, 12)
+    verticalSeparator()
+    ImGui.SameLine(ctx, 0, 12)
+
+    drawSlotPicker {
+      kind     = 'swing',   heading = 'Swing',
+      current  = cm:get('swing'),
+      lib      = cm:get('swings'),
+      presets  = timing.presets,
+      excludePresets = SWING_PRESET_EXCLUDE,
+      onPick   = pickSwing,
+    }
+
+    -- Channel for the per-column swing picker is the cursor's column
+    -- channel. Every column has a channel today, so this is always
+    -- live; if global-channel columns land later, the disable path
+    -- here triggers.
+    local cursorCol = vm.grid.cols[vm:ec():col()]
+    local chan      = cursorCol and cursorCol.midiChan
+    ImGui.SameLine(ctx, 0, 8)
+    if not chan then ImGui.BeginDisabled(ctx) end
+    drawSlotPicker {
+      kind     = 'colSwing',
+      heading  = 'Ch swing',
+      current  = chan and cm:get('colSwing')[chan] or nil,
+      lib      = cm:get('swings'),
+      presets  = timing.presets,
+      excludePresets = SWING_PRESET_EXCLUDE,
+      onPick   = function(name) pickColSwing(chan, name) end,
+    }
+    if not chan then ImGui.EndDisabled(ctx) end
+
+    ImGui.PopStyleVar(ctx, 1)
+    popChromeStyles()
   end
 
-  -- Establish per-frame layout: char metrics, viewport dimensions, and the
-  -- column packing. Called once after drawToolbar so subsequent draw
-  -- routines (lane strip, tracker) share a single layout snapshot.
-  local function computeLayout()
+  -- Establish per-frame layout: char metrics, column packing, and the
+  -- integer-row grid height that fits within `budgetH` pixels (the space
+  -- the loop has reserved between toolbar and statusBar). Width comes
+  -- from the current GetContentRegionAvail; height is explicit so the
+  -- caller can carve out a fixed footer first.
+  local function computeLayout(budgetW, budgetH)
     local grid = vm.grid
     local _, scrollCol = vm:scroll()
 
@@ -251,11 +532,10 @@ function newRenderManager(vm, cm, cmgr)
       gridY = 2 * math.ceil(charH / 2) - 1
     end
 
-    local windowWidth, windowHeight = ImGui.GetContentRegionAvail(ctx)
-    gridWidth  = math.max(1, math.floor(windowWidth  / gridX) - GUTTER)
+    gridWidth  = math.max(1, math.floor(budgetW / gridX) - GUTTER)
     -- Lane strip eats a fixed number of rows above the tracker header.
     local laneRows = laneStripRows()
-    gridHeight = math.max(1, math.floor(windowHeight / gridY) - HEADER - 1 - laneRows)
+    gridHeight = math.max(1, math.floor(budgetH / gridY) - HEADER - 1 - laneRows)
     vm:setGridSize(gridWidth, gridHeight)
 
     chanX, chanW, chanOrder, totalWidth = layoutColumns(grid.cols, scrollCol)
@@ -487,7 +767,7 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    draw:hLine(-GUTTER, totalWidth - 1, 0, 'header', -0.25)
+    draw:hLine(-GUTTER, totalWidth - 1, 0, 'text', -0.25)
 
     for i = 1, #chanOrder - 1 do
       local chan = chanOrder[i]
@@ -509,7 +789,7 @@ function newRenderManager(vm, cm, cmgr)
         end
       end
 
-      local rowNumCol = (isBeatStart and 'textBar') or 'inactive'
+      local rowNumCol = (isBeatStart and 'text') or 'inactive'
       draw:text(-GUTTER, y, string.format('%03d', row), rowNumCol)
     end
 
@@ -568,8 +848,8 @@ function newRenderManager(vm, cm, cmgr)
     end
 
     -- Off-grid bars: projection gap between note intent and displayed step.
-    -- Drawn only under an active tuning, only for notes with a non-zero gap.
-    if vm:activeTuning() then
+    -- Drawn only under an active temperament, only for notes with a non-zero gap.
+    if vm:activeTemper() then
       local barCol = colour('accent')
       for _, col in ipairs(grid.cols) do
         if col.x and col.type == 'note' and col.cells then
@@ -636,13 +916,12 @@ function newRenderManager(vm, cm, cmgr)
     local bar, beat, sub = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
 
-    ImGui.Separator(ctx)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('header'))
+    -- statusBar is rendered inside its own chrome BeginChild whose outer
+    -- Col_Text push is `statusBar.text`; we just print, no inner push.
     ImGui.Text(ctx, string.format(
       '%s | %d:%d.%d/%d | Octave: %d | Advance: %d',
       colLabel, bar, beat, sub, rowPerBeat, currentOctave, advanceBy
     ))
-    ImGui.PopStyleColor(ctx)
   end
 
   ----- Input
@@ -870,7 +1149,7 @@ function newRenderManager(vm, cm, cmgr)
   end
 
   local function handleKeys()
-    if modalState then return end -- popup owns input
+    if modalState or pickerActive then return end -- popup owns input
 
     local grid = vm.grid
     local ec = vm:ec()
@@ -1052,6 +1331,9 @@ function newRenderManager(vm, cm, cmgr)
       }
     end,
 
+    openTemperPicker = function() pickerOpenRequest = 'temper' end,
+    openSwingPicker  = function() pickerOpenRequest = 'swing'  end,
+
     quit = function() quitting = true end,
   }
 
@@ -1064,22 +1346,7 @@ function newRenderManager(vm, cm, cmgr)
                           'classic', 'pocket', 'lilt', 'shuffle', 'tilt' }
   local SWING_ATOMS_Z = table.concat(SWING_ATOMS, '\0') .. '\0\0'
 
-  -- Plain narration uses the theme's text colour; the editor's outer
-  -- Col_Text push is white so controls (combos, sliders, buttons) render
-  -- their text white. Wrap a Text call in narrate() to opt back into
-  -- theme text for static labels.
-  local function narrate(s)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, colour('text'))
-    ImGui.Text(ctx, s)
-    ImGui.PopStyleColor(ctx)
-  end
-
   local RPB_CHOICES   = { 1, 2, 3, 4, 6, 8, 12, 16 }
-  local RPB_CHOICES_Z = (function()
-    local s = {}
-    for _, v in ipairs(RPB_CHOICES) do s[#s+1] = tostring(v) end
-    return table.concat(s, '\0') .. '\0\0'
-  end)()
 
   -- Period presets in qn (the model's native unit), so the whole editor
   -- row is qn-consistent: shift in qn → period in qn → annotation in qn.
@@ -1099,19 +1366,28 @@ function newRenderManager(vm, cm, cmgr)
     return beat, num * beat
   end
 
-  local function periodPresetIndex(period)
-    local qn = timing.periodQN(period)
+  -- Combo speaks tile-qn (= user-period × pulsesPerCycle), so atoms with
+  -- ppC > 1 surface their actual repeat directly in the dropdown. Storage
+  -- stays as user-period; setPeriodFromTileQN divides on write.
+  local function periodPresetIndex(tileQN)
     for i, p in ipairs(PERIOD_PRESETS) do
-      if math.abs(qn - timing.periodQN(p.period)) < 1e-9 then return i end
+      if math.abs(tileQN - timing.periodQN(p.period)) < 1e-9 then return i end
     end
     return 0
   end
 
-  local function periodLabel(period)
-    local i = periodPresetIndex(period)
+  local function periodLabel(tileQN)
+    local i = periodPresetIndex(tileQN)
     if i > 0 then return PERIOD_PRESETS[i].label end
-    local qn = timing.periodQN(period)
-    return string.format(qn == math.floor(qn) and '%d qn' or '%.3g qn', qn)
+    return string.format(tileQN == math.floor(tileQN) and '%d qn' or '%.3g qn', tileQN)
+  end
+
+  -- Preset .period is already a tidy rational; halving it for ppC=2 keeps
+  -- it tidy ({n,d} → {n,2d}; integer → {n,2}).
+  local function periodOverPPC(period, ppC)
+    if ppC == 1 then return period end
+    if type(period) == 'table' then return { period[1], period[2] * ppC } end
+    return { period, ppC }
   end
 
   local SWING_ERR     = 0xff6060ff
@@ -1148,11 +1424,13 @@ function newRenderManager(vm, cm, cmgr)
     local beat, qpb = meterQN()
     local N         = math.max(2, util.round(periodQN * rpb))
     local cellW     = w / N
-    -- text colour with alpha dialled back a touch — pure black is too loud
-    -- against the cream bg, near-zero alpha disappears.
-    local line      = (colour('text') & 0xffffff00) | 0xb0
 
-    ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + w, y0 + h, colour('bg'))
+    -- Half-pad top and bottom so bar/beat shading and dividers sit in an
+    -- inner band; dots can extend past the band edge for emphasis. Same
+    -- structural idea as drawLaneStrip (height-2 lane preview look).
+    local pad  = math.max(2, h * 0.15)
+    local yTop = y0 + pad
+    local yBot = y0 + h - pad
 
     -- Classify a tick at qn position p into 'bar' (downbeat),
     -- 'midBar' (the bar's midpoint when it lands on a beat — true in
@@ -1174,15 +1452,17 @@ function newRenderManager(vm, cm, cmgr)
         local key = SHADE[classify((i / N) * periodQN)]
         if key then
           local cx = x0 + i * cellW
-          ImGui.DrawList_AddRectFilled(dl, cx, y0, cx + cellW, y0 + h, colour(key))
+          ImGui.DrawList_AddRectFilled(dl, cx, yTop, cx + cellW, yBot, colour(key))
         end
       end
     end
 
-    -- 1px vertical grid lines at every cell boundary.
+    -- 1px vertical dividers at every cell boundary, palette pale enough to
+    -- sit behind the dots — same role the main lane strip uses.
+    local divider = colour('laneRowDivider')
     for i = 0, N do
       local gx = x0 + (i / N) * w
-      ImGui.DrawList_AddLine(dl, gx, y0, gx, y0 + h, line, 1)
+      ImGui.DrawList_AddLine(dl, gx, yTop, gx, yBot, divider, 1)
     end
 
     -- Filled dots at the swung image of each unswung tick. Three sizes
@@ -1266,7 +1546,7 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.PushID(ctx, i)
 
     ImGui.AlignTextToFramePadding(ctx)
-    narrate(string.format('%d.', i))
+    ImGui.Text(ctx, string.format('%d.', i))
     ImGui.SameLine(ctx)
 
     local atomIdx = 0
@@ -1301,27 +1581,20 @@ function newRenderManager(vm, cm, cmgr)
 
     ImGui.SameLine(ctx)
     ImGui.AlignTextToFramePadding(ctx)
-    narrate('per')
+    ImGui.Text(ctx, 'per')
     ImGui.SameLine(ctx)
     ImGui.SetNextItemWidth(ctx, 90)
-    local pIdx = periodPresetIndex(f.period)
+    local ppC    = timing.atomMeta[f.atom].pulsesPerCycle
+    local tileQN = timing.atomTilePeriod(f)
+    local pIdx   = periodPresetIndex(tileQN)
     local items = {}
     for _, p in ipairs(PERIOD_PRESETS) do items[#items+1] = p.label end
-    if pIdx == 0 then items[#items+1] = periodLabel(f.period) end
+    if pIdx == 0 then items[#items+1] = periodLabel(tileQN) end
     local itemsZ = table.concat(items, '\0') .. '\0\0'
     local curIdx = pIdx > 0 and (pIdx - 1) or #PERIOD_PRESETS
     local rvP, newPIdx = ImGui.Combo(ctx, '##per', curIdx, itemsZ)
     if rvP and newPIdx + 1 <= #PERIOD_PRESETS then
-      patchFactor(i, { period = PERIOD_PRESETS[newPIdx + 1].period })
-    end
-
-    -- pulsesPerCycle > 1 doubles the actual repeat. The combo speaks the
-    -- user period; this trailing chip surfaces the resulting tile length.
-    local mult = timing.atomMeta[f.atom].pulsesPerCycle
-    if mult > 1 then
-      ImGui.SameLine(ctx)
-      ImGui.AlignTextToFramePadding(ctx)
-      narrate(string.format('×%d → %.3g qn', mult, timing.atomTilePeriod(f)))
+      patchFactor(i, { period = periodOverPPC(PERIOD_PRESETS[newPIdx + 1].period, ppC) })
     end
 
     ImGui.SameLine(ctx)
@@ -1345,14 +1618,7 @@ function newRenderManager(vm, cm, cmgr)
          + nFactors * 72  -- controls row + factor preview + separator + spacing
   end
 
-  -- The ×N chip on the controls row (when any factor has pulsesPerCycle > 1)
-  -- pushes the move/delete buttons off the right edge at the default width.
-  local function idealSwingWidth(composite)
-    for _, f in ipairs(composite) do
-      if timing.atomMeta[f.atom].pulsesPerCycle > 1 then return 660 end
-    end
-    return 560
-  end
+  local function idealSwingWidth() return 560 end
 
   local function drawSwingEditor()
     if not swingEditor then return end
@@ -1366,7 +1632,7 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.SetNextWindowSizeConstraints(ctx, 400, 120, 9999, vpH)
     ImGui.SetNextWindowSize(ctx, 560, 420, ImGui.Cond_FirstUseEver)
 
-    local idealW = idealSwingWidth(composite)
+    local idealW = idealSwingWidth()
     if swingEditor.lastCount ~= n or (swingEditor.lastW or 560) < idealW then
       local w = math.max(swingEditor.lastW or 560, idealW)
       local h = math.min(idealSwingHeight(n), vpH)
@@ -1374,12 +1640,24 @@ function newRenderManager(vm, cm, cmgr)
       swingEditor.lastCount = n
     end
 
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xffffffff)
+    -- Match the toolbar's chrome family, then add window-shape styling
+    -- (border, title bar, window bg, separator) so the editor reads as a
+    -- sibling of the toolbar rather than a default-grey ImGui panel
+    -- floating over the parchment grid. Surfaces use editor.bg (opaque
+    -- pale) — toolbar.bg is authored at 0.5 alpha, which would bleed the
+    -- grid through a floating window.
+    pushChromeStyles()
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowBorderSize, 1)
+    ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg,         colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBg,          colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgActive,    colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgCollapsed, colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Separator,        colour('toolbar.buttonBorder'))
     local visible, open = ImGui.Begin(ctx, 'Swing', true,
       ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_NoDocking)
     if not open then swingEditor = nil end
 
-    if visible then
+    if visible and swingEditor then
       swingEditor.lastW = ImGui.GetWindowWidth(ctx)
 
       if ImGui.IsWindowFocused(ctx) and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
@@ -1388,8 +1666,8 @@ function newRenderManager(vm, cm, cmgr)
 
       if swingEditor and not swingEditor.name then
         -- CREATE MODE
-        narrate('No swing slot is set.')
-        narrate('Name:')
+        ImGui.Text(ctx, 'No swing slot is set.')
+        ImGui.Text(ctx, 'Name:')
         ImGui.SameLine(ctx)
         ImGui.SetNextItemWidth(ctx, 240)
         local rv, buf = ImGui.InputText(ctx, '##newname', swingEditor.createBuf,
@@ -1417,28 +1695,56 @@ function newRenderManager(vm, cm, cmgr)
           ImGui.TextColored(ctx, SWING_ERR, swingEditor.createError)
         end
       elseif swingEditor then
-        -- EDIT MODE
-        narrate('Editing: ' .. swingEditor.name)
-        ImGui.SameLine(ctx)
+        -- EDIT MODE — toolbar row mirrors the main toolbar's chrome:
+        -- (10, 3) FramePadding, vertical separators between groups,
+        -- compact checkbox, manual ▾ on the rpb picker (smaller than
+        -- ImGui.Combo's auto-arrow). Padding push is scoped to the row;
+        -- the factor strip below uses the inherited padding.
+        ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 10, 3)
+
+        ImGui.AlignTextToFramePadding(ctx)
+        ImGui.Text(ctx, 'Editing: ' .. swingEditor.name)
+        ImGui.SameLine(ctx, 0, 12)
         local dirty = not compositesEqual(composite, swingEditor.snapshot)
         if not dirty then ImGui.BeginDisabled(ctx) end
         if ImGui.Button(ctx, 'Reset') then swingWrite(util.deepClone(swingEditor.snapshot) or {}) end
         if not dirty then ImGui.EndDisabled(ctx) end
 
-        ImGui.SameLine(ctx)
-        ImGui.AlignTextToFramePadding(ctx)
-        narrate('Rows/qn:')
-        ImGui.SameLine(ctx)
-        ImGui.SetNextItemWidth(ctx, 60)
-        local rpbIdx = 0
-        for k, v in ipairs(RPB_CHOICES) do if v == swingEditor.rpb then rpbIdx = k - 1; break end end
-        local rvR, newRpbIdx = ImGui.Combo(ctx, '##rpb', rpbIdx, RPB_CHOICES_Z)
-        if rvR then swingEditor.rpb = RPB_CHOICES[newRpbIdx + 1] end
+        ImGui.SameLine(ctx, 0, 12)
+        verticalSeparator()
+        ImGui.SameLine(ctx, 0, 12)
 
-        ImGui.SameLine(ctx)
-        local rvW, newWild = ImGui.Checkbox(ctx, 'Wild', swingEditor.wild or false)
+        ImGui.AlignTextToFramePadding(ctx)
+        ImGui.Text(ctx, 'Rows/qn:')
+        ImGui.SameLine(ctx, 0, 6)
+        -- Button + popup, mirroring drawSlotPicker's chrome (manual ▾
+        -- glyph at font size, smaller than ImGui.Combo's frame-tall arrow).
+        local rpbBtn = tostring(swingEditor.rpb) .. ' \xe2\x96\xbe##rpb'
+        if ImGui.Button(ctx, rpbBtn) then ImGui.OpenPopup(ctx, '##rpb_popup') end
+        local btnX = ImGui.GetItemRectMin(ctx)
+        local _, btnY = ImGui.GetItemRectMax(ctx)
+        ImGui.SetNextWindowPos(ctx, btnX, btnY, ImGui.Cond_Appearing)
+        if ImGui.BeginPopup(ctx, '##rpb_popup', ImGui.WindowFlags_NoNav) then
+          for _, v in ipairs(RPB_CHOICES) do
+            if ImGui.Selectable(ctx, tostring(v), v == swingEditor.rpb) then
+              swingEditor.rpb = v
+            end
+          end
+          ImGui.EndPopup(ctx)
+        end
+
+        ImGui.SameLine(ctx, 0, 12)
+        verticalSeparator()
+        ImGui.SameLine(ctx, 0, 12)
+
+        ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 0, 0)
+        local cy = ImGui.GetCursorPosY(ctx)
+        ImGui.SetCursorPosY(ctx, cy + 3)
+        local rvW, newWild = ImGui.Checkbox(ctx, '  Wild', swingEditor.wild or false)
+        ImGui.PopStyleVar(ctx, 1)
         if rvW then swingEditor.wild = newWild end
 
+        ImGui.PopStyleVar(ctx, 1)
         ImGui.Separator(ctx)
         local availW       = ImGui.GetContentRegionAvail(ctx)
         local _, qpb       = meterQN()
@@ -1450,14 +1756,15 @@ function newRenderManager(vm, cm, cmgr)
 
         for i, f in ipairs(composite) do
           drawFactorRow(i, f, availW)
-          ImGui.Separator(ctx)
         end
 
         if ImGui.Button(ctx, '+ add factor') then addFactor() end
       end
     end
     ImGui.End(ctx)
-    ImGui.PopStyleColor(ctx)
+    ImGui.PopStyleColor(ctx, 5)
+    ImGui.PopStyleVar(ctx, 1)
+    popChromeStyles()
   end
 
   ---------- PUBLIC
@@ -1465,34 +1772,96 @@ function newRenderManager(vm, cm, cmgr)
   local rm = {}
 
   function rm:init()
-    ctx  = ImGui.CreateContext('Readium Tracker')
-    font = ImGui.CreateFont('Source Code Pro')
+    ctx    = ImGui.CreateContext('Readium Tracker')
+    ImGui.SetConfigVar(ctx, ImGui.ConfigVar_ViewportsNoDecoration, 0)
+    -- macOS' system font is private (dot-prefixed) and not reachable by
+    -- family name, so load SFNS.ttf directly. Other platforms resolve by name.
+    local os = reaper.GetOS()
+    font       = ImGui.CreateFont('Source Code Pro')
+    if os:find('OSX') or os:find('mac') then
+      uiFont = ImGui.CreateFontFromFile('/System/Library/Fonts/SFNS.ttf')
+    else
+      uiFont = ImGui.CreateFont(os:find('Win') and 'Segoe UI' or 'sans-serif')
+    end
     ImGui.Attach(ctx, font)
+    ImGui.Attach(ctx, uiFont)
   end
 
   function rm:loop()
     if not ctx then return false end
 
-    ImGui.PushFont(ctx, font, 15)
+    ImGui.PushFont(ctx, uiFont, 13)
 
     local styleCount = pushStyles()
 
     if dragging then
       ImGui.SetNextWindowPos(ctx, dragWinX, dragWinY)
     end
+    -- Zero the main window's padding so the chrome BeginChild bands and
+    -- the parchment grid go edge-to-edge. Each child sets its own inner
+    -- WindowPadding for breathing room around its content.
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, 0, 0)
     local visible, open = ImGui.Begin(ctx, 'Readium Tracker', true,
       ImGui.WindowFlags_NoScrollbar
       | ImGui.WindowFlags_NoScrollWithMouse
       | ImGui.WindowFlags_NoDocking
       | ImGui.WindowFlags_NoNav)
+    ImGui.PopStyleVar(ctx)
 
     if visible then
       if #vm.grid.cols > 0 then
-        drawToolbar()
-        computeLayout()
+        -- Layout: chrome toolbar (auto-fit) | parchment grid (integer rows
+        -- + leftover gap) | chrome statusBar (fixed height). The colour
+        -- change between blocks IS the visual separator — no rules.
+        ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, colour('toolbar.bg'))
+        ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, CHROME_PAD_X, CHROME_PAD_Y)
+        if ImGui.BeginChild(ctx, '##toolbar', 0, 0,
+                            ImGui.ChildFlags_AutoResizeY | ImGui.ChildFlags_AlwaysUseWindowPadding,
+                            ImGui.WindowFlags_NoScrollbar) then
+          drawToolbar()
+        end
+        ImGui.EndChild(ctx)
+        ImGui.PopStyleVar(ctx)
+        ImGui.PopStyleColor(ctx)
+
+        -- Reserve a fixed footer at the bottom; the grid takes
+        -- `availH - footerH` pixels and snaps to integer rows, leaving
+        -- the fractional remainder as a parchment gap *above* the footer.
+        local cursorY   = ImGui.GetCursorPosY(ctx)
+        local _, availH = ImGui.GetContentRegionAvail(ctx)
+        local footerH   = ImGui.GetFrameHeightWithSpacing(ctx) + 4
+        local gridBudget = availH - footerH
+
+        -- Shift the grid in by the same chrome pad so it isn't flush against
+        -- the window edge. Indent persists across drawLaneStrip's Dummy
+        -- (which would otherwise reset cursor X back to 0); SetCursorPosY
+        -- handles the top pad, no equivalent vertical Indent.
+        ImGui.Indent(ctx, CHROME_PAD_X)
+        ImGui.SetCursorPosY(ctx, ImGui.GetCursorPosY(ctx) + CHROME_PAD_Y)
+
+        ImGui.PushFont(ctx, font, 15)
+        local availW = ImGui.GetContentRegionAvail(ctx)
+        computeLayout(availW - CHROME_PAD_X, gridBudget - CHROME_PAD_Y)
         drawLaneStrip()
         drawTracker()
-        drawStatusBar()
+        ImGui.PopFont(ctx)
+        ImGui.Unindent(ctx, CHROME_PAD_X)
+
+        -- Pin the footer to (toolbarBottom + gridBudget); the parchment
+        -- gap between drawTracker's last row and here is the leftover.
+        ImGui.SetCursorPosY(ctx, cursorY + gridBudget)
+        ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, colour('statusBar.bg'))
+        ImGui.PushStyleColor(ctx, ImGui.Col_Text,    colour('statusBar.text'))
+        ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, CHROME_PAD_X + 4, CHROME_PAD_Y)
+        if ImGui.BeginChild(ctx, '##statusBar', 0, footerH,
+                            ImGui.ChildFlags_AlwaysUseWindowPadding,
+                            ImGui.WindowFlags_NoScrollbar) then
+          drawStatusBar()
+        end
+        ImGui.EndChild(ctx)
+        ImGui.PopStyleVar(ctx)
+        ImGui.PopStyleColor(ctx, 2)
+
         handleMouse()
         handleKeys()
         drawModal()

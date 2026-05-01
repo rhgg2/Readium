@@ -146,6 +146,14 @@ function newTrackerManager(mm, cm)
 
     local function assignLowlevel(evtType, evt, update)
       util.assign(evt, update)
+      -- Note ppq mutates in place here; resort the channel index so
+      -- subsequent util.seek calls (detuneAt / pbAt / nextNotePPQ /
+      -- logicalBefore — all key off chans[chan].notes sorted by ppq)
+      -- stay correct even when callers like reswing process notes in
+      -- non-monotone order.
+      if evtType == 'note' and update.ppq ~= nil and evt.lane == 1 then
+        sortByPPQ(chans[evt.chan].notes)
+      end
       if not evt.loc then return end
       for _, e in ipairs(assigns) do
         if e.loc == evt.loc and e.type == evtType then
@@ -217,12 +225,35 @@ function newTrackerManager(mm, cm)
       assignLowlevel('pb', pb, { fake = util.REMOVE })
     end
 
+    -- Restore the fake-pb invariant at note seat P after a detune
+    -- change has shifted the carry across it: if the note's detune
+    -- jumps over the carry, a fake pb must absorb the jump; if not,
+    -- any redundant fake pb is just noise. Callers invoke this in
+    -- the post-mutation frame (note edits committed) so detuneAt/
+    -- Before see live values. Real (user-authored) pbs are left
+    -- alone — only fake absorbers are managed.
+    local function reconcileBoundary(chan, P)
+      if P >= math.huge then return end
+      local D, C = detuneAt(chan, P), detuneBefore(chan, P)
+      local pb   = pbAt(chan, P)
+      if D == C then
+        if pb and pb.fake and rawAt(chan, P) == rawBefore(chan, P) then
+          deleteLowlevel('pb', pb)
+        end
+      elseif not pb then
+        forcePb(chan, P)               -- val = rawAt = rawBefore (no pb yet)
+        markFake(chan, P)
+        pb = pbAt(chan, P)
+        assignLowlevel('pb', pb, { val = pb.val + (D - C) })
+      end
+    end
+
     ----- High-level ops
 
     local function addPb(pb)
       local chan, P, L = pb.chan, pb.ppq, pb.val or 0
       local delta  = L - logicalAt(chan, P)
-      local extras = util.pick(pb, 'straightPPQ frame')
+      local extras = util.pick(pb, 'ppqL frame')
       if not next(extras) then extras = nil end
       if not forcePb(chan, P, extras) then
         if extras then assignLowlevel('pb', pbAt(chan, P), extras) end
@@ -248,8 +279,8 @@ function newTrackerManager(mm, cm)
         -- delete-and-readd is identity-preserving for the pb's stamp;
         -- carry the existing pb's extras forward, with `update`
         -- overriding any overlapping fields.
-        local extras = util.assign(util.pick(pb,     'straightPPQ frame'),
-                                   util.pick(update, 'straightPPQ frame'))
+        local extras = util.assign(util.pick(pb,     'ppqL frame'),
+                                   util.pick(update, 'ppqL frame'))
         deletePb(pb)
         addPb(util.assign({ chan = chan, ppq = update.ppq, val = newVal }, extras))
         return
@@ -268,20 +299,27 @@ function newTrackerManager(mm, cm)
       local D = n.detune
       if lastMuteSet[n.chan] then n.muted = true end
       if n.lane == 1 then
-        local C = detuneAt(n.chan, n.ppq)
+        local C     = detuneAt(n.chan, n.ppq)
+        local nextP = nextNotePPQ(n.chan, n.ppq)
         if D ~= C and forcePb(n.chan, n.ppq) then markFake(n.chan, n.ppq) end
-        retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D - C)
+        retuneLowlevel(n.chan, n.ppq, nextP, D - C)
+        addLowlevel('note', util.assign(n, { detune = D }))
+        reconcileBoundary(n.chan, nextP)
+      else
+        addLowlevel('note', util.assign(n, { detune = D }))
       end
-      addLowlevel('note', util.assign(n, { detune = D }))
     end
 
     local function deleteNote(n, keepPAs)
       if not keepPAs then forEachAttachedPA(n, function(evt) deleteLowlevel('pa', evt) end) end
+      if n.lane ~= 1 then deleteLowlevel('note', n); return end
       local D1, D2 = detuneBefore(n.chan, n.ppq), detuneAt(n.chan, n.ppq)
-      local pb = pbAt(n.chan, n.ppq)
+      local nextP  = nextNotePPQ(n.chan, n.ppq)
+      local pb     = pbAt(n.chan, n.ppq)
       if pb and pb.fake then deleteLowlevel('pb', pb) end
       deleteLowlevel('note', n)
-      retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), D1 - D2)
+      retuneLowlevel(n.chan, n.ppq, nextP, D1 - D2)
+      reconcileBoundary(n.chan, nextP)
     end
 
     local function resizeNote(n, P1, P2)
@@ -310,28 +348,37 @@ function newTrackerManager(mm, cm)
       -- col-1: withdraw detune at old seat, move, reapply at new. L is the
       -- logical pb the user authored at P1 *before* the move — if it
       -- differs from prevailing logical there we seat a real pb to carry it.
-      local oldPpq = n.ppq
+      local oldppq = n.ppq
       local D   = n.detune
       local L   = logicalAt(n.chan, P1)
-      local C1  = detuneBefore(n.chan, oldPpq)
-      local NP1 = nextNotePPQ(n.chan, oldPpq)
-      local oldPb = pbAt(n.chan, oldPpq)
+      local C1  = detuneBefore(n.chan, oldppq)
+      local NP1 = nextNotePPQ(n.chan, oldppq)
+      local oldPb = pbAt(n.chan, oldppq)
 
       assignLowlevel('note', n, { ppq = P1, endppq = P2 })
 
       if oldPb and oldPb.fake then
         deleteLowlevel('pb', oldPb)
       end
-      retuneLowlevel(n.chan, oldPpq, NP1, C1 - D)
+      retuneLowlevel(n.chan, oldppq, NP1, C1 - D)
+      -- The carry into NP1 has shifted from D to C1 (n no longer
+      -- bridges); a previously-masked jump may now need its own
+      -- absorber, or a previously-needed one may have collapsed.
+      reconcileBoundary(n.chan, NP1)
 
-      -- New seat: real pb wins over fake; pre-existing pb wins over both.
+      -- New seat: real pb wins over fake; pre-existing pb wins over
+      -- both. logicalBefore(P1) is read after the boundary at NP1
+      -- has been reconciled — placing the absorber there can change
+      -- rawBefore at P1 in leapfrog moves.
       local C2 = detuneBefore(n.chan, P1)
       if L ~= logicalBefore(n.chan, P1) then
         forcePb(n.chan, P1)
       elseif D ~= C2 and forcePb(n.chan, P1) then
         markFake(n.chan, P1)
       end
-      retuneLowlevel(n.chan, P1, nextNotePPQ(n.chan, P1), D - C2)
+      local NP2 = nextNotePPQ(n.chan, P1)
+      retuneLowlevel(n.chan, P1, NP2, D - C2)
+      reconcileBoundary(n.chan, NP2)
     end
 
     local function assignNote(n, update)
@@ -346,14 +393,18 @@ function newTrackerManager(mm, cm)
         forEachAttachedPA(n, function(e) assignLowlevel('pa', e, { pitch = update.pitch }) end)
       end
       if n.lane == 1 and update.detune ~= nil and update.detune ~= n.detune then
+        local nextP = nextNotePPQ(n.chan, n.ppq)
         if forcePb(n.chan, n.ppq) then markFake(n.chan, n.ppq) end
-        retuneLowlevel(n.chan, n.ppq, nextNotePPQ(n.chan, n.ppq), update.detune - n.detune)
-        -- Boundary became redundant (detune matches prior, no raw step) — drop it.
-        if update.detune == detuneBefore(n.chan, n.ppq)
-           and rawAt(n.chan, n.ppq) == rawBefore(n.chan, n.ppq) then
-          local pb = pbAt(n.chan, n.ppq)
-          if pb then deleteLowlevel('pb', pb) end
-        end
+        retuneLowlevel(n.chan, n.ppq, nextP, update.detune - n.detune)
+        -- Commit detune now so the boundary reconciliations below read
+        -- post-update state. Our own seat may collapse (detune now
+        -- matches prior); the next note's seat may flip either way —
+        -- a previously-absorbed jump may erase, or a previously-absent
+        -- jump may appear because the carry has shifted.
+        assignLowlevel('note', n, { detune = update.detune })
+        update.detune = nil
+        reconcileBoundary(n.chan, n.ppq)
+        reconcileBoundary(n.chan, nextP)
       end
       if next(update) then assignLowlevel('note', n, update) end
     end
@@ -504,7 +555,7 @@ function newTrackerManager(mm, cm)
       for loc, cc in mm:ccs() do
         local evt
         if cc.msgType == 'pb' then
-          evt = util.pick(cc, 'ppq straightPPQ chan shape tension fake frame',
+          evt = util.pick(cc, 'ppq ppqL chan shape tension fake frame',
                           { val = rawToCents(cc.val), loc = loc })
           util.add(chans[evt.chan].pbs, evt)
         else
@@ -535,16 +586,25 @@ function newTrackerManager(mm, cm)
     return util.add(notes, { events = {} }), #notes
   end
 
-  local function noteColumnAccepts(col, notePpq, noteEndPpq)
-    local overlapThreshold = cm:get('overlapOffset') * mm:resolution()
+  -- Overlap is judged in intent space: delay is a realisation-level
+  -- shift and shouldn't affect which notes can share a column. endppq
+  -- is already intent in storage, so only the note-on inverts delay.
+  -- Same-pitch comparisons get a hard zero threshold — MIDI allows
+  -- only one voice per (chan, pitch). Cross-column same-pitch
+  -- non-overlap is held by the truncation pass and clearSameKeyRange;
+  -- the per-pair threshold here is defence in depth.
+  local function noteColumnAccepts(col, note)
+    local lenient = cm:get('overlapOffset') * mm:resolution()
+    local noteppqI    = note.ppq - delayToPPQ(note.delay or 0)
+    local noteEndppqI = note.endppq
     local dominated = 0
     for _, evt in ipairs(col.events) do
-      if notePpq == evt.ppq then return false end
-      if notePpq < evt.endppq and evt.ppq < noteEndPpq then
-        local overlapAmount = math.min(evt.endppq, noteEndPpq) - math.max(evt.ppq, notePpq)
-        if overlapAmount > overlapThreshold then
-          return false
-        end
+      local evtppqI = evt.ppq - delayToPPQ(evt.delay or 0)
+      if noteppqI == evtppqI then return false end
+      if noteppqI < evt.endppq and evtppqI < noteEndppqI then
+        local threshold = (evt.pitch == note.pitch) and 0 or lenient
+        local overlapAmount = math.min(evt.endppq, noteEndppqI) - math.max(evtppqI, noteppqI)
+        if overlapAmount > threshold then return false end
         dominated = dominated + 1
       end
     end
@@ -555,7 +615,7 @@ function newTrackerManager(mm, cm)
     local notes = channel.columns.notes
     if note.lane then
       local col = notes[note.lane]
-      if col and noteColumnAccepts(col, note.ppq, note.endppq) then
+      if col and noteColumnAccepts(col, note) then
         return col, note.lane
       end
       if not col then
@@ -566,7 +626,7 @@ function newTrackerManager(mm, cm)
       -- Exists but won't fit; fall through to first-fit / spill.
     end
     for i, col in ipairs(notes) do
-      if noteColumnAccepts(col, note.ppq, note.endppq) then return col, i end
+      if noteColumnAccepts(col, note) then return col, i end
     end
     return pushNoteCol(channel)
   end
@@ -664,7 +724,7 @@ function newTrackerManager(mm, cm)
           pbByChan[cc.chan] = pb
           pb.anyVisible = pb.anyVisible or not hidden
           -- fake pbs inherit host delay so tidyCol shifts both into intent together
-          util.add(pb.events, util.pick(cc, 'ppq straightPPQ shape tension frame', {
+          util.add(pb.events, util.pick(cc, 'ppq ppqL shape tension frame', {
             loc    = loc,
             val    = util.round(rawToCents(cc.val) - detune),
             detune = detune,
@@ -675,7 +735,7 @@ function newTrackerManager(mm, cm)
         elseif cc.msgType == 'pa' then
           local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
           if noteCol then
-            util.add(noteCol.events, util.pick(cc, 'ppq straightPPQ pitch frame', {
+            util.add(noteCol.events, util.pick(cc, 'ppq ppqL pitch frame', {
               type = 'pa', vel = cc.val, loc = loc,
             }))
           end
@@ -689,7 +749,7 @@ function newTrackerManager(mm, cm)
             col = channel.columns[cc.msgType] or { events = {} }
             channel.columns[cc.msgType] = col
           end
-          util.add(col.events, util.pick(cc, 'ppq straightPPQ val shape tension frame', { loc = loc }))
+          util.add(col.events, util.pick(cc, 'ppq ppqL val shape tension frame', { loc = loc }))
         end
       end
 
@@ -789,7 +849,7 @@ function newTrackerManager(mm, cm)
     return mm and mm:interpolate(A, B, ppq)
   end
 
-  -- E_c: column is inner, global is outer (see design/swing.md).
+  -- E_c: column is inner, global is outer (see docs/timing.md).
   function tm:swingSnapshot(override)
     local global, column = nil, {}
     if mm then
@@ -805,17 +865,19 @@ function newTrackerManager(mm, cm)
     return {
       global = global,
       column = column,
-      apply = function(chan, ppq)
+      fromLogical = function(chan, ppqL)
+        local ppqI = ppqL
         local c = column[chan]
-        if c      then ppq = timing.applyFactors(c, ppq) end
-        if global then ppq = timing.applyFactors(global, ppq) end
-        return ppq
+        if c      then ppqI = timing.applyFactors(c, ppqI) end
+        if global then ppqI = timing.applyFactors(global, ppqI) end
+        return ppqI
       end,
-      unapply = function(chan, ppq)
-        if global then ppq = timing.unapplyFactors(global, ppq) end
+      toLogical = function(chan, ppqI)
+        local ppqL = ppqI
+        if global then ppqL = timing.unapplyFactors(global, ppqL) end
         local c = column[chan]
-        if c      then ppq = timing.unapplyFactors(c, ppq) end
-        return ppq
+        if c      then ppqL = timing.unapplyFactors(c, ppqL) end
+        return ppqL
       end,
     }
   end

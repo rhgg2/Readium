@@ -131,7 +131,7 @@ return {
 
   -- 2a'. Subtle pin: when a 1-row copy spans only the start of a longer
   -- note, the note's endRow is dropped in collectSelection (endppq
-  -- exceeds the region's endPPQ). On paste, addNoteEvent sees
+  -- exceeds the region's endppq). On paste, addNoteEvent sees
   -- `ce.endppq or nextNotePPQ` and stretches the pasted note to the
   -- next note (or take length). This is existing behaviour — pinning
   -- so Stage 2 can't drift it.
@@ -434,6 +434,125 @@ return {
       t.eq(a.endppq, 180, 'note A endppq advanced; just touches B')
       t.eq(b.ppq,    180, 'note B unmoved')
       t.eq(h.ec:row(), 2, 'cursor stays — row 3 is occupied by B')
+    end,
+  },
+
+  -- Pin the intent-space invariant for overlapBounds: a delayed-forward
+  -- next-note must NOT open up extra room for the previous note's
+  -- endppq. Without the fix, growNote on A could push A.endppq past B's
+  -- intent onset (since the bound was B's *realised* onset = intent +
+  -- delay), creating an intent overlap that next rebuild would split
+  -- into separate lanes.
+  {
+    name = 'growNote caps endppq at next-note INTENT onset, not realised',
+    run = function(harness)
+      -- A: intent 0..240. B: intent 240..480, delay = 500 → realised
+      -- onset = 240 + delayToPPQ(500, 240) = 360. Same lane (intent
+      -- intervals just touch, so allocation accepts).
+      -- ppqPerRow = 60. With overlapOffset default 1/16 → off = 15 ppq.
+      -- Old (realised) maxEnd = 360 + 15 = 375 → grow lands at 300.
+      -- New (intent)   maxEnd = 240 + 15 = 255 → grow clamps at 255.
+      local h = harness.mk{ seed = { notes = {
+        { ppq = 0,   endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0   },
+        { ppq = 360, endppq = 480, chan = 1, pitch = 64, vel = 80,  detune = 0, delay = 500 },
+      } } }
+      h.vm:setGridSize(80, 40)
+
+      -- Sanity: A and B share lane 1 (intent intervals don't overlap).
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 1, 'A and B share a lane in intent space')
+      t.eq(#ch.columns.notes[1].events, 2, 'both notes in lane 1')
+
+      h.ec:setPos(0, 1, 1)  -- cursorNoteBefore at row 0 picks A
+      h.cmgr.commands.growNote()
+
+      local a
+      for _, n in ipairs(h.fm:dump().notes) do
+        if n.pitch == 60 then a = n end
+      end
+      t.eq(a.endppq, 255,
+        "A.endppq clamps at B.intent + overlapOffset (240 + 15), not B.realised + overlapOffset (360 + 15)")
+    end,
+  },
+
+  -- growNote is the mechanism by which the user induces the *allowed*
+  -- overlap: a single press from a touching position must land
+  -- A.endppq at B.ppq + overlapOffset·resolution. Pinning under
+  -- non-trivial swing (c58) — the prior code read curRow via
+  -- ppqToRow(endppq), which round-trips through floor(...+0.5) and
+  -- can drift enough to make `+rowDelta` snap back to the same row,
+  -- silently turning the press into a no-op. The fix reads curRow
+  -- exactly off endppqL.
+  {
+    name = 'growNote reaches overlap bound on first press under c58 swing',
+    run = function(harness)
+      local classic58 = { { atom = 'classic', shift = 0.08, period = 1 } }
+      -- rowPerBeat=4, logPerRow=60. Under c58, rowPPQs[1]≈74, rowPPQs[2]=139.
+      -- A: rows 0..1 in c58 (endppq=74, endppqL=60).
+      -- B: row 1, different pitch (touching A in realised + intent).
+      -- maxPPQ = 74 + 15 = 89.
+      local h = harness.mk{
+        seed = { notes = {
+          { ppq = 0,  endppq = 74,  chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0,
+            ppqL = 0,  endppqL = 60,
+            frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
+          { ppq = 74, endppq = 139, chan = 1, pitch = 64, vel = 80,  detune = 0, delay = 0,
+            ppqL = 60, endppqL = 120,
+            frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
+        } },
+        config = {
+          project = { swings = { c58 = classic58 } },
+          take    = { swing = 'c58', rowPerBeat = 4 },
+        },
+      }
+      h.vm:setGridSize(80, 16)
+
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 1, 'A and B share lane 1 (intents touch at logical 60)')
+
+      h.ec:setPos(0, 1, 1)  -- cursorNoteBefore picks A
+      h.cmgr.commands.growNote()
+
+      local a
+      for _, n in ipairs(h.fm:dump().notes) do
+        if n.pitch == 60 then a = n end
+      end
+      -- overlapOffset = 1/16, resolution = 240 → lenient = 15 ppq.
+      t.eq(a.endppq, 74 + 15,
+        "A.endppq lands at B.ppq + lenient on the FIRST press, not stuck on the previous row")
+    end,
+  },
+
+  -- Same-pitch repeats can't share a (chan, pitch) MIDI voice, so the
+  -- overlapBounds same-pitch next-bound is HARD (no overlapOffset
+  -- leniency) — the previous test pinned the different-pitch case
+  -- where 15 ppq of leniency is allowed.
+  {
+    name = 'growNote against same-pitch next clamps at intent onset (no off)',
+    run = function(harness)
+      -- A pitch 60 intent 0..240. B pitch 60 intent 240..480. Same
+      -- pitch, same channel, intents touching at 240 (no overlap). One
+      -- growNote tries to push A.endppq past row 4. Same-pitch ⇒
+      -- maxEnd = B.intent (240, no off), so the grow clamps at 240
+      -- exactly. (The different-pitch case allowed 240 + 15 = 255.)
+      local h = harness.mk{ seed = { notes = {
+        { ppq = 0,   endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+        { ppq = 240, endppq = 480, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+      } } }
+      h.vm:setGridSize(80, 40)
+
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 1, 'A and B share lane 1 (intents touch)')
+
+      h.ec:setPos(0, 1, 1)  -- cursorNoteBefore at row 0 picks A
+      h.cmgr.commands.growNote()
+
+      local a
+      for _, n in ipairs(h.fm:dump().notes) do
+        if n.ppq == 0 then a = n end
+      end
+      t.eq(a.endppq, 240,
+        "A.endppq clamps at B.intent exactly — no overlapOffset for same-pitch")
     end,
   },
 

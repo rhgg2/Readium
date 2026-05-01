@@ -292,12 +292,12 @@ return {
 
   {
     -- Bug 1: notes added with swing off then swing-on must surface as
-    -- off-grid — their realised ppq sits at the straight-grid position,
+    -- off-grid — their realised ppq sits at the logical-grid position,
     -- which under the new swing no longer lands on rowToPPQ_c(N).
     name = 'swing change: notes authored under swing-off are off-grid under a non-trivial swing',
     run = function(harness)
       -- Seed each note as the user would have authored it with swing off:
-      -- frame.swing = nil, straightPPQ pins the row. Under c58 the realised
+      -- frame.swing = nil, ppqL pins the row. Under c58 the realised
       -- ppq remains at the unswung position, no longer on the swung grid.
       local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
       local nilFrame = { swing = nil, colSwing = nil, rpb = 4 }
@@ -305,13 +305,13 @@ return {
         seed = {
           notes = {
             -- ppqPerRow = 60 at rpb=4. Rows 0, 1, 2, 4 placed with no swing.
-            { ppq = 0,   endppq = 60,  straightPPQ = 0,   straightEndPPQ = 60,
+            { ppq = 0,   endppq = 60,  ppqL = 0,   endppqL = 60,
               chan = 1, pitch = 60, vel = 100, frame = nilFrame },
-            { ppq = 60,  endppq = 120, straightPPQ = 60,  straightEndPPQ = 120,
+            { ppq = 60,  endppq = 120, ppqL = 60,  endppqL = 120,
               chan = 1, pitch = 62, vel = 100, frame = nilFrame },
-            { ppq = 120, endppq = 180, straightPPQ = 120, straightEndPPQ = 180,
+            { ppq = 120, endppq = 180, ppqL = 120, endppqL = 180,
               chan = 1, pitch = 64, vel = 100, frame = nilFrame },
-            { ppq = 240, endppq = 300, straightPPQ = 240, straightEndPPQ = 300,
+            { ppq = 240, endppq = 300, ppqL = 240, endppqL = 300,
               chan = 1, pitch = 67, vel = 100, frame = nilFrame },
           },
         },
@@ -336,7 +336,7 @@ return {
 
   {
     -- Bug 2: a fresh PB authored at a row under non-trivial swing must
-    -- land on-grid. Regression guard for addPb dropping straightPPQ/frame.
+    -- land on-grid. Regression guard for addPb dropping ppqL/frame.
     name = 'fresh PB authored under swing lands on-grid (no off-grid flag, regardless of period position)',
     run = function(harness)
       local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
@@ -368,9 +368,9 @@ return {
   },
 
   {
-    -- Underlying mechanism for bug 2: fresh PBs must retain straightPPQ
+    -- Underlying mechanism for bug 2: fresh PBs must retain ppqL
     -- and frame through addPb, otherwise reswing has nothing to invert.
-    name = 'fresh PB carries straightPPQ + frame after authoring',
+    name = 'fresh PB carries ppqL + frame after authoring',
     run = function(harness)
       local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
       local h = harness.mk{
@@ -399,7 +399,7 @@ return {
       t.truthy(fresh.frame,          'fresh pb carries frame')
       t.eq(fresh.frame.swing, 'c58', 'frame.swing matches cm')
       t.eq(fresh.frame.rpb,   4,     'frame.rpb matches cm')
-      t.eq(fresh.straightPPQ, 120,   'straightPPQ pins authoring row 2 (60·2)')
+      t.eq(fresh.ppqL, 120,   'ppqL pins authoring row 2 (60·2)')
     end,
   },
 }

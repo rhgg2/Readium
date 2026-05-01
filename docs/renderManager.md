@@ -55,7 +55,7 @@ sees the row count it actually gets to fill.
 3. Row backgrounds (bar / beat tint) and row numbers.
 4. Sustain tails — per-note continuous bars from intent `ppq` to `endppq`.
 5. Cells, char by char.
-6. Off-grid projection bars — only under an active tuning, only for
+6. Off-grid projection bars — only under an active temperament, only for
    notes with a non-zero `(intent − displayed)` gap.
 7. Selection highlight.
 8. Cursor (single-cell box + re-painted cursor char).
@@ -334,11 +334,38 @@ height clamped to the viewport so auto-grow stays on-screen.
 
 ## Colour
 
-Every colour is read lazily from `cm:get('colour.<name>')` and cached
-as a packed U32. A `'configChanged'` callback nukes the cache on any
-config change, so a palette edit takes effect next frame. `pushStyles` applies
-ImGui-level window-chrome colours around the main window; all grid
-drawing uses the cached palette directly.
+The colour table in cm is a flat keyspace with three coexisting
+namespaces:
+
+- `palette.*` — atoms for the parchment grid palette (`palette.bg`,
+  `palette.shade`, `palette.mid`, `palette.highlight`, `palette.inactive`,
+  `palette.danger`, `palette.caution`, `palette.positive`, `palette.amber`,
+  `palette.steel`, `palette.pale`, `palette.night`, `palette.nightText`).
+- `chrome.*` — atoms for the neutral toolbar/popups/modals palette
+  (`chrome.bg`, `chrome.shade`, `chrome.mid`).
+- `colour.*` — roles that name the *function* a colour plays
+  (`colour.bg`, `colour.text`, `colour.rowBeat`, `colour.toolbar.bg`,
+  etc.). Roles alias atoms, or other roles, by their full cm key.
+
+Each entry takes one of three forms:
+
+- `{r,g,b,a}` — atom (terminal RGBA).
+- `'fullKey'` — pure alias; alpha inherited from the eventual atom.
+- `{'fullKey', a}` — alias with alpha override; outermost override wins
+  along a chain. (Lua treats 0 as truthy, so `override or v[i]` correctly
+  lets an alpha-0 override come through.)
+
+One-off colours that earn no good function name (the yellow editCursor,
+faded steel, faded red) live inline at the role rather than as palette
+atoms.
+
+`renderManager.resolveColour(key)` chases the chain to an atom, raising
+on cycles or unknown keys. The `colour(name)` wrapper takes a bare role
+name, prepends the `colour.` namespace, resolves, and caches the U32 by
+role name. The cache invalidates on `'configChanged'`, so a palette edit
+takes effect next frame. `pushStyles` applies ImGui-level window-chrome
+colours around the main window; all grid drawing uses the cached palette
+directly.
 
 ## Font
 

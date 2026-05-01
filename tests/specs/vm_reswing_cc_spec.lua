@@ -15,14 +15,14 @@ end
 
 return {
   {
-    name = 'CC authored under c58 reswings to identity using its straightPPQ',
+    name = 'CC authored under c58 reswings to identity using its ppqL',
     run = function(harness)
-      -- Row 2 in rpb=4 has straight ppq 120; under c58 that lands at 139.
+      -- Row 2 in rpb=4 has logical ppq 120; under c58 that lands at 139.
       -- Reswing target = identity, so the realised ppq returns to 120.
       local h = harness.mk{
         seed = {
           ccs = {
-            { ppq = 139, straightPPQ = 120,
+            { ppq = 139, ppqL = 120,
               chan = 2, msgType = 'cc', cc = 1, val = 64,
               frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
           },
@@ -70,7 +70,7 @@ return {
       local h = harness.mk{
         seed = {
           ccs = {
-            { ppq = 139, straightPPQ = 120,
+            { ppq = 139, ppqL = 120,
               chan = 2, msgType = 'cc', cc = 1, val = 64,
               frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
           },
@@ -148,15 +148,15 @@ return {
   },
 
   {
-    name = 'PB reswung twice: straightPPQ + frame survive the first pass',
+    name = 'PB reswung twice: ppqL + frame survive the first pass',
     run = function(harness)
       -- assignPb's ppq-change path delete-and-re-adds the pb. If the new
-      -- pb doesn't inherit straightPPQ/frame, the *next* reswing reads
-      -- straightPPQ=nil and tile() / round() blow up.
+      -- pb doesn't inherit ppqL/frame, the *next* reswing reads
+      -- ppqL=nil and tile() / round() blow up.
       local h = harness.mk{
         seed = {
           ccs = {
-            { ppq = 139, straightPPQ = 120,
+            { ppq = 139, ppqL = 120,
               chan = 2, msgType = 'pb', val = 0,
               frame = { swing = 'c58', colSwing = nil, rpb = 4 } },
           },
@@ -173,8 +173,58 @@ return {
       local pb = findCC(h.fm:dump(), 'pb', 2)
       t.truthy(pb, 'pb survives both reswings')
       t.eq(pb.ppq, 120, 'pb at identity-frame intent ppq=120')
-      t.eq(pb.straightPPQ, 120, 'straightPPQ preserved across reswing')
+      t.eq(pb.ppqL, 120, 'ppqL preserved across reswing')
       t.truthy(pb.frame, 'frame preserved across reswing')
+    end,
+  },
+
+  -- Reswing recomputes intent ppqs but leaves delay alone. If the
+  -- new swing closes a gap below the magnitude of an existing delay,
+  -- the same realised reorder delayRange now forbids on direct edits
+  -- would slip in via reswing. The pass-1.5 clamp in reswingCore
+  -- pulls offending delays back to the post-reswing realised-order
+  -- bound, so the invariant holds across reswing too.
+  {
+    name = 'reswing into tighter swing clamps delay to preserve realised order',
+    run = function(harness)
+      -- A (pitch 60) at row 2, B (pitch 64) at row 3, both lane 1 of
+      -- channel 1, both authored under identity (swing = nil). B has
+      -- delay = -240 ms-QN (= -58 ppq @ res=240), valid pre-reswing:
+      -- A.realised=120, B.realised=122.
+      --
+      -- Reswing target = c58. Under c58, ppqL 120 → 139,
+      -- 180 → 194 (= round(240 * (0.75 + 0.08·sin(π·0.75)))). The
+      -- unclamped delay would put B.realised at 194 + (-58) = 136 —
+      -- *before* A's 139. Pass 1.5 clamps B.delay to ceil(ppqToDelay
+      -- (140 − 194, 240)) = ceil(-225) = -225, landing B.realised at
+      -- 140, just after A.
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 120, endppq = 150, ppqL = 120, endppqL = 150,
+              chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0,
+              frame = { swing = nil, colSwing = nil, rpb = 4 } },
+            { ppq = 122, endppq = 240, ppqL = 180, endppqL = 240,
+              chan = 1, pitch = 64, vel = 100, detune = 0, delay = -240,
+              frame = { swing = nil, colSwing = nil, rpb = 4 } },
+          },
+        },
+        config = {
+          project = { swings = { ['c58'] = classic58 } },
+          take    = { swing = 'c58', rowPerBeat = 4 },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      h.vm:reswingAll()
+
+      local Bafter
+      for _, x in ipairs(h.fm:dump().notes) do
+        if x.pitch == 64 then Bafter = x end
+      end
+      t.truthy(Bafter, 'B survives reswing')
+      t.eq(Bafter.delay, -225,
+        'delay clamped at A.realisedOnset + 1 in the post-reswing geometry')
+      t.eq(Bafter.ppq, 140, 'realised onset = A.realisedOnset + 1 = 140')
     end,
   },
 

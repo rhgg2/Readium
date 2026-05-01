@@ -19,7 +19,7 @@ end
 require('fakeMidiManager')  -- installs newMidiManager global
 require('util')
 require('timing')
-require('microtuning')
+require('tuning')
 require('configManager')
 require('trackerManager')
 require('commandManager')

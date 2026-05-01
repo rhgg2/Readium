@@ -207,6 +207,51 @@ return {
   },
 
   {
+    -- Column allocation lives in intent space: delay is realisation-only
+    -- and must not influence which lane a note lands in. Two notes with
+    -- the same intent onset must spill regardless of their delays.
+    name = 'same intent onset with different delays still spills to a new lane',
+    run = function(harness)
+      -- At resolution 240, delay=500 → +120 PPQ realised shift.
+      -- Both notes share intent ppq=240; B's realised onset is 360.
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 240, endppq = 360, chan = 1, pitch = 60, vel = 100, delay = 0   },
+            { ppq = 360, endppq = 360, chan = 1, pitch = 64, vel = 100, delay = 500 },
+          },
+        },
+      }
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 2,
+        'shared intent onset spills to a second lane even when delays differ')
+    end,
+  },
+
+  {
+    -- Converse: notes whose REALISED onsets coincide (purely because of
+    -- delay) but whose intents are disjoint should share a lane. Without
+    -- the intent-space rule the same-tick reject would force a spill.
+    name = 'realised collision via delay does not force a spill if intents are disjoint',
+    run = function(harness)
+      -- A: intent [0, 120), realised onset 0.
+      -- B: intent [240, 480), realised onset 0 (delay = -1000 → -240 PPQ at res 240).
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0, endppq = 120, chan = 1, pitch = 60, vel = 100, delay = 0     },
+            { ppq = 0, endppq = 480, chan = 1, pitch = 64, vel = 100, delay = -1000 },
+          },
+        },
+      }
+      local ch = h.tm:getChannel(1)
+      t.eq(#ch.columns.notes, 1,
+        'intent-disjoint notes share a lane despite realised collision')
+      t.eq(#ch.columns.notes[1].events, 2, 'both notes live in lane 1')
+    end,
+  },
+
+  {
     name = 'tm:addEvent + flush round-trips through mm',
     run = function(harness)
       local h = harness.mk()

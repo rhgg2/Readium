@@ -24,6 +24,7 @@ local specs = {
   'mm_cc_metadata_spec',
   'mm_cc_reconcile_spec',
   'mm_cc_dedup_spec',
+  'mm_deletecc_sidecar_spec',
   'sidecar_reconcile_spec',
   'tm_rebuild_spec',
   'tm_tuning_spec',
@@ -37,9 +38,10 @@ local specs = {
   'clipboard_spec',
   'vm_transient_frame_spec',
   'vm_reswing_cc_spec',
-  'vm_straight_ppq_spec',
+  'vm_logical_ppq_spec',
   'vm_delay_entry_spec',
   'vm_lane_drag_spec',
+  'vm_slot_writers_spec',
 }
 
 local pass, fail, failures = 0, 0, {}

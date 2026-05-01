@@ -1,7 +1,7 @@
 # trackerManager
 
 Parses a midiManager's MIDI stream into tracker-style channels with typed
-columns, resolves microtuning and timing (swing + per-note delay), and
+columns, resolves tuning and timing (swing + per-note delay), and
 exposes a batched mutation interface that writes back to mm. Rebuilds
 automatically whenever mm or cm fires.
 
@@ -61,90 +61,93 @@ The sections below reference `um` by name because its frame and
 encoding choices (cents not raw, realised not intent) are the reason
 several conventions exist.
 
-## Pitchbend: raw, logical, detune
+## Pitchbend: tm's role in the tuning model
 
-**Detune** is a per-note metadata field (signed cents) carried only by
-**col-1 notes** — i.e. notes in lane 1, the first note column of the
-channel. Pb is a channel-wide stream, so only one note column per
-channel can drive microtuning; by convention that is lane 1. Higher
-lanes inherit whatever pb is in force.
+See `docs/tuning.md` for the cross-cutting model — detune as intent,
+pb as realisation, the fake-pb absorber invariant, and the
+orthogonality rule. tm is where the model is implemented. The
+tm-specific facts:
 
-Two views of the same pb stream coexist:
+- **Cents inside, raw at the boundary.** Inside `um`, `pb.val` is
+  always cents. Conversion to raw happens only on load (`rawToCents`)
+  and at flush (`centsToRaw`). The cents window is
+  `cm:get('pbRange') * 100` per side.
+- **Lane-1 drives detune.** Every note has a `detune` field, but
+  only lane-1 notes feed the pb-realisation logic — `detuneAt` /
+  `detuneBefore` walk only `chans[chan].notes`, which is built from
+  lane-1 entries (see `addLowlevel`). Higher lanes' detune is dead
+  data for realisation purposes; it survives so display layers and
+  any future lane-promotion paths can read it back.
+- **Fake-pb persistence.** Absorbers carry `fake=true` as cc
+  metadata via `mm:assignCC` / `mm:addCC`'s lazy-sidecar path. Fake
+  pbs are hidden from the pb column unless an interp shape pulls
+  them into view (`hidden = cc.fake and (shape==nil or 'step')`);
+  the host note for delay inheritance is the lane-1 note at exactly
+  `cc.ppq` whenever `cc.fake` is set.
+- **Helpers.** `markFake` / `unmarkFake` toggle the flag;
+  `reconcileBoundary` runs the both-directions absorber check
+  (drop-redundant + seat-missing) after every detune mutation that
+  crosses a seat. The host note carries no marker — it's recovered
+  geometrically.
 
-- **Raw** is what REAPER stores: signed -8192..8191, centred on 0.
-- **Logical** is what the musician authored: cents relative to
-  prevailing detune. `logical = raw − detune(chan, ppq)`, where
-  `detune(chan, ppq)` is the detune of the latest col-1 note starting
-  at or before `ppq` (0 if none).
+### Implementation invariants
 
-Inside `um`, `pb.val` is **always cents**; conversion to raw happens
-only on load (`rawToCents`) and at flush (`centsToRaw`). The cents
-window is `cm:get('pbRange') * 100` per side.
+Cross-cutting invariants I1-I5 (see `docs/tuning.md`) define the
+contract. The three below are tm-specific — they capture *how* tm
+fulfils that contract, and would change shape if the realisation
+mechanism did:
 
-**Fake pb (detune absorber).** When a col-1 note's `detune` differs
-from prevailing `detune` just before it, a pb must seat at the note
-boundary to absorb the raw step while keeping the logical stream
-unchanged. That pb is tagged `fake=true` (persisted as cc metadata via
-`mm:assignCC` / `mm:addCC`'s lazy-sidecar path). Fake pbs are hidden
-from the pb column unless an interp shape pulls them into view
-(`hidden = cc.fake and (shape==nil or 'step')`); the host note for
-delay inheritance is just the col-1 note at exactly `cc.ppq` whenever
-`cc.fake` is set.
+- **I6 — Cents inside, raw at boundary.** Inside `um`, `pb.val` is
+  always cents. Conversion to raw happens only on load
+  (`rawToCents`) and at flush (`centsToRaw`). The cents window is
+  `cm:get('pbRange') * 100` per side.
+- **I7 — Delay topology.** A pure delay change on a lane-1 note
+  shifts the absorber along with the host. Pb count and the
+  logical stream are preserved; only the realised ppq of host and
+  absorber move together. Implemented by routing delay changes
+  through `realiseNoteUpdate` → `resizeNote`, which deletes the
+  fake at the old seat and reconciles a fresh one at the new seat.
+- **I8 — Round-trip stability.** flush → rebuild → flush produces
+  an identical pb dump. `fake=true` survives via cc-sidecar
+  metadata; absorbers inherit host delay at rebuild so `tidyCol`
+  shifts host and absorber into intent together.
 
-`markFake` / `unmarkFake` toggle the pb's `fake` flag. The host note
-carries no marker — it's recovered geometrically.
+Mutation entry points that touch detune realisation —
+`addNote`, `assignNote`-detune, `resizeNote`, `deleteNote` — all
+gate on `n.lane == 1` to uphold I3. The fake-pb cleanup,
+`retuneLowlevel`, and `reconcileBoundary` calls are lane-1-only.
 
-## Intent vs realised frame
+## Where tm sits in the timing model
 
-**Delay** is a per-note metadata field (signed milli-QN, defaulted to
-0) that nudges only the note-on off its nominal ppq. The note-off
-stays at intent. This creates two views of the note's onset:
+See `docs/timing.md` for the three-frame model (logical / intent /
+realisation) and the full conversion stack. tm's role in it:
 
-- **Intent ppq** is where the note nominally sits (the musician's
-  authored position, and what vm renders).
-- **Realised ppq** is where mm stores the note-on (intent plus the
-  delay offset).
-
-`endppq` is intent in both views — it never carries the delay
-offset. A positive delay therefore shrinks the realised duration by
-exactly `delayToPPQ(delay)`; a negative delay extends it. This is
-classical tracker semantics (sub-row note-on nudge).
-
-vm speaks intent; mm and `um` internals speak realised. The invariant:
-
-```
-realised.ppq    = intent.ppq + delayToPPQ(delay)
-realised.endppq = intent.endppq                      -- delay does not shift the end
-```
-
-is maintained at the vm boundary:
-
-- `tm:rebuild` strips delay from `ppq` via `tidyCol` before exposing
-  events (intent frame out). `endppq` is left alone — already intent.
-- `um:addEvent` / `um:assignEvent` add delay back to `ppq` before
-  routing writes to mm (realised frame in). `endppq` passes through.
+- **Public surface is intent.** Channel events expose intent ppq,
+  sorted by intent ppq; `endppq` is intent at every layer.
+- **`um` and rebuild work in realisation** — REAPER's storage frame.
+  `tidyCol` is the sole shift into intent at rebuild's tail;
+  `um:addEvent` / `um:assignEvent` add delay back on writes to mm.
 
 A delay change with no ppq update pins intent and shifts realised
-onset by the delta (`realiseNoteUpdate`). Ppq comparisons inside
-rebuild run in the realised frame — `tidyCol` is the sole shift into
-intent.
+onset by the delta (`realiseNoteUpdate`).
 
 Fake pbs inherit their host note's `delay` at rebuild time so
-`tidyCol` shifts both into intent frame together. Without this, a
-delayed note and its absorber would desynchronise at the vm boundary.
+`tidyCol` shifts host and absorber into intent together. Without
+this, a delayed note and its absorber would desynchronise at the vm
+boundary.
 
 ## Swing
 
 tm is only a registry here: `cfg.swing` (global) and `cfg.colSwing[c]`
-(per column) hold slot names referring into `cfg.swings`. The semantics
-— what a slot *is*, how factors compose, how apply/unapply work — live
-in `timing.lua` and `design/swing.md`.
+(per column) hold slot names referring into `cfg.swings`. The
+semantics — what a slot *is*, how factors compose, how
+logical↔intent works — live in `docs/timing.md`.
 
 `tm:swingSnapshot(override)` hands callers a frozen view of the
-currently registered swing with `apply`/`unapply` closures ready to
-use. Pass `override` to substitute alternative slot names or shadow the
-library (preset edits need the authoring and target composites for the
-same name side-by-side).
+currently registered swing with `fromLogical`/`toLogical` closures
+ready to use. Pass `override` to substitute alternative slot names or
+shadow the library (preset edits need the authoring and target
+composites for the same name side-by-side).
 
 ## Mutation contract
 
@@ -231,14 +234,30 @@ Then `um = createUpdateManager()` and tm fires the `'rebuild'` signal
 
 ## Column allocation rules
 
-`noteColumnAccepts(col, ppq, endppq)`:
+`noteColumnAccepts(col, note)`:
 
-- same start tick as any existing note ⇒ reject (always spill);
-- overlap amount > `cm:get('overlapOffset') * resolution` with any
-  single existing note ⇒ reject;
-- two or more existing notes overlap this one ⇒ reject.
+Comparisons run in **intent space**: the candidate's note-on has its
+delay subtracted, and each existing event's note-on has its own delay
+subtracted. `endppq` is already intent in storage (delay never shifts
+the note-off — see `docs/timing.md`). This keeps column allocation
+independent of delay: changing a note's delay can never push it into
+a different column or spring a new one.
+
+The overlap threshold is **per-pair**: same-pitch comparisons get
+a hard `0` (MIDI allows only one voice per `(chan, pitch)`), while
+different-pitch comparisons get the configured leniency
+`cm:get('overlapOffset') * resolution`.
+
+- same intent start tick as any existing note ⇒ reject (always spill);
+- intent overlap amount > pair threshold with any single existing
+  note ⇒ reject;
+- two or more existing notes overlap this one in intent ⇒ reject.
 
 Otherwise the column accepts.
+
+Cross-column same-pitch non-overlap is held by the rebuild
+truncation pass and `clearSameKeyRange`; the per-pair threshold
+above is defence in depth.
 
 ## PA binding
 
@@ -342,8 +361,8 @@ tm:interpolate(A, B, ppq)   -> passthrough to mm:interpolate; value at ppq
 tm:swingSnapshot(override)  -> {
   global,                   -- resolved factor array or nil
   column,                   -- { [chan] = factor array or nil }
-  apply(chan, ppq)   -> ppq,
-  unapply(chan, ppq) -> ppq,
+  fromLogical(chan, ppqL) -> ppqI,
+  toLogical(chan, ppqI)   -> ppqL,
 }
 ```
 
@@ -369,12 +388,12 @@ Event fields accepted on `addEvent('note', evt)`:
 Event fields accepted on `addEvent('pb', evt)`:
 `{ ppq, chan, val (cents), [shape], [tension] }`.
 
-`evt.frame` and `evt.straightPPQ` (and `evt.straightEndPPQ` for
+`evt.frame` and `evt.ppqL` (and `evt.endppqL` for
 notes), when supplied by the caller, pass through as sidecar metadata
 at the mm layer. tm itself never inspects or fills them — their
 semantics live entirely in vm. Callers that want a frame on an
 authored event must stamp it themselves before calling `addEvent`.
-Delay nudges shift `ppq` / `endppq` only — `straightPPQ` is
+Delay nudges shift `ppq` / `endppq` only — `ppqL` is
 delay-independent and rides through unchanged.
 
 Update values may include `util.REMOVE` to delete the field.

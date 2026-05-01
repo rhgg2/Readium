@@ -15,8 +15,8 @@ return {
       local h = harness.mk()
       local snap = h.tm:swingSnapshot()
       for _, p in ipairs{ 0, 60, 120, 240, 480, 961 } do
-        t.eq(snap.apply(1, p), p, 'apply at ' .. p)
-        t.eq(snap.unapply(1, p), p, 'unapply at ' .. p)
+        t.eq(snap.fromLogical(1, p), p, 'fromLogical at ' .. p)
+        t.eq(snap.toLogical(1, p), p, 'toLogical at ' .. p)
       end
     end,
   },
@@ -32,11 +32,11 @@ return {
       }
       local snap = h.tm:swingSnapshot()
       -- 240 ppq/QN, period 1 QN = 240 ppq. Boundaries are fixed.
-      t.eq(snap.apply(1, 0),   0,   'origin fixed')
-      t.eq(snap.apply(1, 240), 240, 'period boundary fixed')
-      t.eq(snap.apply(1, 480), 480, 'two periods in, still fixed')
+      t.eq(snap.fromLogical(1, 0),   0,   'origin fixed')
+      t.eq(snap.fromLogical(1, 240), 240, 'period boundary fixed')
+      t.eq(snap.fromLogical(1, 480), 480, 'two periods in, still fixed')
       -- Mid-period maps to 0.58 of the period = 139.2.
-      local mid = snap.apply(1, 120)
+      local mid = snap.fromLogical(1, 120)
       t.truthy(math.abs(mid - 139.2) < 1e-9, 'mid-period maps to ~139.2, got ' .. tostring(mid))
     end,
   },
@@ -52,7 +52,7 @@ return {
       }
       local snap = h.tm:swingSnapshot()
       for _, p in ipairs{ 0, 30, 60, 119, 120, 121, 240, 361, 480, 961 } do
-        local round = snap.unapply(1, snap.apply(1, p))
+        local round = snap.toLogical(1, snap.fromLogical(1, p))
         t.truthy(math.abs(round - p) < 1e-9,
           'round-trip at ppq=' .. p .. ' gave ' .. tostring(round))
       end
@@ -69,8 +69,8 @@ return {
         },
       }
       local snap = h.tm:swingSnapshot()
-      t.eq(snap.apply(1, 120), 120, 'chan 1 unswung')
-      local c2 = snap.apply(2, 120)
+      t.eq(snap.fromLogical(1, 120), 120, 'chan 1 unswung')
+      local c2 = snap.fromLogical(2, 120)
       t.truthy(math.abs(c2 - 0.67 * 240) < 1e-9,
         'chan 2 mid-period maps to 0.67 of period, got ' .. tostring(c2))
     end,
@@ -102,7 +102,7 @@ return {
       local colInner = timing.applyFactors(fc58, timing.applyFactors(fc67, 120))
       local colOuter = timing.applyFactors(fc67, timing.applyFactors(fc58, 120))
 
-      local got = snap.apply(1, 120)
+      local got = snap.fromLogical(1, 120)
       t.truthy(math.abs(got - colInner) < 1e-9,
         'snap matches column-inner ordering: got ' .. tostring(got)
         .. ', column-then-global = ' .. tostring(colInner))
@@ -111,7 +111,7 @@ return {
         tostring(colInner) .. ' vs ' .. tostring(colOuter))
 
       -- Inversion still round-trips.
-      local round = snap.unapply(1, got)
+      local round = snap.toLogical(1, got)
       t.truthy(math.abs(round - 120) < 1e-9, 'composed round-trip failed: ' .. tostring(round))
     end,
   },
@@ -126,7 +126,7 @@ return {
           take    = { swing = 'mysterious' },
         },
       }
-      t.eq(h.tm:swingSnapshot().apply(1, 120), 120, 'unknown slot name passes through')
+      t.eq(h.tm:swingSnapshot().fromLogical(1, 120), 120, 'unknown slot name passes through')
     end,
   },
 
@@ -139,7 +139,7 @@ return {
           take    = { swing = 'id' },
         },
       }
-      t.eq(h.tm:swingSnapshot().apply(1, 120), 120, 'empty composite is identity')
+      t.eq(h.tm:swingSnapshot().fromLogical(1, 120), 120, 'empty composite is identity')
     end,
   },
 }

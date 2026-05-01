@@ -85,8 +85,8 @@ return {
     name = 'null-defaulted keys are declared but return nil',
     run = function(harness)
       local h = harness.mk()
-      -- 'tuning' is declared with no default; should not raise, should return nil.
-      local ok, v = pcall(function() return h.cm:get('tuning') end)
+      -- 'temper' is declared with no default; should not raise, should return nil.
+      local ok, v = pcall(function() return h.cm:get('temper') end)
       t.truthy(ok,  'get on null-defaulted key does not raise')
       t.eq(v, nil, 'null-defaulted key returns nil')
     end,

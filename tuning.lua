@@ -1,10 +1,10 @@
--- See docs/microtuning.md for the model and API reference.
+-- See docs/tuning.md for the model and API reference.
 -- @noindex
 
-microtuning = {}
-local M = microtuning
+tuning = {}
+local M = tuning
 
------ Tuning library
+----- Temperament presets
 
 -- Scan from the end: every trailing C-variant step (e.g. C↓ in 31EDO)
 -- is enharmonically the next C and belongs to the octave above.
@@ -27,7 +27,9 @@ local function edo(n, names)
   }
 end
 
-M.tunings = {
+-- Seed only — never consulted at slot-resolution time. Populates the
+-- "copy into library" UI menu, mirroring `timing.presets`.
+M.presets = {
   ['12EDO'] = edo(12, {
     'C-','C#','D-','D#','E-','F-','F#','G-','G#','A-','A#','B-'
   }),
@@ -49,19 +51,22 @@ M.tunings = {
   }),
 }
 
-function M.findTuning(name)
-  return M.tunings[name]
+-- Resolve a temperament slot name within the project library. Mirrors
+-- `timing.findShape`: presets are seed-only, never consulted here.
+function M.findTemper(name, userLib)
+  if not (name and userLib) then return nil end
+  return userLib[name]
 end
 
 ----- Coordinate conversions
 
-function M.midiToStep(tuning, midi, detune)
+function M.midiToStep(temper, midi, detune)
   detune = detune or 0
   local cents  = midi * 100 + detune
-  local period = tuning.period
+  local period = temper.period
   local octave = math.floor(cents / period)
   local res    = cents - octave * period
-  local steps  = tuning.cents
+  local steps  = temper.cents
 
   local best, bestDist = 1, math.abs(res - steps[1])
   for i = 2, #steps do
@@ -76,12 +81,12 @@ function M.midiToStep(tuning, midi, detune)
   return best, octave - 1
 end
 
-function M.stepToMidi(tuning, step, octave)
-  local steps, n = tuning.cents, #tuning.cents
+function M.stepToMidi(temper, step, octave)
+  local steps, n = temper.cents, #temper.cents
   while step < 1 do step = step + n; octave = octave - 1 end
   while step > n do step = step - n; octave = octave + 1 end
 
-  local cents  = (octave + 1) * tuning.period + steps[step]
+  local cents  = (octave + 1) * temper.period + steps[step]
   local midi   = math.floor(cents / 100 + 0.5)
   local detune = cents - midi * 100
 
@@ -94,13 +99,13 @@ function M.stepToMidi(tuning, step, octave)
   return midi, detune
 end
 
-function M.snap(tuning, midi, detune)
-  return M.stepToMidi(tuning, M.midiToStep(tuning, midi, detune))
+function M.snap(temper, midi, detune)
+  return M.stepToMidi(temper, M.midiToStep(temper, midi, detune))
 end
 
-function M.transposeStep(tuning, midi, detune, n)
-  local step, oct = M.midiToStep(tuning, midi, detune)
-  return M.stepToMidi(tuning, step + n, oct)
+function M.transposeStep(temper, midi, detune, n)
+  local step, oct = M.midiToStep(temper, midi, detune)
+  return M.stepToMidi(temper, step + n, oct)
 end
 
 ----- Display
@@ -110,9 +115,9 @@ local function octaveLabel(o)
   return o == -1 and 'M' or tostring(o)
 end
 
-function M.stepToText(tuning, step, octave)
-  if step >= tuning.octaveStep then octave = octave + 1 end
-  return tuning.stepNames[step] .. octaveLabel(octave)
+function M.stepToText(temper, step, octave)
+  if step >= temper.octaveStep then octave = octave + 1 end
+  return temper.stepNames[step] .. octaveLabel(octave)
 end
 
 return M

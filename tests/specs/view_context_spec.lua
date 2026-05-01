@@ -10,13 +10,13 @@ require('viewManager')        -- registers global newViewContext
 
 local function identitySwing()
   return {
-    apply   = function(_, p) return p end,
-    unapply = function(_, p) return p end,
+    fromLogical = function(_, p) return p end,
+    toLogical   = function(_, p) return p end,
   }
 end
 
--- Uniform straight-grid rowPPQs for 240 ppq/QN, 4 rows/beat, length 3840 ppq.
-local function straightGrid()
+-- Uniform logical-grid rowPPQs for 240 ppq/QN, 4 rows/beat, length 3840 ppq.
+local function logicalGrid()
   local ppqPerRow = 60
   local length    = 3840
   local numRows   = length // ppqPerRow
@@ -26,7 +26,7 @@ local function straightGrid()
 end
 
 local function mkCtx(overrides)
-  local rowPPQs, numRows, length = straightGrid()
+  local rowPPQs, numRows, length = logicalGrid()
   local args = {
     swing      = identitySwing(),
     rowPPQs    = rowPPQs,
@@ -35,13 +35,13 @@ local function mkCtx(overrides)
     rowPerBeat = 4,
     ppqPerRow  = 60,
     timeSigs   = { { ppq = 0, num = 4, denom = 4 } },
-    tuning     = nil,
+    temper     = nil,
   }
   for k, v in pairs(overrides or {}) do args[k] = v end
   return newViewContext(args)
 end
 
--- Build a swung snapshot via the real tm — the rowPPQs stay straight
+-- Build a swung snapshot via the real tm — the rowPPQs stay logical
 -- (intent grid is uniform); swing only deflects the realised ppq.
 local function swungSnapshot(harness, composite, slot)
   slot = slot or 'c58'
@@ -76,7 +76,7 @@ return {
       local ctx = mkCtx()
       -- 30 ppq is half a row at 60 ppq/row.
       t.truthy(math.abs(ctx:ppqToRow(30, 1) - 0.5) < 1e-9, 'ppqToRow(30) ≈ 0.5')
-      -- rowToPPQ(0.5) → swing.apply identity → 30.0 → floor(30.5) = 30
+      -- rowToPPQ(0.5) → swing.fromLogical identity → 30.0 → floor(30.5) = 30
       t.eq(ctx:rowToPPQ(0.5, 1), 30)
     end,
   },
@@ -121,13 +121,13 @@ return {
   },
 
   {
-    name = 'swung snapshot: rowToPPQ deflects mid-period rows away from straight ppq',
+    name = 'swung snapshot: rowToPPQ deflects mid-period rows away from logical ppq',
     run = function(harness)
       local ctx = mkCtx{ swing = swungSnapshot(harness, classic58) }
       -- Row 2 = midpoint of beat 1 = midpoint of swing period.
-      -- Straight ppq would be 120; classic-58 maps 0.5 ↦ 0.58 ⇒ ppq ≈ 139.
+      -- Logical ppq would be 120; classic-58 maps 0.5 ↦ 0.58 ⇒ ppq ≈ 139.
       local ppq = ctx:rowToPPQ(2, 1)
-      t.truthy(ppq ~= 120, 'row 2 should not land on straight 120 under swing, got ' .. ppq)
+      t.truthy(ppq ~= 120, 'row 2 should not land on logical 120 under swing, got ' .. ppq)
       t.truthy(math.abs(ppq - 139) <= 1, 'row 2 should land near 139, got ' .. ppq)
     end,
   },
@@ -135,31 +135,31 @@ return {
   ---------- PPQ-PER-ROW
 
   {
-    name = 'ppqPerRow exposes the rebuild frame straight ppq width',
+    name = 'ppqPerRow exposes the rebuild frame logical ppq width',
     run = function()
       t.eq(mkCtx():ppqPerRow(), 60)
     end,
   },
 
-  ---------- TUNING LENS
+  ---------- TEMPERAMENT LENS
 
   {
-    name = 'activeTuning is nil when no tuning is bound',
+    name = 'activeTemper is nil when no temperament is bound',
     run = function()
-      t.eq(mkCtx():activeTuning(), nil)
+      t.eq(mkCtx():activeTemper(), nil)
     end,
   },
 
   {
-    name = 'activeTuning returns the bound tuning object',
+    name = 'activeTemper returns the bound temperament object',
     run = function()
-      local tuning = microtuning.findTuning('19EDO')
-      t.eq(mkCtx{ tuning = tuning }:activeTuning(), tuning)
+      local temper = tuning.presets['19EDO']
+      t.eq(mkCtx{ temper = temper }:activeTemper(), temper)
     end,
   },
 
   {
-    name = 'noteProjection returns nil when no tuning is bound',
+    name = 'noteProjection returns nil when no temperament is bound',
     run = function()
       t.eq(mkCtx():noteProjection({ pitch = 60 }), nil)
     end,
@@ -168,7 +168,7 @@ return {
   {
     name = 'noteProjection under 12EDO: pitch 60 maps to C-4 with zero gap',
     run = function()
-      local ctx = mkCtx{ tuning = microtuning.findTuning('12EDO') }
+      local ctx = mkCtx{ temper = tuning.presets['12EDO'] }
       local label, gap, halfGap = ctx:noteProjection({ pitch = 60 })
       t.eq(label, 'C-4')
       t.eq(gap, 0)
@@ -179,7 +179,7 @@ return {
   {
     name = 'noteProjection signed gap: positive detune yields positive gap (sharp)',
     run = function()
-      local ctx = mkCtx{ tuning = microtuning.findTuning('12EDO') }
+      local ctx = mkCtx{ temper = tuning.presets['12EDO'] }
       local _, gap = ctx:noteProjection({ pitch = 60, detune = 20 })
       t.truthy(gap > 0, 'sharp detune ⇒ positive gap, got ' .. tostring(gap))
       local _, gapDown = ctx:noteProjection({ pitch = 60, detune = -20 })
@@ -190,15 +190,15 @@ return {
   {
     name = 'noteProjection halfGap is half the cents-distance to the nearest neighbour',
     run = function()
-      local tuning = microtuning.findTuning('19EDO')
-      local ctx = mkCtx{ tuning = tuning }
+      local temper = tuning.presets['19EDO']
+      local ctx = mkCtx{ temper = temper }
       local _, _, halfGap = ctx:noteProjection({ pitch = 60 })   -- midi 60 ⇒ step 1
       -- Step 1 is symmetric: neighbours at -(period - steps[n]) and +steps[2].
-      local n        = #tuning.cents
-      local period   = tuning.period
-      local left     = tuning.cents[n] - period
-      local right    = tuning.cents[2]
-      local expected = math.min(tuning.cents[1] - left, right - tuning.cents[1]) / 2
+      local n        = #temper.cents
+      local period   = temper.period
+      local left     = temper.cents[n] - period
+      local right    = temper.cents[2]
+      local expected = math.min(temper.cents[1] - left, right - temper.cents[1]) / 2
       t.eq(halfGap, expected, 'halfGap = half min-neighbour-distance')
     end,
   },
@@ -418,16 +418,21 @@ return {
   },
 
   {
-    name = 'cfg tuning change triggers a rebuild whose ctx exposes the new tuning',
+    name = 'temper slot resolves only against the project lib (presets are seed-only)',
+    -- Mirrors the swing slot model: setting `cfg.temper` to a preset name
+    -- without seeding it into `cfg.tempers` must not activate.
     run = function(harness)
       local h = harness.mk()
-      t.eq(h.vm:activeTuning(), nil, 'no tuning initially')
+      t.eq(h.vm:activeTemper(), nil, 'no temper initially')
 
-      h.cm:set('track', 'tuning', '19EDO')
+      h.cm:set('track', 'temper', '19EDO')
+      t.eq(h.vm:activeTemper(), nil,
+        'slot name alone does not resolve — project lib is empty')
 
-      local tuning = h.vm:activeTuning()
-      t.truthy(tuning,         '19EDO active after config set')
-      t.eq(tuning.name, '19EDO')
+      h.vm:setTemper('19EDO', tuning.presets['19EDO'])
+      local temper = h.vm:activeTemper()
+      t.truthy(temper,           '19EDO active after seeding the project lib')
+      t.eq(temper.name, '19EDO')
     end,
   },
 }

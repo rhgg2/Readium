@@ -254,12 +254,12 @@ function M.unapplyFactors(factors, ppq)
   return ppq
 end
 
------ Straight grid
+----- Logical grid
 
--- ppq width of one straight-grid row at the given (rpb, denom). Pure;
+-- ppq width of one logical row at the given (rpb, denom). Pure;
 -- callers pass `resolution` (PPQ per QN). May be fractional under odd
 -- (rpb, denom) combinations.
-function M.straightPPQPerRow(rpb, denom, resolution)
+function M.logPerRow(rpb, denom, resolution)
   return resolution * 4 / (denom * rpb)
 end
 

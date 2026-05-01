@@ -38,6 +38,7 @@ function newMidiManager(take)
   local eventsByUuid      = {}
   local maxUUID    = 0
   local lock       = false
+  local pendingSysexDeletes  -- list of uuids; non-nil only inside a modify()
 
   local INTERNALS = { idx = true, uuidIdx = true }
 
@@ -525,14 +526,14 @@ function newMidiManager(take)
         local cs = ccBuckets[k] or {}
         for _, s in ipairs(scs) do
           if #cs == 0 then
-            util.add(reconcileEvents, util.pick(s, 'uuid chan msgType cc pitch', { kind = 'orphaned', lastPpq = s.ppq }))
+            util.add(reconcileEvents, util.pick(s, 'uuid chan msgType cc pitch', { kind = 'orphaned', lastppq = s.ppq }))
           elseif #cs == 1 then
             bind(s, cs[1], 'guessedRebound')
             table.remove(cs, 1)
           else
             local ppqs = {}
             for _, c in ipairs(cs) do util.add(ppqs, c.ppq) end
-            util.add(reconcileEvents, { kind = 'ambiguous', uuid = s.uuid, candidatePpqs = ppqs })
+            util.add(reconcileEvents, { kind = 'ambiguous', uuid = s.uuid, candidateppqs = ppqs })
           end
         end
       end
@@ -642,12 +643,38 @@ function newMidiManager(take)
     return true
   end
 
+  -- Resolve pending sidecar deletes by walking REAPER's live sysex array
+  -- and matching uuids. Avoids the stale-uuidIdx trap when multiple deletes
+  -- (or a note delete's cascaded notation event) shift sysex idxs during
+  -- fn. Sort idxs desc so deleting one doesn't invalidate the next.
+  local function flushPendingSysexDeletes()
+    if not pendingSysexDeletes or #pendingSysexDeletes == 0 then return end
+    local toDelete = {}
+    for _, uuid in ipairs(pendingSysexDeletes) do toDelete[uuid] = true end
+    local _, _, _, sysexCount = reaper.MIDI_CountEvts(take)
+    local idxs = {}
+    for i = 0, sysexCount - 1 do
+      local ok, _, _, _, eventtype, msg = reaper.MIDI_GetTextSysexEvt(take, i)
+      if ok then
+        local sc
+        if     eventtype == 15 then sc = noteSidecarDecode(msg)
+        elseif eventtype == -1 then sc = ccSidecarDecode(msg) end
+        if sc and sc.uuid and toDelete[sc.uuid] then util.add(idxs, i) end
+      end
+    end
+    table.sort(idxs, function(a, b) return a > b end)
+    for _, idx in ipairs(idxs) do reaper.MIDI_DeleteTextSysexEvt(take, idx) end
+  end
+
   function mm:modify(fn)
     if not take then return end
 
     lock = true
+    pendingSysexDeletes = {}
     reaper.MIDI_DisableSort(take)
     local ok, err = pcall(fn)
+    flushPendingSysexDeletes()
+    pendingSysexDeletes = nil
     reaper.MIDI_Sort(take)
     self:reload()
     lock = false
@@ -771,7 +798,10 @@ function newMidiManager(take)
 
     reaper.MIDI_DeleteCC(take, msg.idx)
     if msg.uuid then
-      reaper.MIDI_DeleteTextSysexEvt(take, msg.uuidIdx)
+      -- Defer the sidecar delete: stored uuidIdx may shift if other deletes
+      -- (or note-cascade'd notation events) happen later in this modify.
+      -- modify() resolves uuids → live sysex idxs at end of fn.
+      util.add(pendingSysexDeletes, msg.uuid)
       eventsByUuid[msg.uuid] = nil
       -- saveMetadata at end-of-modify purges the rdm_<uuid> ext-data slot
     end
@@ -950,7 +980,7 @@ function newMidiManager(take)
     local startTime = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
     local itemLength = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
     local endTime = startTime + itemLength
-    local basePPQ = reaper.MIDI_GetPPQPosFromProjTime(take, startTime)
+    local baseppq = reaper.MIDI_GetPPQPosFromProjTime(take, startTime)
 
     local result = {}
     local count = reaper.CountTempoTimeSigMarkers(0)
@@ -975,7 +1005,7 @@ function newMidiManager(take)
     for i = 0, count - 1 do
       local _, pos, _, _, _, num, denom, _ = reaper.GetTempoTimeSigMarker(0, i)
       if num > 0 and pos > startTime and pos < endTime then
-        local ppq = reaper.MIDI_GetPPQPosFromProjTime(take, pos) - basePPQ
+        local ppq = reaper.MIDI_GetPPQPosFromProjTime(take, pos) - baseppq
         util.add(result, { ppq = ppq, num = num, denom = denom })
       end
     end

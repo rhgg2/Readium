@@ -3,7 +3,7 @@
 loadModule('util')
 loadModule('midiManager')
 loadModule('trackerManager')
-loadModule('microtuning')
+loadModule('tuning')
 loadModule('commandManager')
 loadModule('editCursor')
 
@@ -19,22 +19,22 @@ function newViewContext(args)
   local rowPerBeat = args.rowPerBeat
   local ppqPerRow  = args.ppqPerRow
   local timeSigs   = args.timeSigs
-  local tuning     = args.tuning
+  local temper     = args.temper
   local ctx        = {}
 
-  ----- Tuning
+  ----- Temperament
 
-  function ctx:activeTuning() return tuning end
+  function ctx:activeTemper() return temper end
 
   function ctx:noteProjection(evt)
-    if not (tuning and evt and evt.pitch) then return end
+    if not (temper and evt and evt.pitch) then return end
     local detune    = evt.detune or 0
-    local step, oct = microtuning.midiToStep(tuning, evt.pitch, detune)
-    local label     = microtuning.stepToText(tuning, step, oct)
-    local tm_, td_  = microtuning.stepToMidi(tuning, step, oct)
+    local step, oct = tuning.midiToStep(temper, evt.pitch, detune)
+    local label     = tuning.stepToText(temper, step, oct)
+    local tm_, td_  = tuning.stepToMidi(temper, step, oct)
     local gap       = (evt.pitch * 100 + detune) - (tm_ * 100 + td_)
 
-    local steps, n, period = tuning.cents, #tuning.cents, tuning.period
+    local steps, n, period = temper.cents, #temper.cents, temper.period
     local left    = step == 1 and steps[n] - period or steps[step - 1]
     local right   = step == n and steps[1] + period or steps[step + 1]
     local halfGap = math.min(steps[step] - left, right - steps[step]) / 2
@@ -44,18 +44,18 @@ function newViewContext(args)
 
   ----- Timing
 
-  function ctx:ppqToRow(ppq, chan)
-    ppq = swing.unapply(chan, ppq)
-    if ppq <= 0 then return 0 end
-    if ppq >= length then return numRows end
+  function ctx:ppqToRow(ppqI, chan)
+    local ppqL = swing.toLogical(chan, ppqI)
+    if ppqL <= 0 then return 0 end
+    if ppqL >= length then return numRows end
     local lo, hi = 0, numRows - 1
     while lo < hi do
       local mid = (lo + hi + 1) // 2
-      if rowPPQs[mid] <= ppq then lo = mid else hi = mid - 1 end
+      if rowPPQs[mid] <= ppqL then lo = mid else hi = mid - 1 end
     end
     local rowStart = rowPPQs[lo]
     local rowEnd   = rowPPQs[lo + 1] or length
-    return lo + (rowEnd > rowStart and (ppq - rowStart) / (rowEnd - rowStart) or 0)
+    return lo + (rowEnd > rowStart and (ppqL - rowStart) / (rowEnd - rowStart) or 0)
   end
 
   function ctx:rowToPPQ(row, chan)
@@ -65,12 +65,14 @@ function newViewContext(args)
     local frac     = row - r
     local rowStart = rowPPQs[r]
     local rowEnd   = rowPPQs[r + 1] or length
-    return math.floor(swing.apply(chan, rowStart + frac * (rowEnd - rowStart)) + 0.5)
+    local ppqL     = rowStart + frac * (rowEnd - rowStart)
+    local ppqI     = swing.fromLogical(chan, ppqL)
+    return math.floor(ppqI + 0.5)
   end
 
-  function ctx:snapRow(ppq, chan) return util.round(self:ppqToRow(ppq, chan)) end
+  function ctx:snapRow(ppqI, chan) return util.round(self:ppqToRow(ppqI, chan)) end
 
-  -- Straight-grid ppq width of one row in this rebuild's frame.
+  -- Logical ppq width of one row in this rebuild's frame.
   function ctx:ppqPerRow() return ppqPerRow end
 
   do -- exports ctx:rowBeatInfo, ctx:barBeatSub
@@ -145,33 +147,60 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Note geometry (used by editing, adjust*, nudge, quantizeKeepRealised)
 
-  -- Realised onset/offset bounds for a note's neighbours under the
-  -- "delay shifts only the note-on" model: prev.endppq is intent (=
-  -- realised end), next.ppq + next-delay is realised onset.
+  -- Tightest prev.endppq and next.ppq across cols.events matching pred.
+  local function neighbourBounds(cols, ppq, pred)
+    local prevEnd, nextStart
+    for _, c in ipairs(cols) do
+      local p = util.seek(c.events, 'before', ppq, pred)
+      local n = util.seek(c.events, 'after',  ppq, pred)
+      if p and (not prevEnd   or p.endppq > prevEnd  ) then prevEnd   = p.endppq end
+      if n and (not nextStart or n.ppq    < nextStart) then nextStart = n.ppq    end
+    end
+    return prevEnd, nextStart
+  end
+
+  -- Bounds on placing/extending a note. Different-pitch neighbours
+  -- bind col-locally in intent space, with `overlapOffset` leniency —
+  -- column allocation judges intent-space overlap with the same
+  -- threshold. Same-pitch neighbours bind channel-wide with no
+  -- leniency: MIDI permits only one voice per (chan, pitch).
   local function overlapBounds(col, ppq, excludeEvt, allowOverlap)
-    local off  = allowOverlap and cm:get('overlapOffset') * resolution or 0
-    local pred = excludeEvt
-      and function(e) return util.isNote(e) and e ~= excludeEvt end
-      or util.isNote
-    local prev = util.seek(col.events, 'before', ppq, pred)
-    local next = util.seek(col.events, 'after',  ppq, pred)
-    local minStart = prev and (prev.endppq - off) or 0
-    local maxEnd   = next and (next.ppq + timing.delayToPPQ(next.delay, resolution) + off) or length
+    local lenient = allowOverlap and cm:get('overlapOffset') * resolution or 0
+    local pitch   = excludeEvt and excludeEvt.pitch
+    local diff = function(e) return util.isNote(e) and e ~= excludeEvt and e.pitch ~= pitch end
+    local same = function(e) return util.isNote(e) and e ~= excludeEvt and e.pitch == pitch end
+
+    local prevD, nextD = neighbourBounds({col}, ppq, diff)
+    local prevS, nextS = neighbourBounds(tm:getChannel(col.midiChan).columns.notes, ppq, same)
+
+    local minStart = math.max(prevD and (prevD - lenient) or 0,      prevS or 0)
+    local maxEnd   = math.min(nextD and (nextD + lenient) or length, nextS or length)
     return minStart, maxEnd
   end
 
-  -- Bounds on a note's `delay` field. Realised onset must stay between
-  -- prev's end and next's onset (no item-edge cap — delay is a tiny
-  -- nudge, not a position move) and the realised duration must remain
-  -- ≥ 1 ppq so the note doesn't collapse.
+  -- Bounds on a note's `delay` field. Two constraints, both natural
+  -- to "performance delay":
+  --   * same-pitch (channel-wide): MIDI permits one voice per
+  --     (chan, pitch), so a same-pitch prev binds at its intent end.
+  --   * same-column (any pitch): a delay that reorders onsets within
+  --     its own column isn't a performance delay any more — bound at
+  --     the prev/next column-neighbour's realised onset. This keeps
+  --     "realised order = intent order" within every column, which
+  --     the pb model leans on (detune is keyed by note onset).
+  -- Floor at 0 (no negative ppq); ceiling at n.endppq − 1 so realised
+  -- duration stays ≥ 1 ppq.
   local function delayRange(col, n)
-    local off  = cm:get('overlapOffset') * resolution
-    local pred = function(e) return util.isNote(e) and e ~= n end
-    local prev = util.seek(col.events, 'before', n.ppq, pred)
-    local next = util.seek(col.events, 'after',  n.ppq, pred)
-    local minStart = prev and (prev.endppq - off) or 0
-    local maxStart = next and (next.ppq + timing.delayToPPQ(next.delay, resolution) + off) or math.huge
-    maxStart = math.min(maxStart, n.endppq - 1)
+    local sameP = function(e) return util.isNote(e) and e ~= n and e.pitch == n.pitch end
+    local prevSameEnd = neighbourBounds(tm:getChannel(col.midiChan).columns.notes, n.ppq, sameP)
+
+    local prev  = util.seek(col.events, 'before', n.ppq, util.isNote)
+    local nextE = util.seek(col.events, 'after',  n.ppq, util.isNote)
+    local realised = function(e) return e.ppq + timing.delayToPPQ(e.delay or 0, resolution) end
+
+    local minStart = math.max(prevSameEnd or 0,
+                              prev and (realised(prev) + 1) or 0)
+    local maxStart = math.min(n.endppq - 1,
+                              nextE and (realised(nextE) - 1) or math.huge)
     return timing.ppqToDelay(minStart - n.ppq, resolution),
            timing.ppqToDelay(maxStart - n.ppq, resolution)
   end
@@ -188,11 +217,11 @@ function newViewManager(tm, cm, cmgr)
       local col = grid.cols[ci]
       if not col then goto nextCol end
 
-      local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+      local startppq, endppq = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
       local locs = {}
       -- Keyed by event reference, not loc: notes and CCs use disjoint loc
       -- spaces, so a PA (cc loc=N) and a note (note loc=N) can collide.
-      for evt in util.between(col.events, startPPQ, endPPQ) do
+      for evt in util.between(col.events, startppq, endppq) do
         locs[evt] = evt
       end
 
@@ -205,17 +234,17 @@ function newViewManager(tm, cm, cmgr)
 
   ----- Frames & timing
 
-  -- Straight-grid ppq width of one row at the given rpb. Take-wide
+  -- Logical ppq width of one row at the given rpb. Take-wide
   -- denom comes off timeSigs[1]; resolution is constant per take.
-  local function straightPPQPerRowFor(rpb)
+  local function logPerRowFor(rpb)
     local denom = (timeSigs[1] and timeSigs[1].denom) or 4
-    return timing.straightPPQPerRow(rpb, denom, resolution)
+    return timing.logPerRow(rpb, denom, resolution)
   end
 
-  -- Read straight ppq off an event, falling back to ppq for events
+  -- Read logical ppq off an event, falling back to ppq for events
   -- with no authored frame (legacy / raw-imported MIDI).
-  local function straightOf(e)    return e.straightPPQ    or e.ppq    end
-  local function straightEndOf(e) return e.straightEndPPQ or e.endppq end
+  local function logicalOf(e)    return e.ppqL    or e.ppq    end
+  local function endLogicalOf(e) return e.endppqL or e.endppq end
 
   -- An authoring frame comprises swing slot, per-column swing map,
   -- and rowPerBeat.
@@ -259,26 +288,53 @@ function newViewManager(tm, cm, cmgr)
   end
 
   -- Frame + its row scale for the current channel.
-  local function frameAndSppr(chan)
+  local function frameAndLogPerRow(chan)
     local f = currentFrame(chan)
-    return f, straightPPQPerRowFor(f.rpb)
+    return f, logPerRowFor(f.rpb)
   end
 
-  -- Row-aligned authoring stamp. Returns `at(rowS, rowE?)` which
-  -- produces the canonical (ppq, [endppq,] straightPPQ,
-  -- [straightEndPPQ,] frame) payload. Pass rowE for span events (notes).
-  local function stamping(chan)
-    local f, sppr = frameAndSppr(chan)
-    return function(rowS, rowE)
-      local s = { ppq         = ctx:rowToPPQ(rowS, chan),
-                  straightPPQ = rowS * sppr,
-                  frame       = f }
-      if rowE then
-        s.endppq         = ctx:rowToPPQ(rowE, chan)
-        s.straightEndPPQ = rowE * sppr
-      end
-      return s
+  -- Row-aligned authoring stamp + assign. Writes the canonical
+  -- (ppq, [endppq,] ppqL, [endppqL,] frame) payload to `evt`. Pass
+  -- rowE for span events (notes).
+  local function assignStamp(type, evt, chan, rowS, rowE)
+    local f, logPerRow = frameAndLogPerRow(chan)
+    local s = { ppq   = ctx:rowToPPQ(rowS, chan),
+                ppqL  = rowS * logPerRow,
+                frame = f }
+    if rowE then
+      s.endppq, s.endppqL = ctx:rowToPPQ(rowE, chan), rowE * logPerRow
     end
+    tm:assignEvent(type, evt, s)
+  end
+
+  -- Frame to stamp on a PA being attached to a host note. Inherits
+  -- host's swing slot + colSwing (so a later reswing of the host
+  -- carries the PA along — without that link, PAs would orphan), but
+  -- takes rpb from the current take frame so the PA's ppqL — written
+  -- as cursor's logical row × current logPerRow — is coherent with
+  -- the rpb its frame names.
+  local function paFrame(hostFrame, chan)
+    return { swing    = hostFrame.swing,
+             colSwing = hostFrame.colSwing,
+             rpb      = currentFrame(chan).rpb }
+  end
+
+  -- Coherent tail-only assign. Use whenever a note's tail moves:
+  -- writing endppqL alone leaves it incoherent with `frame`. Rebases
+  -- `frame` to current alongside the new (endppq, endppqL). The
+  -- head's ppqL stays in absolute logical-ppq units — still correct
+  -- as time; may read off-grid in the new frame's row map only when
+  -- the user coarsens rpb, which is a real semantic, not a bug.
+  --
+  -- Pass `endppqL` when known (row-aligned, or partner already in
+  -- current frame); omit otherwise — derived via current row map.
+  local function assignTail(evt, chan, endppq, endppqL)
+    local f, logPerRow = frameAndLogPerRow(chan)
+    tm:assignEvent('note', evt, {
+      endppq  = endppq,
+      endppqL = endppqL or ctx:ppqToRow(endppq, chan) * logPerRow,
+      frame   = f,
+    })
   end
 
   -- Set grid to the cursor's frame, or release if already overriding.
@@ -313,9 +369,30 @@ function newViewManager(tm, cm, cmgr)
     cm:set('track', 'rowPerBeat', n)
   end
 
-  function vm:setSwingSlot(name)
-    if name and name ~= '' then cm:set('take', 'swing', name)
-    else cm:remove('take', 'swing') end
+  -- Slot selections (temper, swing) are views over the data, not data
+  -- themselves. Mirroring at project+track means a fresh take inherits
+  -- the most recent selection, while takes on an existing track inherit
+  -- from their siblings via the track-level value.
+  local function writeShared(key, value)
+    if value == nil or value == '' then
+      cm:remove('project', key)
+      cm:remove('track',   key)
+    else
+      cm:set('project', key, value)
+      cm:set('track',   key, value)
+    end
+  end
+
+  function vm:setSwingSlot(name)  writeShared('swing',  name) end
+  function vm:setTemperSlot(name) writeShared('temper', name) end
+
+  -- colSwing is a per-channel map; cross-track bleed via project would
+  -- mean track A's per-channel pattern surfaces on a fresh track B until
+  -- B overrides every entry. Keep it track-scoped.
+  function vm:setColSwingSlot(chan, name)
+    local map = cm:get('colSwing')
+    map[chan] = (name ~= '' and name) or nil
+    cm:set('track', 'colSwing', map)
   end
 
   function vm:setSwingComposite(name, composite)
@@ -325,32 +402,11 @@ function newViewManager(tm, cm, cmgr)
     cm:set('project', 'swings', lib)
   end
 
-  local function cycleSwing()
-    local stops = { 'off', 'classic-55', 'classic-58', 'classic-62', 'classic-67' }
-    local cur = cm:get('swing') or 'off'
-    local i = 1
-    for k, v in ipairs(stops) do if v == cur then i = k; break end end
-    local next = stops[(i % #stops) + 1]
-    if next == 'off' then
-      cm:remove('take', 'swing')
-    else
-      -- Seed into project lib on first use so the slot name resolves.
-      local lib = cm:get('swings')
-      if not lib[next] then
-        local proj = cm:getAt('project', 'swings') or {}
-        proj[next] = timing.presets[next]
-        cm:set('project', 'swings', proj)
-      end
-      cm:set('take', 'swing', next)
-    end
-    util.print('swing: ' .. next)
-  end
-
-  local function cycleTuning()
-    local names = { '12EDO', '19EDO', '31EDO', '53EDO' }
-    local cur, i = cm:get('tuning'), 0
-    for k, v in ipairs(names) do if v == cur then i = k; break end end
-    cm:set('track', 'tuning', names[(i + 1) % (#names + 1)])
+  function vm:setTemper(name, temper)
+    if not name or name == '' then return end
+    local lib = cm:getAt('project', 'tempers') or {}
+    lib[name] = temper
+    cm:set('project', 'tempers', lib)
   end
 
   ----- Mute / solo
@@ -465,32 +521,29 @@ function newViewManager(tm, cm, cmgr)
       hexDigit[string.byte('A') + i] = 10 + i
     end
 
-    -- Caller has already pinned (ppq, straightPPQ, frame) onto `update`.
+    -- Caller has already pinned (ppq, ppqL, frame) onto `update`.
     -- Endppq stretches to the next note start (or take length); the
-    -- straight end derives from that intent ppq via the row map under
+    -- logical end derives from that intent ppq via the row map under
     -- the new note's own frame.
     local function placeNewNote(col, update)
       local last = util.seek(col.events, 'before', update.ppq, util.isNote)
       local next = util.seek(col.events, 'after',  update.ppq, util.isNote)
       if last and last.endppq >= update.ppq then
-        tm:assignEvent('note', last, {
-          endppq         = update.ppq,
-          straightEndPPQ = update.straightPPQ,
-        })
+        assignTail(last, col.midiChan, update.ppq, update.ppqL)
       end
       update.vel             = last and last.vel or cm:get('defaultVelocity')
       update.endppq          = next and next.ppq or length
-      update.straightEndPPQ  = ctx:ppqToRow(update.endppq, update.chan)
-                               * straightPPQPerRowFor(update.frame.rpb)
+      update.endppqL  = ctx:ppqToRow(update.endppq, update.chan)
+                               * logPerRowFor(update.frame.rpb)
       update.lane            = col.lane
       tm:addEvent('note', update)
     end
 
-    local function notePAEvents(col, pitch, startPPQ, endPPQ)
+    local function notePAEvents(col, pitch, startppq, endppq)
       local pas = {}
       for _, evt in ipairs(col.events) do
         if evt.type == 'pa' and evt.pitch == pitch
-          and evt.ppq >= startPPQ and evt.ppq <= endPPQ then
+          and evt.ppq >= startppq and evt.ppq <= endppq then
           util.add(pas, evt)
         end
       end
@@ -501,9 +554,9 @@ function newViewManager(tm, cm, cmgr)
       if not col then return end
       local type      = col.type
       local frameNow  = currentFrame(col.midiChan)
-      local spprNow   = straightPPQPerRowFor(frameNow.rpb)
-      local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
-      local cursorSPPQ = ec:row() * spprNow
+      local logPerRowNow   = logPerRowFor(frameNow.rpb)
+      local cursorppq = ctx:rowToPPQ(ec:row(), col.midiChan)
+      local cursorppqL = ec:row() * logPerRowNow
 
       local function commit(auditionPitch, auditionVel)
         tm:flush()
@@ -513,17 +566,17 @@ function newViewManager(tm, cm, cmgr)
       end
 
       -- Off-grid write snaps intent to the cursor row, restamps the
-      -- frame, and preserves straight duration. Endppq derives from
-      -- the new straight end via the row map so the realised tail
+      -- frame, and preserves logical duration. Endppq derives from
+      -- the new logical end via the row map so the realised tail
       -- lines up with the displayed one.
       local function snap(update)
-        if not evt or evt.ppq == cursorPPQ then return update end
-        update.ppq         = cursorPPQ
-        update.straightPPQ = cursorSPPQ
+        if not evt or evt.ppq == cursorppq then return update end
+        update.ppq         = cursorppq
+        update.ppqL = cursorppqL
         update.frame       = frameNow
         if evt.endppq then
-          update.straightEndPPQ = cursorSPPQ + (straightEndOf(evt) - straightOf(evt))
-          update.endppq         = ctx:rowToPPQ(update.straightEndPPQ / spprNow, col.midiChan)
+          update.endppqL = cursorppqL + (endLogicalOf(evt) - logicalOf(evt))
+          update.endppq         = ctx:rowToPPQ(update.endppqL / logPerRowNow, col.midiChan)
         end
         return update
       end
@@ -534,8 +587,8 @@ function newViewManager(tm, cm, cmgr)
           local nk = cmgr:noteChars(char); if not nk then return end
           local pitch = util.clamp((cm:get('currentOctave') + 1 + nk[2]) * 12 + nk[1], 0, 127)
           local detune = 0
-          local tuning = ctx:activeTuning()
-          if tuning then pitch, detune = microtuning.snap(tuning, pitch, 0) end
+          local temper = ctx:activeTemper()
+          if temper then pitch, detune = tuning.snap(temper, pitch, 0) end
 
           -- Existing note → repitch, snapping intent time to the cursor row.
           -- tm clears same-(chan, pitch) overlaps at the write boundary.
@@ -558,7 +611,7 @@ function newViewManager(tm, cm, cmgr)
 
           local new = {
             pitch = pitch, detune = detune,
-            ppq = cursorPPQ, straightPPQ = cursorSPPQ,
+            ppq = cursorppq, ppqL = cursorppqL,
             chan = col.midiChan, frame = frameNow,
           }
           placeNewNote(col, new)
@@ -617,18 +670,13 @@ function newViewManager(tm, cm, cmgr)
           end
 
           if cm:get('polyAftertouch') then
-            local note = util.seek(col.events, 'before', cursorPPQ, util.isNote)
-            if note and note.endppq > cursorPPQ then
-              local val = newVel(0)
-              -- PA inherits host's frame so reswing moves PA with host.
-              -- Straight ppq is the cursor's straight position in current
-              -- frame; under the common case host.frame.rpb == frameNow.rpb
-              -- this is exact, otherwise it's a benign approximation.
+            local note = util.seek(col.events, 'before', cursorppq, util.isNote)
+            if note and note.endppq > cursorppq then
               tm:addEvent('pa', {
-                ppq = cursorPPQ, straightPPQ = cursorSPPQ,
+                ppq = cursorppq, ppqL = cursorppqL,
                 chan = col.midiChan,
-                pitch = note.pitch, val = val,
-                frame = note.frame,
+                pitch = note.pitch, val = newVel(0),
+                frame = paFrame(note.frame, col.midiChan),
               })
               return commit()
             end
@@ -662,7 +710,7 @@ function newViewManager(tm, cm, cmgr)
       else
         if type == 'cc' then util.assign(update, { cc = col.cc }) end
         util.assign(update, {
-          ppq = cursorPPQ, straightPPQ = cursorSPPQ,
+          ppq = cursorppq, ppqL = cursorppqL,
           chan = col.midiChan, frame = frameNow,
         })
         tm:addEvent(type, update)
@@ -686,23 +734,23 @@ function newViewManager(tm, cm, cmgr)
 
     local chan       = col.midiChan
     local prev, next = col.events[i-1], col.events[i+1]
-    local newPPQ     = ctx:rowToPPQ(toRow, chan)
+    local newppq     = ctx:rowToPPQ(toRow, chan)
     local newRow     = toRow
-    if prev and newPPQ <= prev.ppq then
-      newPPQ = prev.ppq + 1
-      newRow = ctx:ppqToRow(newPPQ, chan)
+    if prev and newppq <= prev.ppq then
+      newppq = prev.ppq + 1
+      newRow = ctx:ppqToRow(newppq, chan)
     end
-    if next and newPPQ >= next.ppq then
-      newPPQ = next.ppq - 1
-      newRow = ctx:ppqToRow(newPPQ, chan)
+    if next and newppq >= next.ppq then
+      newppq = next.ppq - 1
+      newRow = ctx:ppqToRow(newppq, chan)
     end
-    if prev and newPPQ <= prev.ppq then return end  -- gap < 2 ppq, nowhere to go
+    if prev and newppq <= prev.ppq then return end  -- gap < 2 ppq, nowhere to go
 
-    local f, sppr = frameAndSppr(chan)
+    local f, logPerRow = frameAndLogPerRow(chan)
     tm:assignEvent(col.type, evt, {
       val         = toVal,
-      ppq         = newPPQ,
-      straightPPQ = newRow * sppr,
+      ppq         = newppq,
+      ppqL = newRow * logPerRow,
       frame       = f,
     })
     tm:flush()
@@ -731,9 +779,9 @@ function newViewManager(tm, cm, cmgr)
         local r1, r2 = ec:region()
         for col in ec:eachSelectedCol() do
           if interpolable[col.type] then
-            local startPPQ, endPPQ = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+            local startppq, endppq = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
             local prev
-            for evt in util.between(col.events, startPPQ, endPPQ) do
+            for evt in util.between(col.events, startppq, endppq) do
               if prev then cycleShape(col, prev) end
               prev = evt
             end
@@ -782,31 +830,21 @@ function newViewManager(tm, cm, cmgr)
     local function cursorNoteBefore()
       local col = grid.cols[ec:col()]
       if not (col and col.type == 'note') then return end
-      local cursorPPQ = ctx:rowToPPQ(ec:row(), col.midiChan)
-      return col, util.seek(col.events, 'at-or-before', cursorPPQ, util.isNote)
+      local cursorppq = ctx:rowToPPQ(ec:row(), col.midiChan)
+      return col, util.seek(col.events, 'at-or-before', cursorppq, util.isNote)
     end
 
-    local function applyNoteOff(col, last, targetPPQ, undo)
-      local sppr = ctx:ppqPerRow()
-      local function endStraight(ppq)
-        return ctx:ppqToRow(ppq, col.midiChan) * sppr
-      end
+    local function applyNoteOff(col, last, targetppq, undo)
       if undo then
-        local next = util.seek(col.events, 'at-or-after', targetPPQ, util.isNote)
+        local next = util.seek(col.events, 'at-or-after', targetppq, util.isNote)
         local newEnd = next and next.ppq or length
-        tm:assignEvent('note', last, {
-          endppq         = newEnd,
-          straightEndPPQ = next and next.straightPPQ or endStraight(newEnd),
-        })
-      elseif last.ppq >= targetPPQ then
+        assignTail(last, col.midiChan, newEnd, next and next.ppqL)
+      elseif last.ppq >= targetppq then
         tm:deleteEvent('note', last)
       else
         local _, maxEnd = overlapBounds(col, last.ppq, last, true)
-        local newEnd    = util.clamp(targetPPQ, last.ppq + 1, maxEnd)
-        tm:assignEvent('note', last, {
-          endppq         = newEnd,
-          straightEndPPQ = endStraight(newEnd),
-        })
+        local newEnd    = util.clamp(targetppq, last.ppq + 1, maxEnd)
+        assignTail(last, col.midiChan, newEnd)
       end
     end
 
@@ -817,20 +855,20 @@ function newViewManager(tm, cm, cmgr)
         for col in ec:eachSelectedCol() do
           if col.type == 'note' then
             local chan = col.midiChan
-            local targetPPQ = ctx:rowToPPQ(r1, chan)
+            local targetppq = ctx:rowToPPQ(r1, chan)
             local nextPPQ   = ctx:rowToPPQ(r1 + 1, chan)
             local last = util.seek(col.events, 'before', nextPPQ, util.isNote)
-            if last then util.add(hits, { col = col, note = last, targetPPQ = targetPPQ }) end
+            if last then util.add(hits, { col = col, note = last, targetppq = targetppq }) end
           end
         end
         if #hits == 0 then return end
 
         local undo = true
         for _, h in ipairs(hits) do
-          if h.note.endppq ~= h.targetPPQ then undo = false; break end
+          if h.note.endppq ~= h.targetppq then undo = false; break end
         end
 
-        for _, h in ipairs(hits) do applyNoteOff(h.col, h.note, h.targetPPQ, undo) end
+        for _, h in ipairs(hits) do applyNoteOff(h.col, h.note, h.targetppq, undo) end
         tm:flush()
         return
       end
@@ -838,26 +876,31 @@ function newViewManager(tm, cm, cmgr)
       local col = grid.cols[ec:col()]
       if not (col and col.type == 'note' and ec:cursorKind() == 'pitch') then return false end
       local r = ec:row()
-      local cursorPPQ     = ctx:rowToPPQ(r,     col.midiChan)
+      local cursorppq     = ctx:rowToPPQ(r,     col.midiChan)
       local nextCursorPPQ = ctx:rowToPPQ(r + 1, col.midiChan)
 
       local last = util.seek(col.events, 'before', nextCursorPPQ, util.isNote)
       if not last then return end
-      applyNoteOff(col, last, cursorPPQ, last.endppq == cursorPPQ)
+      applyNoteOff(col, last, cursorppq, last.endppq == cursorppq)
       tm:flush()
     end
 
+    -- Read the current end row exactly off `endppqL` (authored
+    -- row * logPerRow) so `curRow + rowDelta` stays integer; otherwise the
+    -- ppq round-trip drifts and the first press into a neighbour can
+    -- fail to reach the `nextD + lenient` overlap bound.
     local function adjustDurationCore(col, note, rowDelta)
-      local chan = col.midiChan
-      local newRow = util.clamp(ctx:ppqToRow(note.endppq, chan) + rowDelta, 0, grid.numRows)
-            newRow = math.floor(newRow / rowDelta) * rowDelta
-      local minPPQ = math.min(note.endppq, ctx:rowToPPQ(ctx:snapRow(note.ppq, chan) + 1, chan))
+      local chan      = col.midiChan
+      local logPerRow = ctx:ppqPerRow()
+      local curRow    = note.endppqL and note.endppqL / logPerRow
+                        or ctx:ppqToRow(note.endppq, chan)
+      local newRow    = util.clamp(util.round(curRow + rowDelta), 0, grid.numRows)
+      local minPPQ    = math.min(note.endppq, ctx:rowToPPQ(ctx:snapRow(note.ppq, chan) + 1, chan))
       local _, maxPPQ = overlapBounds(col, note.ppq, note, true)
-      local newPPQ = util.clamp(ctx:rowToPPQ(newRow, chan), minPPQ, maxPPQ)
-      tm:assignEvent('note', note, {
-        endppq         = newPPQ,
-        straightEndPPQ = ctx:ppqToRow(newPPQ, chan) * ctx:ppqPerRow(),
-      })
+      local rawPPQ    = ctx:rowToPPQ(newRow, chan)
+      local newppq    = util.clamp(rawPPQ, minPPQ, maxPPQ)
+      local endppqL   = newppq == rawPPQ and newRow * logPerRow or nil
+      assignTail(note, chan, newppq, endppqL)
     end
 
     function adjustDuration(rowDelta)
@@ -905,7 +948,6 @@ function newViewManager(tm, cm, cmgr)
       -- the direction that keeps shifted PBs out of unprocessed notes' ranges.
       for _, r in ipairs(runs) do
         local chan = r.col.midiChan
-        local at = stamping(chan)
         local notes = r.notes
         local s, e, step = 1, #notes, 1
         if rowDelta > 0 then s, e, step = #notes, 1, -1 end
@@ -913,7 +955,7 @@ function newViewManager(tm, cm, cmgr)
           local n = notes[i]
           local rowS = ctx:ppqToRow(n.ppq,    chan) + rowDelta
           local rowE = ctx:ppqToRow(n.endppq, chan) + rowDelta
-          tm:assignEvent('note', n, at(rowS, rowE))
+          assignStamp('note', n, chan, rowS, rowE)
         end
       end
       tm:flush()
@@ -952,7 +994,7 @@ function newViewManager(tm, cm, cmgr)
         end
       end
 
-      tm:assignEvent('note', note, stamping(chan)(newStart, newEnd))
+      assignStamp('note', note, chan, newStart, newEnd)
       tm:flush()
       if not cursorBlocked then ec:setPos(newCursorRow) end
     end
@@ -974,7 +1016,7 @@ function newViewManager(tm, cm, cmgr)
     end
 
     -- opts: { include?, target, restamp? }. Each event carries its own
-    -- .frame and .straightPPQ (stamped at authoring time); events
+    -- .frame and .ppqL (stamped at authoring time); events
     -- without a frame are skipped — there's no inferring a frame after
     -- the fact. Two passes — gather plans, then mutate — to keep frame
     -- reads stable across the batch. Writes past `length` make REAPER
@@ -982,34 +1024,88 @@ function newViewManager(tm, cm, cmgr)
     -- rebuild), so clamp on the way out.
     local function reswingCore(groups, opts)
       local plans = {}
+      local notePlansByChan = {}
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
         for _, e in pairs(g.locs) do
           if e.frame and (not opts.include or opts.include(e, chan)) then
             local tgt   = opts.target(e.frame, chan)
             local entry = { col = col, e = e,
-              newPPQ = math.min(length, util.round(tgt.apply(chan, e.straightPPQ))) }
+              newppq = math.min(length, util.round(tgt.fromLogical(chan, e.ppqL))) }
             if util.isNote(e) then
-              entry.newEndPPQ = math.min(length, util.round(tgt.apply(chan, e.straightEndPPQ)))
+              entry.newEndppq = math.min(length, util.round(tgt.fromLogical(chan, e.endppqL)))
+              notePlansByChan[chan] = notePlansByChan[chan] or {}
+              util.add(notePlansByChan[chan], entry)
             end
-            if opts.restamp then entry.newFrame = opts.restamp(chan) end
+            if opts.restamp then
+              entry.newFrame = opts.restamp(chan)
+              -- Frame change must drag ppqL/endppqL into the new rpb's
+              -- units (same authoring row, new logPerRow). No-op when rpbs
+              -- match — the common case.
+              local ratio = logPerRowFor(entry.newFrame.rpb) / logPerRowFor(e.frame.rpb)
+              if ratio ~= 1 then
+                entry.newPpqL = e.ppqL * ratio
+                if util.isNote(e) then entry.newEndppqL = e.endppqL * ratio end
+              end
+            end
             util.add(plans, entry)
           end
         end
       end
-      -- Monotone reparameterisation: the end-state can't introduce new
-      -- same-(chan, pitch) overlaps, so opt out of tm's per-write clamp.
-      -- Without this, the first-processed of two legato siblings would
-      -- see its endppq clipped against the second's still-old ppq.
+
+      -- Pass 1.5: clamp delays so realised order = intent order under
+      -- the post-reswing geometry. delayRange enforces this on direct
+      -- edits; reswing changes intent ppqs without touching delay, so
+      -- a delay that fit the old gap can spill into the new one. Walk
+      -- each channel's note plans in new intent order, tracking the
+      -- last realised onset per column (same-col bound) and last
+      -- intent end per pitch (same-pitch bound) — same two bounds
+      -- delayRange uses, sourced from post-reswing positions.
+      local clamped = 0
+      for _, list in pairs(notePlansByChan) do
+        table.sort(list, function(a, b) return a.newppq < b.newppq end)
+        local lastInCol, lastInPitch = {}, {}
+        for _, p in ipairs(list) do
+          local e = p.e
+          local realised = p.newppq + timing.delayToPPQ(e.delay or 0, resolution)
+          local floor    = 0
+          local prevCol  = lastInCol[p.col]
+          if prevCol   then floor = math.max(floor, prevCol.realised + 1) end
+          local prevPit  = lastInPitch[e.pitch]
+          if prevPit   then floor = math.max(floor, prevPit.newEndppq)   end
+          if realised < floor then
+            p.newDelay = math.ceil(timing.ppqToDelay(floor - p.newppq, resolution))
+            realised   = p.newppq + timing.delayToPPQ(p.newDelay, resolution)
+            clamped    = clamped + 1
+          end
+          lastInCol[p.col]     = { realised = realised, newEndppq = p.newEndppq }
+          lastInPitch[e.pitch] = { realised = realised, newEndppq = p.newEndppq }
+        end
+      end
+
+      -- Monotone reparameterisation + the clamp above: the end-state
+      -- can't introduce new same-(chan, pitch) overlaps, so opt out of
+      -- tm's per-write clamp. Without this, the first-processed of
+      -- two legato siblings would see its endppq clipped against the
+      -- second's still-old ppq.
       local trust = { trustGeometry = true }
       for _, p in ipairs(plans) do
         local e, u = p.e, {}
-        if p.newPPQ    ~= e.ppq    then u.ppq    = p.newPPQ    end
-        if p.newEndPPQ ~= e.endppq and util.isNote(e) then u.endppq = p.newEndPPQ end
-        if p.newFrame  ~= nil      then u.frame  = p.newFrame  end
+        if p.newppq      ~= e.ppq    then u.ppq    = p.newppq    end
+        if p.newEndppq   ~= e.endppq and util.isNote(e) then u.endppq = p.newEndppq end
+        if p.newDelay    ~= nil      then u.delay    = p.newDelay  end
+        if p.newFrame    ~= nil      then u.frame    = p.newFrame  end
+        if p.newPpqL     ~= nil      then u.ppqL     = p.newPpqL     end
+        if p.newEndppqL  ~= nil      then u.endppqL  = p.newEndppqL  end
         if next(u) then tm:assignEvent(util.isNote(e) and 'note' or p.col.type, e, u, trust) end
       end
       tm:flush()
+
+      if clamped > 0 then
+        reaper.ShowMessageBox(
+          clamped .. ' note(s) reswung — delay clamped at realised-order bound.',
+          'reswing', 0)
+      end
     end
 
     local function reswingScope(groups)
@@ -1043,19 +1139,18 @@ function newViewManager(tm, cm, cmgr)
     local function quantizeScope(groups)
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
-        local at        = stamping(chan)
         for _, e in pairs(g.locs) do
           local sRow   = ctx:ppqToRow(e.ppq, chan)
           local newRow = util.round(sRow)
-          local newPPQ = ctx:rowToPPQ(newRow, chan)
+          local newppq = ctx:rowToPPQ(newRow, chan)
           if util.isNote(e) then
             local newEndRow = newRow + util.round(ctx:ppqToRow(e.endppq, chan) - sRow)
-            local newEndPPQ = ctx:rowToPPQ(newEndRow, chan)
-            if newPPQ ~= e.ppq or newEndPPQ ~= e.endppq then
-              tm:assignEvent('note', e, at(newRow, newEndRow))
+            local newEndppq = ctx:rowToPPQ(newEndRow, chan)
+            if newppq ~= e.ppq or newEndppq ~= e.endppq then
+              assignStamp('note', e, chan, newRow, newEndRow)
             end
-          elseif newPPQ ~= e.ppq then
-            tm:assignEvent(col.type, e, at(newRow))
+          elseif newppq ~= e.ppq then
+            assignStamp(col.type, e, chan, newRow)
           end
         end
       end
@@ -1071,27 +1166,33 @@ function newViewManager(tm, cm, cmgr)
       local clamped = 0
       for _, g in ipairs(groups) do
         local col, chan = g.col, g.col.midiChan
-        local at        = stamping(chan)
         for _, e in pairs(g.locs) do
           if util.isNote(e) then
             local newRow    = ctx:snapRow(e.ppq, chan)
-            local targetPPQ = ctx:rowToPPQ(newRow, chan)
-            if targetPPQ ~= e.ppq then
-              local wantDelay  = e.delay + timing.ppqToDelay(e.ppq - targetPPQ, resolution)
+            local targetppq = ctx:rowToPPQ(newRow, chan)
+            if targetppq ~= e.ppq then
+              local wantDelay  = e.delay + timing.ppqToDelay(e.ppq - targetppq, resolution)
               local dMin, dMax = delayRange(col, e)
               local newDelay   = util.clamp(wantDelay, dMin, dMax)
-              local newPPQ     = util.round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
-              if newPPQ ~= e.ppq or newDelay ~= e.delay then
+              local newppq     = util.round(e.ppq + timing.delayToPPQ(e.delay - newDelay, resolution))
+              if newppq ~= e.ppq or newDelay ~= e.delay then
                 if newDelay ~= wantDelay then clamped = clamped + 1 end
-                local s = at(newRow)
-                s.ppq, s.delay = newPPQ, newDelay
-                tm:assignEvent('note', e, s)
+                -- endppq stays put (intent), but endppqL must be re-expressed
+                -- in the new frame's logPerRow for coherence with the rebased head.
+                local f, logPerRow = frameAndLogPerRow(chan)
+                tm:assignEvent('note', e, {
+                  ppq     = newppq,
+                  ppqL    = newRow * logPerRow,
+                  delay   = newDelay,
+                  endppqL = ctx:ppqToRow(e.endppq, chan) * logPerRow,
+                  frame   = f,
+                })
               end
             end
           else
             local newRow = ctx:snapRow(e.ppq, chan)
             if ctx:rowToPPQ(newRow, chan) ~= e.ppq then
-              tm:assignEvent(col.type, e, at(newRow))
+              assignStamp(col.type, e, chan, newRow)
             end
           end
         end
@@ -1118,69 +1219,75 @@ function newViewManager(tm, cm, cmgr)
   end
 
   local insertRow, deleteRow do
-    -- Shift one event's intent + straight position by (dPPQ, dStraight) under
-    -- frame f. Note tails clamp to take length; for delete (dPPQ < 0) the clamp
-    -- is a no-op since e.endppq ≤ length already.
-    local function shiftEvent(col, e, dPPQ, dStraight, f)
+    -- Shift one event by dLogical rows under frame f. ppq is re-realised
+    -- from the new ppqL via current swing — a constant ±dppq shift would
+    -- only be correct under identity swing, since under non-trivial swing
+    -- rowToPPQ is non-linear and events at heterogeneous source rows
+    -- would land at non-grid realised positions.
+    local function shiftEvent(col, e, dLogical, swing, f)
+      local chan    = col.midiChan
+      local kind    = util.isNote(e) and 'note' or col.type
+      local newppqL = logicalOf(e) + dLogical
+      local update  = {
+        ppq   = util.round(swing.fromLogical(chan, newppqL)),
+        ppqL  = newppqL,
+        frame = f,
+      }
       if util.isNote(e) then
-        tm:assignEvent('note', e, {
-          ppq            = e.ppq + dPPQ,
-          endppq         = math.min(e.endppq + dPPQ, length),
-          straightPPQ    = straightOf(e)    + dStraight,
-          straightEndPPQ = straightEndOf(e) + dStraight,
-          frame          = f,
-        })
-      else
-        tm:assignEvent(col.type, e, {
-          ppq         = e.ppq + dPPQ,
-          straightPPQ = straightOf(e) + dStraight,
-          frame       = f,
-        })
+        update.endppqL = endLogicalOf(e) + dLogical
+        update.endppq  = math.min(util.round(swing.fromLogical(chan, update.endppqL)), length)
       end
+      tm:assignEvent(kind, e, update)
     end
 
     local function insertRowCore(col, topRow, numRows)
-      local chan    = col.midiChan
-      local f, sppr = frameAndSppr(chan)
-      local C       = ctx:rowToPPQ(topRow, chan)
-      local R       = ctx:rowToPPQ(topRow + numRows, chan) - C
-      local Sshift  = numRows * sppr
+      local chan = col.midiChan
+      local f, logPerRow = frameAndLogPerRow(chan)
+      local swing    = tm:swingSnapshot()
+      local C        = ctx:rowToPPQ(topRow, chan)
+      local dLogical = numRows * logPerRow
 
       local shifted = {}
       for e in util.between(col.events, C, length) do util.add(shifted, e) end
       for i = #shifted, 1, -1 do
         local e = shifted[i]
-        if e.ppq + R >= length then tm:deleteEvent(col.type, e)
-        else                        shiftEvent(col, e, R, Sshift, f) end
+        local newppq = util.round(swing.fromLogical(chan, logicalOf(e) + dLogical))
+        if newppq >= length then tm:deleteEvent(col.type, e)
+        else                     shiftEvent(col, e, dLogical, swing, f) end
       end
 
       if col.type == 'note' then
         local spanning = util.seek(col.events, 'before', C, util.isNote)
         if spanning and spanning.endppq > C then
-          tm:assignEvent('note', spanning, {
-            endppq         = math.min(spanning.endppq + R, length),
-            straightEndPPQ = straightEndOf(spanning) + Sshift,
-          })
+          local newendppqL = endLogicalOf(spanning) + dLogical
+          local newendppq  = math.min(util.round(swing.fromLogical(chan, newendppqL)), length)
+          assignTail(spanning, chan, newendppq, newendppqL)
         end
       end
     end
 
     local function deleteRowCore(col, topRow, numRows)
-      local chan    = col.midiChan
-      local f, sppr = frameAndSppr(chan)
-      local C       = ctx:rowToPPQ(topRow, chan)
-      local D       = ctx:rowToPPQ(topRow + numRows, chan)
-      local R       = D - C
-      local Sshift  = numRows * sppr
+      local chan = col.midiChan
+      local f, logPerRow = frameAndLogPerRow(chan)
+      local swing    = tm:swingSnapshot()
+      local C        = ctx:rowToPPQ(topRow, chan)
+      local D        = ctx:rowToPPQ(topRow + numRows, chan)
+      local dLogical = numRows * logPerRow
+      local topppqL  = topRow * logPerRow
 
       if col.type == 'note' then
         local spanning = util.seek(col.events, 'before', C, util.isNote)
         if spanning and spanning.endppq > C then
-          local clip = spanning.endppq > D
-          tm:assignEvent('note', spanning, {
-            endppq         = clip and spanning.endppq - R or C,
-            straightEndPPQ = clip and straightEndOf(spanning) - Sshift or straightOf(spanning),
-          })
+          if spanning.endppq > D then
+            local newendppqL = endLogicalOf(spanning) - dLogical
+            local newendppq  = util.round(swing.fromLogical(chan, newendppqL))
+            assignTail(spanning, chan, newendppq, newendppqL)
+          else
+            -- Note tail falls inside the deleted region — clip to topRow.
+            -- endppqL must be the logical position of C (topRow * logPerRow),
+            -- not the note's onset, or a later reswing would collapse the note.
+            assignTail(spanning, chan, C, topppqL)
+          end
         end
       end
 
@@ -1188,7 +1295,7 @@ function newViewManager(tm, cm, cmgr)
       for e in util.between(col.events, C, length) do util.add(touched, e) end
       for _, e in ipairs(touched) do
         if e.ppq < D then tm:deleteEvent(col.type, e)
-        else              shiftEvent(col, e, -R, -Sshift, f) end
+        else              shiftEvent(col, e, -dLogical, swing, f) end
       end
     end
 
@@ -1212,7 +1319,7 @@ function newViewManager(tm, cm, cmgr)
   local nudge do
     local function pitchStep(coarse)
       if not coarse then return 1 end
-      local t = ctx:activeTuning()
+      local t = ctx:activeTemper()
       return t and t.octaveStep or 12
     end
 
@@ -1229,11 +1336,11 @@ function newViewManager(tm, cm, cmgr)
     end
 
     local function nudgePitch(col, note, dir, coarse, audible)
-      local delta  = dir * pitchStep(coarse)
-      local tuning = ctx:activeTuning()
+      local delta = dir * pitchStep(coarse)
+      local temper = ctx:activeTemper()
       local pitch, detune
-      if tuning then
-        pitch, detune = microtuning.transposeStep(tuning, note.pitch, note.detune, delta)
+      if temper then
+        pitch, detune = tuning.transposeStep(temper, note.pitch, note.detune, delta)
       else
         pitch, detune = util.clamp(note.pitch + delta, 0, 127), note.detune
       end
@@ -1326,7 +1433,7 @@ function newViewManager(tm, cm, cmgr)
     -- Fixups are computed before any mutation: tm:assignEvent's same-key clamp
     -- reads live state, so we must delete first and stretch second.
     local function queueDeleteNotes(col, locs)
-      local sppr = ctx:ppqPerRow()
+      local chan = col.midiChan
       local fixups = {}
       local lastSurvivor, pendingFixup = nil, false
       for _, evt in ipairs(col.events) do
@@ -1337,12 +1444,7 @@ function newViewManager(tm, cm, cmgr)
             end
           else
             if pendingFixup then
-              util.add(fixups, {
-                evt            = lastSurvivor,
-                endppq         = evt.ppq,
-                straightEndPPQ = evt.straightPPQ
-                                 or ctx:ppqToRow(evt.ppq, col.midiChan) * sppr,
-              })
+              util.add(fixups, { evt = lastSurvivor, endppq = evt.ppq, endppqL = evt.ppqL })
             end
             pendingFixup = false
             lastSurvivor = evt
@@ -1350,18 +1452,14 @@ function newViewManager(tm, cm, cmgr)
         end
       end
       if pendingFixup then
-        util.add(fixups, {
-          evt            = lastSurvivor,
-          endppq         = length,
-          straightEndPPQ = ctx:ppqToRow(length, col.midiChan) * sppr,
-        })
+        util.add(fixups, { evt = lastSurvivor, endppq = length })
       end
 
       for _, evt in pairs(locs) do
         if evt.type ~= 'pa' then tm:deleteEvent('note', evt) end
       end
       for _, f in ipairs(fixups) do
-        tm:assignEvent('note', f.evt, { endppq = f.endppq, straightEndPPQ = f.straightEndPPQ })
+        assignTail(f.evt, chan, f.endppq, f.endppqL)
       end
     end
 
@@ -1476,7 +1574,7 @@ function newViewManager(tm, cm, cmgr)
   ----- Accessors for renderManager
 
   function vm:rowPerBar()      return rowPerBar end
-  function vm:activeTuning()   return ctx:activeTuning() end
+  function vm:activeTemper()   return ctx:activeTemper() end
   function vm:noteProjection(evt) return ctx:noteProjection(evt) end
   function vm:rowBeatInfo(row) return ctx:rowBeatInfo(row) end
   function vm:barBeatSub(row) return ctx:barBeatSub(row) end
@@ -1649,8 +1747,6 @@ function newViewManager(tm, cm, cmgr)
     doubleRPB               = function() vm:setRowPerBeat(cm:get('rowPerBeat') * 2) end,
     halveRPB                = function() vm:setRowPerBeat(math.floor(cm:get('rowPerBeat') / 2)) end,
     matchGridToCursor       = matchGridToCursor,
-    cycleTuning             = cycleTuning,
-    cycleSwing              = cycleSwing,
   }
 
   for i = 0, 9 do
@@ -1749,7 +1845,7 @@ function newViewManager(tm, cm, cmgr)
 
       -- Swing snapshot for this rebuild — resolved slots, T baked in.
       -- tm has already stripped delay from col.events, so evt.ppq is
-      -- intent; unapply(chan, intentPPQ) → straight-grid PPQ.
+      -- intent; swing.toLogical(chan, ppqI) → ppqL.
       ctx = newViewContext{
         swing      = tm:swingSnapshot(),
         rowPPQs    = rowPPQs,
@@ -1758,10 +1854,10 @@ function newViewManager(tm, cm, cmgr)
         rowPerBeat = rpb,
         ppqPerRow  = ppqPerRow,
         timeSigs   = timeSigs,
-        tuning     = microtuning.findTuning(cm:get('tuning')),
+        temper     = tuning.findTemper(cm:get('temper'), cm:get('tempers')),
       }
 
-      -- Per design/archive/swing.md: displayRow(e) = round(ppqToRow_c(e.ppq))
+      -- Per docs/timing.md: displayRow(e) = round(ppqToRow_c(e.ppq))
       -- under *current* swing. tm has stripped delay, so e.ppq is
       -- intent. On-grid iff rowToPPQ_c reproduces e.ppq exactly — with
       -- float rowPPQs the round-trip is bit-exact, so a swing change
@@ -1837,6 +1933,8 @@ function newViewManager(tm, cm, cmgr)
   clipboard = newClipboard {
     ec = ec, grid = grid, tm = tm, cm = cm,
     currentFrame = currentFrame,
+    assignTail   = assignTail,
+    paFrame      = paFrame,
     getCtx       = function() return ctx end,
     getLength    = function() return length end,
   }

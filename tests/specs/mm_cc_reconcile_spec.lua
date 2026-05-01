@@ -187,7 +187,7 @@ return {
       local mm, captured = loadWithCapture(take)
       t.eq(#captured.ccsReconciled, 1)
       t.eq(captured.ccsReconciled[1].kind, 'orphaned')
-      t.eq(captured.ccsReconciled[1].lastPpq, 100)
+      t.eq(captured.ccsReconciled[1].lastppq, 100)
 
       -- Sidecar gone from the take.
       local _, _, _, txtCount = reaper.MIDI_CountEvts(take)
@@ -232,7 +232,7 @@ return {
       t.eq(#captured.ccsReconciled, 1)
       local e = captured.ccsReconciled[1]
       t.eq(e.kind, 'ambiguous')
-      t.deepEq(e.candidatePpqs, { 80, 130 })
+      t.deepEq(e.candidateppqs, { 80, 130 })
       for _, c in mm:ccs() do t.eq(c.uuid, nil, 'no cc takes the orphaned uuid') end
       local _, _, _, txtCount = reaper.MIDI_CountEvts(take)
       t.eq(txtCount, 0, 'ambiguous sidecar removed')

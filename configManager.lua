@@ -6,6 +6,17 @@ local function print(...)
   return util.print(...)
 end
 
+-- hex('#RRGGBB', alpha?) → {r,g,b,a} with components in [0,1].
+-- Leading '#' optional; alpha defaults to 1. Used by the colour-atom
+-- declarations below.
+local function hex(s, alpha)
+  s = s:gsub('^#', '')
+  local r = tonumber(s:sub(1,2), 16) / 255
+  local g = tonumber(s:sub(3,4), 16) / 255
+  local b = tonumber(s:sub(5,6), 16) / 255
+  return {r, g, b, alpha or 1}
+end
+
 -- Array-of-pairs lets nil defaults (declared-but-null) coexist with
 -- non-nil ones: pair[1] presence = declared; pair[2] = default.
 local declarations = {
@@ -24,49 +35,99 @@ local declarations = {
   { 'noteLayout',      'colemak' },
 
   -- null-defaulted (declared, no initial value)
-  { 'tuning',          nil   },
+  { 'temper',          nil   },
   { 'swing',           nil   },
 
   -- table-valued
   { 'colSwing',        {}    },
   { 'swings',          {}    },
+  { 'tempers',         {}    },
   { 'mutedChannels',   {}    },
   { 'soloedChannels',  {}    },
   { 'extraColumns',    {}    },
   { 'noteDelay',       {}    },
 
-  -- colours (flat dotted keys preserve per-colour override across levels)
-  { 'colour.bg',           {218/256, 214/256, 201/256, 1  } },
-  { 'colour.text',         { 48/256,  48/256,  33/256, 1  } },
-  { 'colour.offGrid',      { 86/256, 138/256,  64/256, 1  } },
-  { 'colour.overflow',     {210/256,  90/256,  35/256, 1  } },
-  { 'colour.negative',     {218/256,  48/256,  33/256, 1  } },
-  { 'colour.textBar',      { 48/256,  48/256,  33/256, 1  } },
-  { 'colour.header',       { 48/256,  48/256,  33/256, 1  } },
-  { 'colour.inactive',     {138/256, 134/256, 121/256, 1  } },
-  { 'colour.cursor',       { 37/256,  41/256,  54/256, 1  } },
-  { 'colour.cursorText',   {207/256, 207/256, 222/256, 1  } },
-  { 'colour.rowNormal',    {218/256, 214/256, 201/256, 0  } },
-  { 'colour.rowBeat',      {181/256, 179/256, 158/256, 0.4} },
-  { 'colour.rowBarStart',  {159/256, 147/256, 115/256, 0.4} },
-  { 'colour.editCursor',   {1,       1,       0,       1  } },
-  { 'colour.selection',    {247/256, 247/256, 244/256, 0.5} },
-  { 'colour.scrollHandle', { 48/256,  48/256,  33/256, 1  } },
-  { 'colour.scrollBg',     {218/256, 214/256, 201/256, 1  } },
-  { 'colour.accent',       {159/256, 147/256, 115/256, 1  } },
-  { 'colour.mute',         {218/256,  48/256,  33/256, 1  } },
-  { 'colour.solo',         {220/256, 180/256,  50/256, 1  } },
-  { 'colour.separator',    {159/256, 147/256, 115/256, 0.3} },
-  { 'colour.tail',         {100/256, 130/256, 160/256, 0.15} },
-  { 'colour.tailBord',     {140/256, 170/256, 200/256, 1  } },
-  { 'colour.ghost',        {100/256, 130/256, 160/256, 0.9} },
-  { 'colour.ghostNegative',{218/256, 130/256, 120/256, 0.9} },
+  -- Colour table: a flat keyspace whose entries take three forms.
+  -- Atoms live under `palette.*` (parchment, used by the tracker grid)
+  -- and `chrome.*` (neutral, used by toolbar/popups/modals); they're the
+  -- only place RGB values live. Roles live under `colour.*` and name the
+  -- *function* a colour plays — they alias an atom (or another role) by
+  -- its full cm key, optionally overriding alpha. One-off colours that
+  -- earn no good function name live inline at the role.
+  --
+  -- Entry forms (resolved by renderManager's resolveColour):
+  --   {r,g,b,a}     atom — terminal RGBA
+  --   'fullKey'     pure alias — recursive cm:get, alpha inherited
+  --   {'fullKey',a} alias with alpha override (outermost wins)
+
+  -- Atoms — parchment palette
+  { 'palette.bg',        hex('#dad6c9') },  -- cream paper
+  { 'palette.shade',     hex('#303021') },  -- dark ink
+  { 'palette.mid',       hex('#9f9373') },  -- warm tan (accents, separators, bar markers)
+  { 'palette.highlight', hex('#b5b39e') },  -- lighter tan (beat-row tone)
+  { 'palette.inactive',  hex('#8a8679') },  -- muted olive-grey
+  { 'palette.danger',    hex('#da3021') },
+  { 'palette.caution',   hex('#d25a23') },
+  { 'palette.positive',  hex('#568a40') },
+  { 'palette.amber',     hex('#dcb432') },
+  { 'palette.steel',     hex('#6482a0') },
+  { 'palette.pale',      hex('#f7f7f4') },
+  { 'palette.night',     hex('#252936') },
+  { 'palette.nightText', hex('#cfcfde') },
+
+  -- Atoms — chrome palette
+  { 'chrome.bg',        hex('#79829f') },              -- slate
+  { 'chrome.shade',     hex('#5e6678') },              -- deeper slate
+  { 'chrome.highlight', hex('#d6d9df') },              -- warm fog on slate
+
+  -- Grid roles
+  { 'colour.bg',               'palette.bg'                       },
+  { 'colour.text',             'palette.shade'                    },
+  { 'colour.offGrid',          'palette.positive'                 },
+  { 'colour.overflow',         'palette.caution'                  },
+  { 'colour.negative',         'palette.danger'                   },
+  { 'colour.inactive',         'palette.inactive'                 },
+  { 'colour.cursor',           'palette.night'                    },
+  { 'colour.cursorText',       'palette.nightText'                },
+  { 'colour.rowNormal',        {'palette.bg',         0   }       },
+  { 'colour.rowBeat',          {'palette.highlight',  0.4 }       },
+  { 'colour.rowBarStart',      {'palette.mid',        0.4 }       },
+  { 'colour.editCursor',       hex('#ffff00')                     },  -- one-off yellow
+  { 'colour.selection',        {'palette.pale',       0.5 }       },
+  { 'colour.scrollHandle',     'colour.text'                      },
+  { 'colour.scrollBg',         'colour.bg'                        },
+  { 'colour.accent',           'palette.mid'                      },
+  { 'colour.mute',             'colour.negative'                  },
+  { 'colour.solo',             'palette.amber'                    },
+  { 'colour.separator',        {'palette.mid',        0.3 }       },
+  { 'colour.tail',             {'palette.steel',      0.15}       },
+  { 'colour.tailBord',         hex('#8caac8')                     },  -- one-off lighter steel
+  { 'colour.ghost',            {'palette.steel',      0.9 }       },
+  { 'colour.ghostNegative',    hex('#da8278', 0.9)                },  -- one-off faded red
   -- Lane strip (CC/PB/AT envelope visualiser above the tracker grid).
-  { 'colour.laneAxis',     {138/256, 134/256, 121/256, 0.6 } },
-  { 'colour.laneRowDivider',{138/256, 134/256, 121/256, 0.15} },
-  { 'colour.laneAnchor',   { 48/256,  48/256,  33/256, 1   } },
-  { 'colour.laneAnchorActive',{218/256, 48/256,  33/256, 1   } },
-  { 'colour.laneEnvelope', {159/256, 147/256, 115/256, 1   } },
+  { 'colour.laneAxis',         {'palette.inactive',   0.6 }       },
+  { 'colour.laneRowDivider',   {'palette.inactive',   0.15}       },
+  { 'colour.laneAnchor',       'colour.text'                      },
+  { 'colour.laneAnchorActive', 'colour.negative'                  },
+  { 'colour.laneEnvelope',     'colour.accent'                    },
+
+  -- Chrome roles — toolbar (top band) and statusBar (bottom band).
+  -- They share the chrome palette today; split aliases let either diverge.
+  { 'colour.toolbar.bg',           {'palette.pale', 0.5}          },
+  { 'colour.toolbar.text',         'palette.shade'                 },
+  { 'colour.toolbar.button',       'palette.pale',                 },
+  { 'colour.toolbar.buttonHover',  {'palette.pale',  0.42 }       },
+  { 'colour.toolbar.buttonActive', {'palette.pale',  0.62 }       },
+  { 'colour.toolbar.buttonBorder', {'palette.mid',    0.35  }       },
+  { 'colour.toolbar.checkMark',    'palette.shade'                 },
+  { 'colour.toolbar.popupBg',      'palette.pale'                  },
+  { 'colour.statusBar.bg',         'chrome.bg'                    },
+  { 'colour.statusBar.text',       'chrome.highlight'             },
+  -- Floating editor windows (e.g. swing editor) want the *rendered*
+  -- toolbar tone — opaque, matching what `{'palette.pale', 0.5}` looks
+  -- like when blended over palette.bg. Pure palette.pale is too cool.
+  -- Pre-computed blend: 0.5*pale + 0.5*bg ≈ #e9e7df.
+  { 'colour.editor.bg',            hex('#e9e7df')                 },
   { 'laneStrip.rows',      4    },
   { 'laneStrip.visible',   true },
 }

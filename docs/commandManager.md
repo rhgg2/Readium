@@ -35,7 +35,7 @@ Registration is split by ownership rather than packed into one site:
 - **clipboard** (`clipboard:registerCommands(cmgr)`, called from vm) —
   `copy`, `paste`.
 - **vm** (`cmgr:registerAll`) — editing commands, transport, column
-  management, display, swing/tuning cycling, and cross-layer composites
+  management, display, swing/temperament cycling, and cross-layer composites
   like `cut` (which combines `clipboard:copy` with `vm`'s
   `deleteSelection`).
 - **rm** (`cmgr:registerAll`) — commands whose effect lives in rm-only

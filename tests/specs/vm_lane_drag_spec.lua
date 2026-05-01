@@ -2,11 +2,11 @@
 -- driven by the lane-strip drag in renderManager.
 --
 -- Invariants:
---   - integer toRow → ppq = rowToPPQ(toRow), straightPPQ = toRow * sppr
+--   - integer toRow → ppq = rowToPPQ(toRow), ppqL = toRow * logPerRow
 --   - identity-by-index survives the post-flush rebuild, because:
 --       * tm sorts col.events by ppq each rebuild
---       * the move clamps newPPQ strictly inside (prev.ppq, next.ppq) by ±1
---   - fractional toRow (shift-drag) lands ppq off-grid; straightPPQ
+--       * the move clamps newppq strictly inside (prev.ppq, next.ppq) by ±1
+--   - fractional toRow (shift-drag) lands ppq off-grid; ppqL
 --     records the authored fractional row so reswing remembers it
 --   - non cc/pb/at columns are silently ignored
 
@@ -23,7 +23,7 @@ return {
   {
     name = 'integer toRow lands ppq on rowToPPQ exactly; identity-by-index preserved',
     run = function(harness)
-      -- rpb=4, resolution=240 → sppr=60. Three CCs at rows 1, 4, 6.
+      -- rpb=4, resolution=240 → logPerRow=60. Three CCs at rows 1, 4, 6.
       local h = harness.mk{
         seed = {
           ccs = {
@@ -43,7 +43,7 @@ return {
       local events = h.vm.grid.cols[idx].events
       t.eq(events[2].ppq,         180, 'ppq = rowToPPQ(3)')
       t.eq(events[2].val,         20,  'val carried through (event identity preserved)')
-      t.eq(events[2].straightPPQ, 180, 'straightPPQ = row * sppr')
+      t.eq(events[2].ppqL, 180, 'ppqL = row * logPerRow')
       t.eq(events[1].ppq,         60,  'prev untouched')
       t.eq(events[3].ppq,         360, 'next untouched')
     end,
@@ -113,7 +113,7 @@ return {
       h.vm:moveLaneEvent(h.vm.grid.cols[idx], 2, 2.5, 20)
       local evt = h.vm.grid.cols[idx].events[2]
       t.eq(evt.ppq,         150, 'ppq = rowToPPQ(2.5)')
-      t.eq(evt.straightPPQ, 150, 'straightPPQ = 2.5 * sppr')
+      t.eq(evt.ppqL, 150, 'ppqL = 2.5 * logPerRow')
     end,
   },
 

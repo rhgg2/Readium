@@ -128,7 +128,12 @@ All write paths (`add*`, `delete*`, `assign*`) must run inside `mm:modify(fn)`.
 
 A structural assignCC on a uuid'd cc also rewrites the sidecar's position and
 fingerprint bytes so the next load is stage-1 clean. `deleteCC` removes the
-sidecar alongside the event.
+sidecar alongside the event — but defers the sysex delete to end-of-`modify`,
+where the queued uuids are resolved against the live sysex array (idxs
+sorted desc) rather than against `uuidIdx` values stamped before any
+intervening shifts. Without that, a mid-fn sidecar insert + a subsequent
+delete that shifts the array can leave a `deleteCC`'s cached `uuidIdx`
+pointing at the wrong sidecar — quietly killing a bystander.
 
 `addCC(t)` mirrors the lazy-sidecar pattern: if `t` carries any non-structural
 key it allocates a uuid + inserts a sidecar in the same shot. Plain ccs
@@ -181,6 +186,14 @@ Firing rules:
 
 ## Conventions
 
+- **mm holds the realisation frame** — REAPER's storage frame, with
+  per-note delay already baked into the note-on ppq. See
+  `docs/timing.md` for the three-frame model and where conversion
+  happens (tm).
+- **mm holds raw pb only.** No notion of detune or cents — the
+  cents↔raw conversion and the fake-pb absorber pattern live in tm.
+  See `docs/tuning.md` for the detune-as-intent / pb-as-realisation
+  split.
 - **Channels are 1..16 internally**, offset by +1 from REAPER's 0..15. All
   getters return 1-indexed; all setters shift back on write.
 - **Pitchbend is centred on 0**, range -8192..8191. Stored on the wire as

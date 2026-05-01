@@ -141,10 +141,10 @@ local function op1_immediate_readback(scratch)
   if #sx ~= 2 then
     fail(1, fmt("expected 2 sidecars, got %d", #sx))
   else
-    local byPpq = {}
-    for _, e in ipairs(sx) do byPpq[e.ppq] = e end
-    local ppqsOk  = byPpq[0] and byPpq[100]
-    local bytesOk = ppqsOk and byPpq[0].msg == payload and byPpq[100].msg == payload
+    local byppq = {}
+    for _, e in ipairs(sx) do byppq[e.ppq] = e end
+    local ppqsOk  = byppq[0] and byppq[100]
+    local bytesOk = ppqsOk and byppq[0].msg == payload and byppq[100].msg == payload
     if bytesOk then
       pass(1, fmt("readback = %s; ppqs preserved", hex(sx[1].msg)))
     else

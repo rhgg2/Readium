@@ -1,0 +1,12 @@
+- rebuild on MIDI hash change
+- horizontal preview UI for 7bit/PBs
+- editing UI for 7bit/PBs
+- ghost paste (grouped notes/CCs)
+- pattern resize (including duplicate)
+- tuning editor
+- FX, ideas:
+  - flam
+  - trill
+  - cc macros
+- automation smoothing
+- 14bit CCs

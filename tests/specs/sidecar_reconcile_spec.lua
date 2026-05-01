@@ -322,11 +322,11 @@ return {
       t.eq(#evts, 1)
       local e = byUuid[1]
       t.eq(e.kind, 'orphaned')
-      t.eq(e.lastPpq, 100)
+      t.eq(e.lastppq, 100)
       t.eq(e.chan, 1)
       t.eq(e.msgType, 'cc')
       t.eq(e.cc, 7)
-      t.eq(e.ppq, nil, 'orphans use lastPpq, never ppq')
+      t.eq(e.ppq, nil, 'orphans use lastppq, never ppq')
       t.eq(next(ccsByLoc(mm)), nil, 'no ccs')
     end,
   },
@@ -350,7 +350,7 @@ return {
   },
 
   {
-    name = 'two candidates → ambiguous, no bind, candidatePpqs reported',
+    name = 'two candidates → ambiguous, no bind, candidateppqs reported',
     run = function()
       local take, reaper = freshTake()
       seed(take, reaper, {
@@ -364,7 +364,7 @@ return {
       t.eq(#evts, 1)
       local e = byUuid[1]
       t.eq(e.kind, 'ambiguous')
-      t.deepEq(e.candidatePpqs, { 50, 150 })
+      t.deepEq(e.candidateppqs, { 50, 150 })
       for _, c in mm:ccs() do t.eq(c.uuid, nil) end
     end,
   },
