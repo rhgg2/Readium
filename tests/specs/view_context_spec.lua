@@ -41,6 +41,25 @@ local function mkCtx(overrides)
   return newViewContext(args)
 end
 
+-- Non-divisor rpb: rowPPQs[r] = r · ppqPerRow is fractional for most r,
+-- which exposes the F4 asymmetry between rowToPPQ (rounds at realisation)
+-- and ppqToRow (returns a fractional row).
+local function mkCtxRpb(rpb, ppqPerQN)
+  ppqPerQN        = ppqPerQN or 240
+  local ppqPerRow = ppqPerQN / rpb        -- denom = 4 ⇒ resolution*4/denom = ppqPerQN
+  local numRows   = rpb * 16              -- 4 bars of content
+  local length    = numRows * ppqPerRow
+  local rowPPQs   = {}
+  for r = 0, numRows - 1 do rowPPQs[r] = r * ppqPerRow end
+  return mkCtx{
+    rowPPQs    = rowPPQs,
+    length     = length,
+    numRows    = numRows,
+    rowPerBeat = rpb,
+    ppqPerRow  = ppqPerRow,
+  }
+end
+
 -- Build a swung snapshot via the real tm — the rowPPQs stay logical
 -- (intent grid is uniform); swing only deflects the realised ppq.
 local function swungSnapshot(harness, composite, slot)
@@ -129,6 +148,59 @@ return {
       local ppq = ctx:rowToPPQ(2, 1)
       t.truthy(ppq ~= 120, 'row 2 should not land on logical 120 under swing, got ' .. ppq)
       t.truthy(math.abs(ppq - 139) <= 1, 'row 2 should land near 139, got ' .. ppq)
+    end,
+  },
+
+  ---------- F4 ROUND-TRIP UNDER NON-DIVISOR RPB
+  --
+  -- See design/swing_delay_invariants.md F4. Two corners hold; the raw
+  -- round-trip is asymmetric by design (snapRow is the recovery operator).
+
+  {
+    name = 'F4 corner 1: snapRow(rowToPPQ(r,c),c) == r under non-divisor rpb',
+    run = function()
+      for _, rpb in ipairs{ 5, 7 } do
+        local ctx = mkCtxRpb(rpb)
+        for r = 0, rpb * 4 - 1 do
+          t.eq(ctx:snapRow(ctx:rowToPPQ(r, 1), 1), r,
+            'rpb=' .. rpb .. ' r=' .. r)
+        end
+      end
+    end,
+  },
+
+  {
+    name = 'F4 corner 2: on-grid p round-trips exactly under non-divisor rpb',
+    run = function()
+      for _, rpb in ipairs{ 5, 7 } do
+        local ctx = mkCtxRpb(rpb)
+        for r = 0, rpb * 4 - 1 do
+          local p = ctx:rowToPPQ(r, 1)
+          t.eq(ctx:rowToPPQ(ctx:ppqToRow(p, 1), 1), p,
+            'rpb=' .. rpb .. ' r=' .. r .. ' p=' .. p)
+        end
+      end
+    end,
+  },
+
+  {
+    name = 'F4 asymmetry: raw ppqToRow ∘ rowToPPQ is NOT the identity under non-divisor rpb',
+    -- Witnesses why snapRow is the recovery operator, not "fix ppqToRow to
+    -- round." The drift is bounded by < 0.5 (snapRow's recovery range);
+    -- removing it would cost the fractional-row resolution that lane drag
+    -- and off-grid display rely on.
+    run = function()
+      local ctx = mkCtxRpb(7)
+      local witnessed = false
+      for r = 1, 6 do                       -- r=0 and r=7 are integer-ppq fixpoints
+        local back  = ctx:ppqToRow(ctx:rowToPPQ(r, 1), 1)
+        local drift = math.abs(back - r)
+        t.truthy(drift < 0.5,
+          'drift must stay within snapRow recovery range, r=' .. r .. ' got ' .. drift)
+        if back ~= r then witnessed = true end
+      end
+      t.truthy(witnessed,
+        'expected at least one r in 1..6 to witness raw round-trip drift under rpb=7')
     end,
   },
 

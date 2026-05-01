@@ -167,15 +167,22 @@ Semantics:
 
 - **Rejected updates.** Changing a note's `chan` or `lane` via
   `assignEvent` is rejected (prints a warning and drops the call).
-- **Single voice per (chan, pitch).** `clearSameKeyRange` truncates or
-  deletes overlapping same-key notes around any add or move. Matches
-  the post-hoc normalisation rebuild runs for foreign MIDI, so callers
-  don't have to think about cross-column collisions. A caller staging
-  a coherent monotone batch (where the end-state has no new same-key
-  overlaps) can pass `opts.trustGeometry` on `assignEvent` to skip the
-  per-write clamp; rebuild's group-by-pitch pass is the backstop.
-  Reswing uses this — without it, the first-processed of two legato
-  siblings sees its endppq clipped against the second's still-old ppq.
+- **Single voice per (chan, pitch) — realised space.** `clearSameKeyRange`
+  truncates or deletes overlapping same-key notes around any add or
+  move. The MIDI spec gives one voice per `(chan, pitch)`, so a
+  *realised* collision must always shorten or drop a note regardless
+  of intent geometry. The reconciliation therefore compares onsets in
+  realised space (`n.ppq` from `notesByLoc` is realised), and the
+  resulting `endppq` write — though `endppq` is intent at every layer
+  per F3 — is the moment we now intend to end, forced by the voice
+  collision. vm-side `delayRange` is the user-facing gate that keeps
+  legitimate edits from creating these collisions in the first place;
+  rebuild's group-by-pitch pass is the backstop for foreign MIDI.
+  A caller staging a coherent monotone batch (where the end-state has
+  no new same-key overlaps) can pass `opts.trustGeometry` on
+  `assignEvent` to skip the per-write clamp. Reswing uses this —
+  without it, the first-processed of two legato siblings sees its
+  endppq clipped against the second's still-old ppq.
 - **Detune changes (col-1 notes).** `assignNote` seats a pb at the
   boundary if needed, retunes the raw stream forward to the next note,
   then drops the boundary if it became redundant.

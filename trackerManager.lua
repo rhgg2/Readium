@@ -409,6 +409,15 @@ function newTrackerManager(mm, cm)
       if next(update) then assignLowlevel('note', n, update) end
     end
 
+    -- Same-(chan, pitch) overlap reconciliation in REALISED space. MIDI
+    -- gives one voice per (chan, pitch); a sibling whose realised onset
+    -- collides with ours must truncate or shorten regardless of intent
+    -- geometry, so onsets are compared in n.ppq (realised). The truncate
+    -- target lands in `endppq` — endppq stays intent in the sense that
+    -- it's "the moment we intend to end" — but that intended end is now
+    -- forced by the voice collision, hence a realised value. vm-side
+    -- `delayRange` is the user-facing gate that prevents legitimate edits
+    -- from creating these collisions in the first place.
     local function clearSameKeyRange(chan, pitch, P, Pend, selfEvt)
       local clampEnd = Pend
       local toDelete, toTruncate = {}, {}
@@ -493,11 +502,9 @@ function newTrackerManager(mm, cm)
         evt.detune = evt.detune or 0
         evt.delay  = evt.delay  or 0
         evt.lane   = evt.lane   or 1
-        local d = delayToPPQ(evt.delay)
-        if d ~= 0 then
-          evt.ppq = evt.ppq + d
-          if evt.endppq then evt.endppq = evt.endppq + d end
-        end
+        -- ppq shifts into realised so CSK can compare in realised space;
+        -- endppq stays intent (delay is a realisation-level shift only).
+        evt.ppq = evt.ppq + delayToPPQ(evt.delay)
         evt.endppq = clearSameKeyRange(evt.chan, evt.pitch, evt.ppq, evt.endppq, evt)
         addNote(evt)
       elseif evtType == 'pb' then
