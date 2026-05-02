@@ -252,6 +252,53 @@ return {
   },
 
   {
+    -- Pins forward-compat for the cc/pb/pa projection. Routing fields
+    -- (chan, msgType, cc) belong to the destination col and are stripped;
+    -- everything else on the source mm-level event — including future
+    -- metadata fields not known here — must ride through to col.events.
+    -- The previous implementation used per-msgType allowlists that
+    -- silently dropped any unknown field.
+    name = 'arbitrary metadata on cc/pb/pa survives the projection',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0, endppq = 480, chan = 1, pitch = 60, vel = 100,
+              detune = 0, delay = 0 },
+          },
+          ccs = {
+            { ppq = 100, chan = 1, msgType = 'cc', cc = 74, val = 64,
+              mood = 'blue', tag = 42 },
+            { ppq = 200, chan = 1, msgType = 'pb', val = 0,
+              mood = 'green', tag = 7 },
+            { ppq = 300, chan = 1, msgType = 'pa', pitch = 60, val = 90,
+              mood = 'red',  tag = 99 },
+          },
+        },
+      }
+      local ch = h.tm:getChannel(1)
+
+      local ccEvt = ch.columns.ccs[74].events[1]
+      t.eq(ccEvt.mood, 'blue', 'cc custom field rides through projection')
+      t.eq(ccEvt.tag,  42,     'cc tag rides through projection')
+
+      t.truthy(ch.columns.pb, 'pb column surfaces')
+      local pbEvt = ch.columns.pb.events[1]
+      t.eq(pbEvt.mood, 'green', 'pb custom field rides through projection')
+      t.eq(pbEvt.tag,  7,       'pb tag rides through projection')
+
+      -- pa is attached to the host note's column, alongside the note.
+      local paEvt
+      for _, e in ipairs(ch.columns.notes[1].events) do
+        if e.type == 'pa' then paEvt = e end
+      end
+      t.truthy(paEvt, 'pa event projected onto host-pitch note col')
+      t.eq(paEvt.mood, 'red', 'pa custom field rides through projection')
+      t.eq(paEvt.tag,  99,    'pa tag rides through projection')
+    end,
+  },
+
+  {
     name = 'tm:addEvent + flush round-trips through mm',
     run = function(harness)
       local h = harness.mk()

@@ -966,11 +966,66 @@ function newMidiManager(take)
     return reaper.MIDI_GetPPQPosFromProjQN(take, 1) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
   end
 
+  -- Source length, not item length. The "take" is the source MIDI; the item
+  -- is just a window onto it. setLength below truncates the source's EOT
+  -- marker explicitly so this stays in sync after a shrink.
   function mm:length()
     if not take then return end
     local source = reaper.GetMediaItemTake_Source(take)
-    local sourceLengthQN = reaper.GetMediaSourceLength(source)
-    return reaper.MIDI_GetPPQPosFromProjQN(take, sourceLengthQN) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
+    local lenQN  = reaper.GetMediaSourceLength(source)
+    return lenQN * self:resolution()
+  end
+
+  function mm:name()
+    if not take then return end
+    local _, name = reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', false)
+    return name
+  end
+
+  function mm:setName(name)
+    if not take then return end
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', name, true)
+  end
+
+  -- Walk the raw event buffer to find the trailing End-Of-Track meta event
+  -- (msg = 0xFF 0x2F 0x00) and rewrite its delta so the EOT lands at
+  -- targetPpq. Events past targetPpq are assumed already deleted upstream
+  -- (tm:setLength does this before calling mm:setLength).
+  local function retractEot(buf, targetPpq)
+    local pos, ppq, lastPpq, lastStart = 1, 0, 0, nil
+    while pos + 8 <= #buf do
+      local offset, _, msglen = string.unpack('<i4Bi4', buf, pos)
+      lastPpq, lastStart = ppq, pos
+      ppq = ppq + offset
+      pos = pos + 9 + msglen
+    end
+    if not lastStart then return buf end
+    local _, flag, msglen = string.unpack('<i4Bi4', buf, lastStart)
+    local msg = buf:sub(lastStart + 9, lastStart + 9 + msglen - 1)
+    local isEot = msglen == 3 and msg:byte(1) == 0xFF and msg:byte(2) == 0x2F
+    if not isEot then return buf end
+    local newOffset = math.max(0, targetPpq - lastPpq)
+    return buf:sub(1, lastStart - 1)
+        .. string.pack('<i4Bi4', newOffset, flag, msglen) .. msg
+  end
+
+  -- Resize the take to `qn` quarter-notes. MIDI_SetItemExtents shrinks the
+  -- item but leaves the source's EOT stale on contract; we retract it
+  -- explicitly so the source actually shrinks. Project metadata only —
+  -- no high-level MIDI event mutation, so doesn't go through modify();
+  -- fires reload so tm picks up the new length.
+  function mm:setLength(qn)
+    if not take then return end
+    local item     = reaper.GetMediaItemTake_Item(take)
+    local startSec = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+    local startQN  = reaper.TimeMap2_timeToQN(0, startSec)
+    reaper.MIDI_SetItemExtents(item, startQN, startQN + qn)
+    local ok, buf = reaper.MIDI_GetAllEvts(take)
+    if ok then
+      local newBuf = retractEot(buf, qn * self:resolution())
+      if newBuf ~= buf then reaper.MIDI_SetAllEvts(take, newBuf) end
+    end
+    self:reload()
   end
 
   function mm:timeSigs()

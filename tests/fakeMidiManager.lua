@@ -41,6 +41,7 @@ function newMidiManager(opts)
   local resolution  = opts.resolution or 240
   local length      = opts.length or 3840
   local timeSigs    = opts.timeSigs or { { ppq = 0, num = 4, denom = 4 } }
+  local takeName    = opts.name or ''
   local maxUuid     = 0
   local fire
 
@@ -252,6 +253,12 @@ function newMidiManager(opts)
   function mm:resolution() return resolution end
   function mm:length()     return length end
   function mm:timeSigs()   return util.clone(timeSigs, nil, true) or {} end
+  function mm:name()       return takeName end
+  function mm:setName(n)   takeName = n or '' end
+  function mm:setLength(qn)
+    length = qn * resolution
+    fire('reload', nil)
+  end
 
   -- Curve semantics mirror midiManager.lua (kept in sync by hand; the real
   -- module isn't loaded under the test harness).

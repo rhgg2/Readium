@@ -157,7 +157,11 @@ function newTrackerManager(mm, cm)
       if not evt.loc then return end
       for _, e in ipairs(assigns) do
         if e.loc == evt.loc and e.type == evtType then
-          util.assign(e.update, update)
+          -- Plain copy, not util.assign: this is an instruction stream,
+          -- so a util.REMOVE marker must survive into the queued update
+          -- (where it tells mm to drop the field). util.assign would
+          -- collapse REMOVE to nil-the-key, silently losing the delete.
+          for k, v in pairs(update) do e.update[k] = v end
           return
         end
       end
@@ -654,6 +658,22 @@ function newTrackerManager(mm, cm)
     end
   end
 
+  -- Project a raw mm-level cc record into a typed col.events entry.
+  -- Routing fields the destination col owns (chan, msgType, cc) are
+  -- stripped; everything else — including future metadata fields not
+  -- known here — rides through verbatim. `overlay` carries the
+  -- per-msgType derived fields (and may use util.REMOVE to drop a
+  -- source field the projection deliberately replaces, e.g. pa
+  -- replaces `val` with `vel`).
+  local CC_PROJECT_STRIP = { chan = true, msgType = true, cc = true }
+
+  local function projectCC(cc, loc, overlay)
+    local evt = util.clone(cc, CC_PROJECT_STRIP)
+    evt.loc = loc
+    if overlay then util.assign(evt, overlay) end
+    return evt
+  end
+
   ---------- PUBLIC
 
   local tm = {}
@@ -731,8 +751,7 @@ function newTrackerManager(mm, cm)
           pbByChan[cc.chan] = pb
           pb.anyVisible = pb.anyVisible or not hidden
           -- fake pbs inherit host delay so tidyCol shifts both into intent together
-          util.add(pb.events, util.pick(cc, 'ppq ppqL shape tension frame', {
-            loc    = loc,
+          util.add(pb.events, projectCC(cc, loc, {
             val    = util.round(rawToCents(cc.val) - detune),
             detune = detune,
             hidden = hidden,
@@ -742,8 +761,8 @@ function newTrackerManager(mm, cm)
         elseif cc.msgType == 'pa' then
           local noteCol = findNoteColumnForPitch(channel, cc.pitch, cc.ppq)
           if noteCol then
-            util.add(noteCol.events, util.pick(cc, 'ppq ppqL pitch frame', {
-              type = 'pa', vel = cc.val, loc = loc,
+            util.add(noteCol.events, projectCC(cc, loc, {
+              type = 'pa', vel = cc.val, val = util.REMOVE,
             }))
           end
 
@@ -756,7 +775,7 @@ function newTrackerManager(mm, cm)
             col = channel.columns[cc.msgType] or { events = {} }
             channel.columns[cc.msgType] = col
           end
-          util.add(col.events, util.pick(cc, 'ppq ppqL val shape tension frame', { loc = loc }))
+          util.add(col.events, projectCC(cc, loc))
         end
       end
 
@@ -846,6 +865,183 @@ function newTrackerManager(mm, cm)
 
   function tm:resolution()
     return mm and mm:resolution()
+  end
+
+  function tm:name()        return mm and mm:name() end
+  function tm:setName(name) if mm then mm:setName(name) end end
+
+  -- Walk every event in the take, calling fn(type, evt, chan, isNote) once
+  -- per event. Notes/pa visit via the per-lane note columns; pb/at/pc/cc
+  -- via the lane-less columns. Operates on the column-projected event view,
+  -- so fields the projection drops (cc number, fake flag) are not visible
+  -- — callers that need raw MIDI fidelity should walk mm directly.
+  local function forEachEvent(fn)
+    for _, channel in tm:channels() do
+      local chan, cols = channel.chan, channel.columns
+      for _, col in ipairs(cols.notes) do
+        for _, evt in ipairs(col.events) do
+          local isNote = evt.type ~= 'pa'
+          fn(isNote and 'note' or 'pa', evt, chan, isNote)
+        end
+      end
+      for _, t in ipairs{'pb', 'at', 'pc'} do
+        if cols[t] then
+          for _, evt in ipairs(cols[t].events) do fn(t, evt, chan, false) end
+        end
+      end
+      for _, col in pairs(cols.ccs) do
+        for _, evt in ipairs(col.events) do fn('cc', evt, chan, false) end
+      end
+    end
+  end
+
+  -- Apply a piecewise-linear time map τ to every event in the take. τ
+  -- acts on logical positions (ppqL / endppqL); intent ppqs are
+  -- rederived through the current swing snapshot. Events without a
+  -- ppqL stamp fall back to applying τ to raw ppq — under identity
+  -- swing the two paths coincide. slopeAt(ppqL) is τ's local stretch:
+  -- note delays scale by it so the realised stretch is locally
+  -- proportional to the logical one.
+  --
+  -- Two passes (gather, then mutate) so all reads are stable. Used by
+  -- rescaleLength and (future) region-rescale variants.
+  local function applyTimeMap(tau, slopeAt)
+    local snap  = tm:swingSnapshot()
+    local plans = {}
+    forEachEvent(function(type, evt, chan, isNote)
+      local p = { type = type, evt = evt }
+      if evt.ppqL ~= nil then
+        p.newPpqL = tau(evt.ppqL)
+        p.newPpq  = util.round(snap.fromLogical(chan, p.newPpqL))
+      else
+        p.newPpq = util.round(tau(evt.ppq))
+      end
+      if isNote then
+        if evt.endppqL ~= nil then
+          p.newEndppqL = tau(evt.endppqL)
+          p.newEndppq  = util.round(snap.fromLogical(chan, p.newEndppqL))
+        else
+          p.newEndppq = util.round(tau(evt.endppq))
+        end
+        if evt.delay and evt.delay ~= 0 then
+          p.newDelay = slopeAt(evt.ppqL or evt.ppq) * evt.delay
+        end
+      end
+      util.add(plans, p)
+    end)
+    for _, p in ipairs(plans) do
+      um:assignEvent(p.type, p.evt, {
+        ppq      = p.newPpq,
+        endppq   = p.newEndppq,
+        delay    = p.newDelay,
+        ppqL     = p.newPpqL,
+        endppqL  = p.newEndppqL,
+      })
+    end
+    um:flush()
+  end
+
+  -- Resize the take to `newPpq`. On shrink, events at-or-past the boundary
+  -- are deleted; notes that span the boundary keep their onset and have
+  -- endppq clamped.
+  function tm:setLength(newPpq)
+    if not mm then return end
+    local oldPpq = mm:length() or 0
+    if newPpq < oldPpq then
+      local kills, clamps = {}, {}
+      forEachEvent(function(type, evt, _, isNote)
+        if evt.ppq >= newPpq then
+          util.add(kills, { type, evt })
+        elseif isNote and evt.endppq > newPpq then
+          util.add(clamps, evt)
+        end
+      end)
+      for _, k in ipairs(kills)    do um:deleteEvent(k[1], k[2]) end
+      for _, evt in ipairs(clamps) do um:assignEvent('note', evt, { endppq = newPpq }) end
+      um:flush()
+    end
+    if newPpq ~= oldPpq then mm:setLength(newPpq / mm:resolution()) end
+  end
+
+  -- Stretch the take to `newPpq` by linearly remapping the logical
+  -- frame: each event on logical row r ends up on row f·r where
+  -- f = newPpq/oldPpq. ppqL stamps scale by f; intent ppqs are
+  -- rederived through swing — so under non-identity swing realised
+  -- ppqs are not linearly scaled (rows are preserved instead, which
+  -- keeps reswing well-defined). Note delays scale by f. Frame stamps
+  -- (rpb, swing slot names) are untouched. No events are deleted.
+  function tm:rescaleLength(newPpq)
+    if not mm then return end
+    local oldPpq = mm:length() or 0
+    if oldPpq <= 0 or newPpq == oldPpq then
+      if newPpq ~= oldPpq then mm:setLength(newPpq / mm:resolution()) end
+      return
+    end
+    local f = newPpq / oldPpq
+    applyTimeMap(function(t) return f * t end, function() return f end)
+    mm:setLength(newPpq / mm:resolution())
+  end
+
+  -- Loop the existing pattern to fill `newPpq`. The events in [0, oldPpq)
+  -- are replicated at offsets k·oldPpq for k = 1 .. ceil(newPpq/oldPpq)-1.
+  -- Copies whose shifted ppq lands at-or-past newPpq are dropped; note
+  -- endppqs that extend past newPpq are clamped. Originals are untouched.
+  -- Shrinks fall through to setLength.
+  --
+  -- Walks mm-level events directly rather than column-projected ones:
+  -- the projection strips fields a verbatim replica needs (cc number,
+  -- pb fake flag, custom user metadata). For pbs this means the copied
+  -- stream recreates the source's pitch trajectory exactly — including
+  -- whatever carry it inherits from the end of the prior tile.
+  --
+  -- Because oldPpq sits on a swing-period boundary (take length aligns
+  -- to QN), shifting by k·oldPpq is identical in logical and realised
+  -- frames; one delta serves both ppq and ppqL paths.
+  function tm:tileLength(newPpq)
+    if not mm then return end
+    local oldPpq = mm:length() or 0
+    if oldPpq <= 0 or newPpq <= oldPpq then return self:setLength(newPpq) end
+
+    local function snapshot(iter)
+      local out = {}
+      for _, evt in iter do
+        if evt.ppq < oldPpq then
+          local c = util.clone(evt, { uuid = true })
+          util.add(out, c)
+        end
+      end
+      return out
+    end
+    local sourceNotes = snapshot(mm:notes())
+    local sourceCCs   = snapshot(mm:ccs())
+
+    mm:setLength(newPpq / mm:resolution())
+
+    local function shift(c, delta, isNote)
+      c.ppq = c.ppq + delta
+      if c.ppqL    then c.ppqL    = c.ppqL    + delta end
+      if c.ppq >= newPpq then return false end
+      if isNote then
+        c.endppq = c.endppq + delta
+        if c.endppqL then c.endppqL = c.endppqL + delta end
+        if c.endppq > newPpq then c.endppq, c.endppqL = newPpq, nil end
+      end
+      return true
+    end
+
+    mm:modify(function()
+      for k = 1, math.ceil(newPpq / oldPpq) - 1 do
+        local delta = k * oldPpq
+        for _, src in ipairs(sourceNotes) do
+          local c = util.clone(src)
+          if shift(c, delta, true) then mm:addNote(c) end
+        end
+        for _, src in ipairs(sourceCCs) do
+          local c = util.clone(src)
+          if shift(c, delta, false) then mm:addCC(c) end
+        end
+      end
+    end)
   end
 
   function tm:timeSigs()

@@ -513,6 +513,23 @@ function newViewManager(tm, cm, cmgr)
     cm:set('track', 'rowPerBeat', n)
   end
 
+  -- Apply a take-properties dialog submission. Rows are a viewManager concept;
+  -- convert here, then hand the structural change to tm.
+  -- props = { name, rows, mode = 'resize'|'rescale'|'tile' }; mode defaults to 'resize'.
+  function vm:applyTakeProperties(props)
+    if reaper.Undo_BeginBlock then reaper.Undo_BeginBlock() end
+    if props.name ~= tm:name() then tm:setName(props.name) end
+    local newPpq = props.rows * ctx:ppqPerRow()
+    if newPpq ~= (tm:length() or 0) then
+      local mode = props.mode or 'resize'
+      if     mode == 'rescale' then tm:rescaleLength(newPpq)
+      elseif mode == 'tile'    then tm:tileLength(newPpq)
+      else                          tm:setLength(newPpq)
+      end
+    end
+    if reaper.Undo_EndBlock then reaper.Undo_EndBlock('Take properties', -1) end
+  end
+
   -- Slot selections (temper, swing) are views over the data, not data
   -- themselves. Mirroring at project+track means a fresh take inherits
   -- the most recent selection, while takes on an existing track inherit
@@ -863,21 +880,42 @@ function newViewManager(tm, cm, cmgr)
     end
   end
 
-  ----- Lane-strip drag
+  ----- Lane-strip edits (drag, add, delete, shape, tension)
 
-  -- Move event i in a cc/pb/at column to (toRow, toVal). Caller passes
-  -- toRow as either an integer (snap-to-row) or a fractional row (shift-
-  -- drag, off-grid). Identity-by-index survives the post-flush rebuild
-  -- because the ppq is clamped strictly inside (prev.ppq, next.ppq) and
-  -- col.events is sorted by ppq each rebuild.
+  -- The i-th visible event in a cc/pb/at column (skips hidden absorbers),
+  -- or nil. Used by methods that target a single event by lane-strip index.
+  local function visibleAt(col, i)
+    if not col or not col.events then return end
+    local k = 0
+    for _, e in ipairs(col.events) do
+      if not e.hidden then
+        k = k + 1
+        if k == i then return e end
+      end
+    end
+  end
+
+  -- Move event i in a cc/pb/at column to (toRow, toVal). `i` indexes
+  -- the *visible* event sequence (events with `hidden` skipped), matching
+  -- what the lane strip hovers and anchors over; hidden absorber pbs
+  -- don't constrain horizontal motion. Caller passes toRow as either an
+  -- integer (snap-to-row) or a fractional row (shift-drag, off-grid).
+  -- Identity-by-visible-index survives the post-flush rebuild because
+  -- the ppq is clamped strictly inside the visible neighbours' ppqs and
+  -- the visible sequence's order is preserved across flush.
   function vm:moveLaneEvent(col, i, toRow, toVal)
     if not col or not col.events then return end
     if not util.oneOf('cc pb at', col.type) then return end
-    local evt = col.events[i]
+
+    local visible = {}
+    for _, e in ipairs(col.events) do
+      if not e.hidden then util.add(visible, e) end
+    end
+    local evt = visible[i]
     if not evt then return end
 
     local chan       = col.midiChan
-    local prev, next = col.events[i-1], col.events[i+1]
+    local prev, next = visible[i-1], visible[i+1]
     local newppq     = ctx:rowToPPQ(toRow, chan)
     local newRow     = toRow
     if prev and newppq <= prev.ppq then
@@ -900,11 +938,65 @@ function newViewManager(tm, cm, cmgr)
     tm:flush()
   end
 
+  -- Insert a new cc/pb/at event at `ppq` with value `val`, inheriting the
+  -- envelope shape of the previous *visible* event (so the existing curve
+  -- shape from prev→next is preserved across the new midpoint). Returns
+  -- the visible index of the new event after flush, for the lane-strip
+  -- to seed a drag on.
+  function vm:addLaneEvent(col, colIdx, ppq, val)
+    if not col or not util.oneOf('cc pb at', col.type) then return end
+    local chan = col.midiChan
+    local prev = util.seek(col.events, 'before', ppq,
+                           function(e) return not e.hidden end)
+    local f, logPerRow = frameAndLogPerRow(chan)
+    local row = ctx:ppqToRow(ppq, chan)
+    local update = {
+      val   = val,
+      ppq   = ppq,
+      ppqL  = row * logPerRow,
+      chan  = chan,
+      frame = f,
+      shape = prev and prev.shape or nil,
+    }
+    if col.type == 'cc' then update.cc = col.cc end
+    tm:addEvent(col.type, update)
+    tm:flush()
+
+    local newCol = grid.cols[colIdx]
+    if not newCol then return end
+    local idx = 0
+    for _, e in ipairs(newCol.events) do
+      if not e.hidden then
+        idx = idx + 1
+        if e.ppq == ppq then return idx end
+      end
+    end
+  end
+
+  -- Delete the i-th *visible* event in a cc/pb/at column.
+  function vm:deleteLaneEvent(col, i)
+    if not col or not util.oneOf('cc pb at', col.type) then return end
+    local evt = visibleAt(col, i)
+    if not evt then return end
+    tm:deleteEvent(col.type, evt)
+    tm:flush()
+  end
+
+  -- Set bezier tension on the i-th visible event. Forces shape to bezier
+  -- so the tension is honoured (REAPER ignores tension on other shapes).
+  function vm:setLaneTension(col, i, tension)
+    if not col or not util.oneOf('cc pb at', col.type) then return end
+    local A = visibleAt(col, i)
+    if not A then return end
+    tm:assignEvent(col.type, A, { tension = tension, shape = 'bezier' })
+    tm:flush()
+  end
+
   ----- Interpolation
 
   local interpolate, interpolateValues do
     local interpolable = { cc = true, pb = true, at = true }
-    local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end' }
+    local shapeCycle = { 'step', 'linear', 'slow', 'fast-start', 'fast-end', 'bezier' }
 
     local function nextShape(s)
       for i, n in ipairs(shapeCycle) do
@@ -916,6 +1008,17 @@ function newViewManager(tm, cm, cmgr)
     local function cycleShape(col, A)
       if not A then return end
       tm:assignEvent(col.type, A, { shape = nextShape(A.shape or 'step') })
+    end
+
+    -- Cycle the segment-owner's shape on the i-th visible event in a
+    -- cc/pb/at column. Segment-owner = left endpoint (REAPER convention:
+    -- A.shape governs the curve from A to next).
+    function vm:cycleLaneShape(col, i)
+      if not col or not interpolable[col.type] then return end
+      local A = visibleAt(col, i)
+      if not A then return end
+      cycleShape(col, A)
+      tm:flush()
     end
 
     function interpolate()
@@ -1742,6 +1845,7 @@ function newViewManager(tm, cm, cmgr)
   ----- Accessors for renderManager
 
   function vm:rowPerBar()      return rowPerBar end
+  function vm:takeName()       return tm:name() end
   function vm:activeTemper()   return ctx:activeTemper() end
   function vm:noteProjection(evt) return ctx:noteProjection(evt) end
   function vm:rowBeatInfo(row) return ctx:rowBeatInfo(row) end
@@ -1916,12 +2020,13 @@ function newViewManager(tm, cm, cmgr)
       note = 'Note', cc = 'CC', pb = 'PB', at = 'AT', pa = 'PA', pc = 'PC',
     }
 
-    if takeChanged then
-      resolution = tm:resolution()
-      length     = tm:length()
-      timeSigs   = tm:timeSigs()
-      ec:reset()
-    end
+    -- Length, resolution and timeSigs all change without a take swap:
+    -- length on resize (take properties), resolution under tempo changes,
+    -- timeSigs on edits to the project's tempo/time-sig markers.
+    resolution = tm:resolution()
+    length     = tm:length()
+    timeSigs   = tm:timeSigs()
+    if takeChanged then ec:reset() end
 
     do
       local rpb = cm:get('rowPerBeat')

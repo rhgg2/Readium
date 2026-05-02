@@ -146,6 +146,7 @@ function newCommandManager(cm)
       doubleRPB      = { {ImGui.Key_Equal, ImGui.Mod_Super} },
       halveRPB       = { {ImGui.Key_Minus, ImGui.Mod_Super} },
       setRPB         = { {ImGui.Key_Z, ImGui.Mod_Super} },
+      takeProperties = { {ImGui.Key_Backspace, ImGui.Mod_Ctrl} },
       matchGridToCursor = { {ImGui.Key_M, ImGui.Mod_Super} },
       hideExtraCol   = { {ImGui.Key_H, ImGui.Mod_Ctrl} },
       inputOctaveUp   = { {ImGui.Key_8, ImGui.Mod_Shift} },

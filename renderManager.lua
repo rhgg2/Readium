@@ -70,9 +70,21 @@ function newRenderManager(vm, cm, cmgr)
   -- frame (or nils it if the strip isn't showing an envelope); handleMouse
   -- reads it for hover/drag dispatch.
   local laneLayout  = nil  -- { x0, yTop, yBot, w, valSpan, valMin, valMax,
-                           --   scrollRow, rowSpan, col, colIdx, chan }
-  local laneHover   = nil  -- event index in laneLayout.col.events, or nil
-  local laneDrag    = nil  -- { colIdx, idx, shifted }
+                           --   scrollRow, rowSpan, col, colIdx, chan, events }
+  local laneHover   = nil  -- visible event index in laneLayout.events, or nil
+  local laneSegHover = nil -- segment-owner visible idx (left endpoint of hovered segment), or nil
+  -- Sticky segment hover: after a dbl-click cycles a shape, the new
+  -- curve-y at the click x usually moves >6 px from the cursor, so
+  -- geometric segHover would drop on the very next frame. Pinning
+  -- holds the highlight (and the dbl-click target) until the mouse
+  -- actually moves, so further dbl-clicks keep cycling in place.
+  local laneSegPin  = nil  -- { segI, mx, my, colIdx } or nil
+  local lanePreview = nil  -- { colIdx, row, ppq, val } — phantom anchor for click-to-insert
+  local laneDrag    = nil  -- { kind='move'|'tension', colIdx, idx, startMx, startMy, moved, ... }
+  -- After delete-by-double-click, suppress the insert-preview blob until
+  -- the mouse leaves the click position — otherwise it pops up instantly
+  -- where the user just removed an anchor.
+  local lanePreviewSuppress = nil  -- { x, y } or nil
 
   ----- Cell renderers
 
@@ -436,6 +448,34 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.PopStyleVar(ctx, 1)
   end
 
+  -- Window-shell additions on top of pushChromeStyles. Used by floating
+  -- chrome surfaces (swing editor, modals) that need to read as siblings
+  -- of the toolbar over the parchment grid: hairline window border, an
+  -- opaque parchment fill on the window/title/popup backgrounds, and a
+  -- separator that matches the chrome border.
+  --
+  -- Surfaces use editor.bg (opaque pale) — toolbar.bg is authored at
+  -- 0.5 alpha and would bleed the grid through. Col_PopupBg is
+  -- overridden so BeginPopupModal (which uses PopupBg, not WindowBg)
+  -- gets the same parchment as a regular Begin window. Caller pairs
+  -- with popChromeWindow().
+  local function pushChromeWindow()
+    pushChromeStyles()
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowBorderSize, 1)
+    ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg,         colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_PopupBg,          colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBg,          colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgActive,    colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgCollapsed, colour('editor.bg'))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Separator,        colour('toolbar.buttonBorder'))
+  end
+
+  local function popChromeWindow()
+    ImGui.PopStyleColor(ctx, 6)
+    ImGui.PopStyleVar(ctx, 1)
+    popChromeStyles()
+  end
+
   local function drawToolbar()
     pickerActive = false
     local rowPerBeat = cm:get('rowPerBeat')
@@ -597,13 +637,18 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
 
-    laneLayout = nil
-    laneHover  = nil
+    laneLayout   = nil
+    laneHover    = nil
+    laneSegHover = nil
+    lanePreview  = nil
     local colIdx = vm:ec():col()
     local col    = vm.grid.cols[colIdx]
-    if w > 0 and col and laneRenderable[col.type] and #col.events > 0 then
+    if w > 0 and col and laneRenderable[col.type] then
       local chan   = col.midiChan
-      local events = col.events
+      local events = {}
+      for _, evt in ipairs(col.events) do
+        if not evt.hidden then util.add(events, evt) end
+      end
       local n      = #events
 
       local valMin, valMax
@@ -636,14 +681,16 @@ function newRenderManager(vm, cm, cmgr)
       -- exact), and compute a fractional ppq by lerping inside the segment
       -- only at sample time — vm:rowToPPQ rounds to integer ppq, which
       -- would plateau the curve when many pixels share an integer ppq.
+      -- segIdx is bidirectional: the polyline pass advances it forward,
+      -- but the insert-preview lookup later may jump backward.
       local rowOf = {}
       for i = 1, n do rowOf[i] = vm:ppqToRow(events[i].ppq, chan) end
 
       local segIdx = 1
       local function evalAtRow(row)
-        while segIdx < n and rowOf[segIdx + 1] <= row do
-          segIdx = segIdx + 1
-        end
+        if n == 0 then return 0 end
+        while segIdx < n and rowOf[segIdx + 1] <= row do segIdx = segIdx + 1 end
+        while segIdx > 1 and rowOf[segIdx]     >  row do segIdx = segIdx - 1 end
         local A, B = events[segIdx], events[segIdx + 1]
         if not B or row < rowOf[segIdx] then return A.val end
         local rA, rB = rowOf[segIdx], rowOf[segIdx + 1]
@@ -652,41 +699,138 @@ function newRenderManager(vm, cm, cmgr)
         return vm:sampleCurve(A, B, fracP) or A.val
       end
 
-      local pts     = {}
-      local pxLeft  = math.floor(x0)
-      local pxRight = math.ceil(x0 + w)
-      for px = pxLeft, pxRight do
-        local row = scrollRow + (px - x0) / w * rowSpan
-        pts[#pts + 1] = px
-        pts[#pts + 1] = valToY(evalAtRow(row))
-      end
+      if n > 0 then
+        local pts     = {}
+        local pxLeft  = math.floor(x0)
+        local pxRight = math.ceil(x0 + w)
+        for px = pxLeft, pxRight do
+          local row = scrollRow + (px - x0) / w * rowSpan
+          pts[#pts + 1] = px
+          pts[#pts + 1] = valToY(evalAtRow(row))
+        end
 
-      ImGui.DrawList_AddPolyline(drawList, reaper.new_array(pts), envCol, 0, 1.5)
+        ImGui.DrawList_AddPolyline(drawList, reaper.new_array(pts), envCol, 0, 1.5)
 
-      -- Anchor positions, then hover hit-test, then draw with the active
-      -- index promoted to bigger+red. Drag wins over hover for active-ness.
-      local ax, ay = {}, {}
-      for i = 1, n do
-        ax[i], ay[i] = ppqToX(events[i].ppq), valToY(events[i].val)
-      end
-
-      if not laneDrag then
-        local mx, my = ImGui.GetMousePos(ctx)
-        local best2  = 36   -- 6px squared
+        -- Anchor positions, then hover hit-test, then draw with the active
+        -- index promoted to bigger+red. Drag wins over hover for active-ness.
+        local ax, ay = {}, {}
         for i = 1, n do
-          local dx, dy = mx - ax[i], my - ay[i]
-          local d2 = dx*dx + dy*dy
-          if d2 < best2 then best2, laneHover = d2, i end
+          ax[i], ay[i] = ppqToX(events[i].ppq), valToY(events[i].val)
+        end
+
+        if not laneDrag then
+          local mx, my = ImGui.GetMousePos(ctx)
+          local best2  = 36   -- 6px squared
+          for i = 1, n do
+            local dx, dy = mx - ax[i], my - ay[i]
+            local d2 = dx*dx + dy*dy
+            if d2 < best2 then best2, laneHover = d2, i end
+          end
+        end
+
+        -- Three sizes: passive 2.5, move-drag-or-hover 4.5, insert-preview
+        -- 3.5 (drawn separately below). Tension drag deliberately doesn't
+        -- promote its endpoint — the segment polyline below carries the
+        -- "this is what you're editing" signal instead.
+        local activeIdx = (laneDrag and laneDrag.kind == 'move'
+                           and laneDrag.colIdx == colIdx and laneDrag.idx)
+                       or laneHover
+        for i = 1, n do
+          if i == activeIdx then
+            ImGui.DrawList_AddCircleFilled(drawList, ax[i], ay[i], 4.5, anchorActiveCol)
+          else
+            ImGui.DrawList_AddCircleFilled(drawList, ax[i], ay[i], 2.5, anchorCol)
+          end
         end
       end
 
-      local activeIdx = (laneDrag and laneDrag.colIdx == colIdx and laneDrag.idx) or laneHover
-      for i = 1, n do
-        if i == activeIdx then
-          ImGui.DrawList_AddCircleFilled(drawList, ax[i], ay[i], 4.5, anchorActiveCol)
-        else
-          ImGui.DrawList_AddCircleFilled(drawList, ax[i], ay[i], 2.5, anchorCol)
+      -- Restroke segment segI in the active colour. evalAtRow is
+      -- bidirectional (segIdx ratchets both ways), so resampling over
+      -- [pxA, pxB] is safe regardless of where it was last left.
+      local function drawSegHighlight(segI)
+        local pxA = math.floor(rowToX(rowOf[segI]))
+        local pxB = math.ceil(rowToX(rowOf[segI + 1]))
+        local hpts = {}
+        for px = pxA, pxB do
+          local row = scrollRow + (px - x0) / w * rowSpan
+          hpts[#hpts + 1] = px
+          hpts[#hpts + 1] = valToY(evalAtRow(row))
         end
+        ImGui.DrawList_AddPolyline(drawList, reaper.new_array(hpts),
+                                   anchorActiveCol, 0, 2.5)
+      end
+
+      -- Curve-region affordances. Three mutually exclusive states when
+      -- the mouse is over the strip and not on an anchor:
+      --   * near a row gridline AND near the curve at the snapped row
+      --     → insert-preview (phantom anchor; click to add a new event)
+      --   * not near a row line, near the curve at exact mouseRow,
+      --     between two visible events → segment hover (double-click
+      --     cycles shape, click-drag tensions a bezier segment)
+      --   * neither → nothing
+      if not laneDrag and not laneHover then
+        local mx, my  = ImGui.GetMousePos(ctx)
+        local suppressed = lanePreviewSuppress
+                           and math.abs(mx - lanePreviewSuppress.x) < 1
+                           and math.abs(my - lanePreviewSuppress.y) < 1
+        if not suppressed and ImGui.IsWindowHovered(ctx) then
+          lanePreviewSuppress = nil
+          local mouseRow = scrollRow + (mx - x0) / w * rowSpan
+          if mouseRow >= scrollRow and mouseRow < scrollRow + rowSpan then
+            local snapped     = util.round(mouseRow)
+            local snappedX    = rowToX(snapped)
+            local nearRowLine = math.abs(mx - snappedX) <= 6
+
+            if nearRowLine then
+              local val = util.clamp(util.round(evalAtRow(snapped)), valMin, valMax)
+              local py  = valToY(val)
+              if math.abs(my - py) <= 6 then
+                local occupied = false
+                for i = 1, n do
+                  if util.round(rowOf[i]) == snapped then occupied = true; break end
+                end
+                if not occupied then
+                  ImGui.DrawList_AddCircleFilled(drawList, snappedX, py, 3.5, anchorActiveCol)
+                  lanePreview = {
+                    colIdx = colIdx, row = snapped,
+                    ppq    = vm:rowToPPQ(snapped, chan), val = val,
+                  }
+                end
+              end
+            elseif n >= 2 then
+              local curveY = valToY(evalAtRow(mouseRow))
+              if math.abs(my - curveY) <= 6 then
+                for i = 1, n - 1 do
+                  if mouseRow >= rowOf[i] and mouseRow < rowOf[i + 1] then
+                    laneSegHover = i; break
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      -- Pin fallback: if geometric hover didn't claim a segment but the
+      -- mouse hasn't moved since the last cycle, keep the pinned segment
+      -- highlighted (so further dbl-clicks land on the same target).
+      if not laneSegHover and laneSegPin and laneSegPin.colIdx == colIdx
+         and laneSegPin.segI < n then
+        local mx, my = ImGui.GetMousePos(ctx)
+        if math.abs(mx - laneSegPin.mx) < 1 and math.abs(my - laneSegPin.my) < 1 then
+          laneSegHover = laneSegPin.segI
+        else
+          laneSegPin = nil
+        end
+      end
+
+      -- Segment highlight: hover (geometric or pinned) and tension drag
+      -- both want it. Tension drag wins if both apply.
+      local activeSeg = (laneDrag and laneDrag.kind == 'tension'
+                         and laneDrag.colIdx == colIdx and laneDrag.idx)
+                     or laneSegHover
+      if activeSeg and activeSeg < n then
+        drawSegHighlight(activeSeg)
       end
 
       ImGui.DrawList_PopClipRect(drawList)
@@ -696,6 +840,8 @@ function newRenderManager(vm, cm, cmgr)
         valSpan = valSpan, valMin  = valMin,  valMax  = valMax,
         scrollRow = scrollRow, rowSpan = rowSpan,
         col     = col,     colIdx  = colIdx,  chan    = chan,
+        events  = events,  -- visible sequence; hover/drag/clamp index into this
+        ppqToX  = ppqToX,  valToY  = valToY,  -- projections, for handleLaneStrip
       }
     end
 
@@ -953,48 +1099,173 @@ function newRenderManager(vm, cm, cmgr)
   -- as mouseRow does. This keeps off-grid events from jittering to the
   -- nearest integer row on every twitch, and gracefully degrades to
   -- "no move" when an off-grid event is sandwiched between off-grid
-  -- neighbours with no integer row between them. Identity-by-index is
+  -- neighbours with no integer row between them.
+  --
+  -- laneDrag.idx indexes laneLayout.events — the *visible* sequence built
+  -- in drawLaneStrip. Hidden absorber pbs are below the realisation line
+  -- and don't restrict horizontal motion; identity-by-visible-index is
   -- enforced by vm:moveLaneEvent's ppq clamp.
   local function handleLaneStrip()
-    local clicked = ImGui.IsMouseClicked(ctx, 0)
-    local held    = ImGui.IsMouseDown(ctx, 0)
+    local clicked       = ImGui.IsMouseClicked(ctx, 0)
+    local doubleClicked = ImGui.IsMouseDoubleClicked(ctx, 0)
+    local held          = ImGui.IsMouseDown(ctx, 0)
 
     if laneDrag and not held then
       laneDrag, dragging = nil, false
       return false
     end
 
-    if not laneDrag and clicked and laneHover and laneLayout
+    -- Double-click on an existing anchor deletes it. Checked before the
+    -- drag-start branch so the second press of the pair doesn't seed a
+    -- spurious drag on a now-deleted index. Suppress the insert-preview
+    -- blob until the mouse leaves the click position.
+    if doubleClicked and laneHover and laneLayout
        and ImGui.IsWindowHovered(ctx) then
-      local mx = ImGui.GetMousePos(ctx)
+      vm:deleteLaneEvent(laneLayout.col, laneHover)
+      laneHover = nil
+      local mx, my = ImGui.GetMousePos(ctx)
+      lanePreviewSuppress = { x = mx, y = my }
+      return true
+    end
+
+    -- startMx/startMy gate the held branch: no edits until mouse moves a
+    -- pixel, so a click that doesn't drag preserves the existing val
+    -- (or the interpolated val for a fresh insert).
+    local function seedDragBase(kind, colIdx, idx)
+      local mx, my = ImGui.GetMousePos(ctx)
       laneDrag = {
-        colIdx        = laneLayout.colIdx,
-        idx           = laneHover,
-        startMouseRow = laneLayout.scrollRow + (mx - laneLayout.x0)
-                                              / laneLayout.w * laneLayout.rowSpan,
+        kind    = kind,
+        colIdx  = colIdx,
+        idx     = idx,
+        startMx = mx,
+        startMy = my,
+        moved   = false,
       }
       -- Pin window position for the duration of the drag (same shimmy
       -- as the tracker-grid drag — without it ImGui repositions the
       -- window when the mouse clips offscreen).
       dragging = true
       dragWinX, dragWinY = ImGui.GetWindowPos(ctx)
+      return mx, my
+    end
+
+    local function seedMoveDrag(colIdx, idx)
+      local mx = seedDragBase('move', colIdx, idx)
+      laneDrag.startMouseRow = laneLayout.scrollRow + (mx - laneLayout.x0)
+                                              / laneLayout.w * laneLayout.rowSpan
+    end
+
+    -- Tension drag: capture chord endpoints in screen space at click
+    -- time. The drag axis is the perpendicular to that chord; mouse
+    -- delta projected onto it scales tension. Seg-owner shape is
+    -- forced to bezier the moment vm:setLaneTension fires.
+    local function seedTensionDrag(colIdx, segI, A, B)
+      seedDragBase('tension', colIdx, segI)
+      laneDrag.startTension = A.tension or 0
+      laneDrag.ax, laneDrag.ay = laneLayout.ppqToX(A.ppq), laneLayout.valToY(A.val)
+      laneDrag.bx, laneDrag.by = laneLayout.ppqToX(B.ppq), laneLayout.valToY(B.val)
+    end
+
+    -- Double-click on a segment cycles its shape (segment-owner = left
+    -- endpoint; REAPER convention: A.shape governs the curve A→next).
+    if doubleClicked and laneSegHover and laneLayout
+       and ImGui.IsWindowHovered(ctx) then
+      vm:cycleLaneShape(laneLayout.col, laneSegHover)
+      local mx, my = ImGui.GetMousePos(ctx)
+      laneSegPin = { segI = laneSegHover, mx = mx, my = my, colIdx = laneLayout.colIdx }
+      return true
+    end
+
+    if not laneDrag and clicked and laneHover and laneLayout
+       and ImGui.IsWindowHovered(ctx) then
+      seedMoveDrag(laneLayout.colIdx, laneHover)
+      return true
+    end
+
+    -- Click-to-insert: phantom-anchor preview was published this frame;
+    -- add the event, then start dragging the new visible index.
+    if not laneDrag and clicked and not laneHover and lanePreview and laneLayout
+       and ImGui.IsWindowHovered(ctx) then
+      local idx = vm:addLaneEvent(
+        vm.grid.cols[lanePreview.colIdx], lanePreview.colIdx,
+        lanePreview.ppq, lanePreview.val
+      )
+      if idx then
+        seedMoveDrag(lanePreview.colIdx, idx)
+        return true
+      end
+    end
+
+    -- Click on a segment: bezier → tension drag; other shapes → seed an
+    -- inert drag. The inert drag does no edits but still pins the window
+    -- (via dragging=true), so dragging the mouse off a non-bezier
+    -- segment doesn't trigger ImGui's "click-empty-area-to-move-window".
+    if not laneDrag and clicked and laneSegHover and laneLayout
+       and ImGui.IsWindowHovered(ctx) then
+      local A = laneLayout.events[laneSegHover]
+      local B = laneLayout.events[laneSegHover + 1]
+      if A and B and A.shape == 'bezier' then
+        seedTensionDrag(laneLayout.colIdx, laneSegHover, A, B)
+      else
+        seedDragBase('inert', laneLayout.colIdx, laneSegHover)
+      end
       return true
     end
 
     if not (laneDrag and held and laneLayout) then return false end
 
-    local L   = laneLayout
-    local col = vm.grid.cols[laneDrag.colIdx]
-    if not (col and laneRenderable[col.type] and col.events[laneDrag.idx]) then
+    -- Inert drag: just absorb motion until release; window stays pinned.
+    if laneDrag.kind == 'inert' then return true end
+
+    local L      = laneLayout
+    local col    = vm.grid.cols[laneDrag.colIdx]
+    local events = L.events
+    if not (col and laneRenderable[col.type] and events and events[laneDrag.idx]) then
       laneDrag, dragging = nil, false
       return true
     end
 
     local mx, my   = ImGui.GetMousePos(ctx)
+
+    -- Movement gate: a click that doesn't drag must not change the event.
+    -- Without this, the held branch would write toVal from mouseY on
+    -- frame 1, overwriting the click-time val (interpolated for inserts,
+    -- unchanged for an existing-anchor click). Once the mouse has moved
+    -- a single pixel, drag is "live" for the rest of this gesture.
+    if not laneDrag.moved then
+      if math.abs(mx - laneDrag.startMx) < 1
+         and math.abs(my - laneDrag.startMy) < 1 then
+        return true
+      end
+      laneDrag.moved = true
+    end
+
+    -- Tension drag: project mouse delta onto the chord-perpendicular
+    -- captured at click time. valSpan magnitude → half the strip's
+    -- height of perpendicular drag = full tension swing.
+    if laneDrag.kind == 'tension' then
+      local cdx, cdy = laneDrag.bx - laneDrag.ax, laneDrag.by - laneDrag.ay
+      local cLen     = math.sqrt(cdx * cdx + cdy * cdy)
+      if cLen >= 1 then
+        -- Perp oriented so its y-component points toward A's screen y:
+        -- bezier tension is asymmetric in val (τ > 0 dwells near A), so
+        -- "drag toward A = increase τ" only holds uniformly across both
+        -- gradient signs after this flip. Without the flip, neg-gradient
+        -- chords get an inverted tension response.
+        local s         = (laneDrag.ay >= laneDrag.by) and 1 or -1
+        local nx, ny    = s * cdy / cLen, -s * cdx / cLen
+        local perpDist  = (mx - laneDrag.startMx) * nx + (my - laneDrag.startMy) * ny
+        local tension   = util.clamp(
+          laneDrag.startTension - 2 * perpDist / L.valSpan, -1, 1)
+        vm:setLaneTension(col, laneDrag.idx, tension)
+      end
+      return true
+    end
+
     local shifted  = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
     local mouseRow = L.scrollRow + (mx - L.x0) / L.w * L.rowSpan
     local i        = laneDrag.idx
-    local currRow  = vm:ppqToRow(col.events[i].ppq, L.chan)
+    local currRow  = vm:ppqToRow(events[i].ppq, L.chan)
     local startRow = laneDrag.startMouseRow
 
     -- Direction is mouse-vs-start (not mouse-vs-event): clicking inside
@@ -1010,14 +1281,14 @@ function newRenderManager(vm, cm, cmgr)
     else
       local target = util.round(mouseRow)
       if mouseRow > startRow and target > currRow then
-        if i < #col.events then
-          local nextRow = vm:ppqToRow(col.events[i+1].ppq, L.chan)
+        if i < #events then
+          local nextRow = vm:ppqToRow(events[i+1].ppq, L.chan)
           target = math.min(target, math.ceil(nextRow) - 1)
         end
         if target > currRow then toRow = target end
       elseif mouseRow < startRow and target < currRow then
         if i > 1 then
-          local prevRow = vm:ppqToRow(col.events[i-1].ppq, L.chan)
+          local prevRow = vm:ppqToRow(events[i-1].ppq, L.chan)
           target = math.max(target, math.floor(prevRow) + 1)
         end
         if target < currRow then toRow = target end
@@ -1148,6 +1419,15 @@ function newRenderManager(vm, cm, cmgr)
     end
   end
 
+  -- A keymap entry is either a bare key constant or a {key, mod, mod...}
+  -- chord. Returns (keyCode, modMask).
+  local function keySpec(spec)
+    if type(spec) ~= 'table' then return spec, ImGui.Mod_None end
+    local mods = ImGui.Mod_None
+    for i = 2, #spec do mods = mods | spec[i] end
+    return spec[1], mods
+  end
+
   local function handleKeys()
     if modalState or pickerActive then return end -- popup owns input
 
@@ -1167,14 +1447,8 @@ function newRenderManager(vm, cm, cmgr)
     local commandHeld = false
     if trackerFocused or fwdCommands then
       for command, keys in pairs(cmgr.keymap) do
-        for _, key in ipairs(keys) do
-          local mods = ImGui.Mod_None
-          if type(key) == 'table' then
-            for i = 2, #key do
-              mods = mods | key[i]
-            end
-            key = key[1]
-          end
+        for _, spec in ipairs(keys) do
+          local key, mods = keySpec(spec)
           if ImGui.IsKeyDown(ctx, key) and mods == ImGui.Mod_None then commandHeld = true end
           if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then
             if cmgr.commands[command]() == false then
@@ -1191,17 +1465,23 @@ function newRenderManager(vm, cm, cmgr)
       -- Gate the char queue on commandHeld: IsKeyPressed and the char queue
       -- don't share auto-repeat timing, so a held command key would leak.
       if not commandHeld and ImGui.GetKeyMods(ctx) == ImGui.Mod_None then
-        local col = grid.cols[cursorCol]
-        if col then
-          local rv, char = ImGui.GetInputQueueCharacter(ctx, 0)
-          if rv then
-            if ec:isSticky() then
-              ec:selClear()
-            else
-              local evt = col.cells and col.cells[cursorRow]
-              vm:editEvent(col, evt, cursorStop, char)
-            end
+        -- Drain the queue: ImGui buffers all chars typed within a frame, so
+        -- reading only index 0 drops the rest under fast typing / rollover.
+        -- Re-fetch grid + cursor each step: editEvent flushes and may rebuild.
+        local i = 0
+        while true do
+          local rv, char = ImGui.GetInputQueueCharacter(ctx, i)
+          if not rv then break end
+          if ec:isSticky() then
+            ec:selClear()
+            break
           end
+          local row, colIdx, stop = ec:pos()
+          local c = vm.grid.cols[colIdx]
+          if c then
+            vm:editEvent(c, c.cells and c.cells[row], stop, char)
+          end
+          i = i + 1
         end
       end
 
@@ -1224,21 +1504,32 @@ function newRenderManager(vm, cm, cmgr)
 
   local function drawModal()
     if not modalState then return end
+    -- Self-heal: if modalState was set from inside a callback (e.g. takeProps OK
+    -- → openConfirm) the OpenPopup queued there can be cancelled by the
+    -- enclosing CloseCurrentPopup. Re-open here at the top level.
+    if not ImGui.IsPopupOpen(ctx, modalState.title) then
+      ImGui.OpenPopup(ctx, modalState.title)
+    end
     local center_x, center_y = ImGui.Viewport_GetCenter(ImGui.GetWindowViewport(ctx))
     ImGui.SetNextWindowPos(ctx, center_x, center_y, ImGui.Cond_Appearing, 0.5, 0.5)
 
+    pushChromeWindow()
     if ImGui.BeginPopupModal(ctx, modalState.title, true, ImGui.WindowFlags_AlwaysAutoResize) then
       ImGui.Text(ctx, modalState.prompt)
 
       local function close(invoke, ...)
-        if invoke then
-          local ok, err = pcall(modalState.callback, ...)
+        -- Capture and clear before invoking: the callback may open a follow-up
+        -- modal (e.g. takeProps → confirm-on-shrink) by setting modalState
+        -- itself, and we mustn't nil that out from under it.
+        local cb = modalState.callback
+        modalState = nil
+        ImGui.CloseCurrentPopup(ctx)
+        if invoke and cb then
+          local ok, err = pcall(cb, ...)
           if not ok then
             reaper.ShowConsoleMsg('\nModal callback error: ' .. tostring(err) .. '\n')
           end
         end
-        modalState = nil
-        ImGui.CloseCurrentPopup(ctx)
       end
 
       if modalState.kind == 'confirm' then
@@ -1247,6 +1538,61 @@ function newRenderManager(vm, cm, cmgr)
         elseif ImGui.IsKeyPressed(ctx, ImGui.Key_N) or ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
           close(true, false)
         end
+      elseif modalState.kind == 'takeProps' then
+        -- Mutating rowsBuf externally is invisible to an active InputText,
+        -- which caches its own buffer. Bumping rowsGen changes the widget's
+        -- PushID identity and forces it to re-initialise from rowsBuf;
+        -- refocusRows then puts the cursor back so the user can keep typing.
+        -- Both chord and button paths share this so the InputText stays
+        -- in sync regardless of which one fired.
+        local function scaleBy(factor)
+          local n = tonumber(modalState.rowsBuf)
+          if not n then return end
+          modalState.rowsBuf     = tostring(math.max(1, math.floor(n * factor)))
+          modalState.rowsGen     = modalState.rowsGen + 1
+          modalState.refocusRows = true
+        end
+        local function pressedAny(specs)
+          if not specs then return false end
+          for _, spec in ipairs(specs) do
+            local key, mods = keySpec(spec)
+            if ImGui.IsKeyPressed(ctx, key) and ImGui.GetKeyMods(ctx) == mods then return true end
+          end
+          return false
+        end
+
+        if     pressedAny(cmgr.keymap.doubleRPB) then scaleBy(2)
+        elseif pressedAny(cmgr.keymap.halveRPB)  then scaleBy(0.5) end
+
+        ImGui.Text(ctx, 'Item name')
+        local rvN, name = ImGui.InputText(ctx, '##takeprops_name', modalState.nameBuf)
+        if rvN then modalState.nameBuf = name end
+
+        ImGui.Text(ctx, 'Length (rows)')
+        if ImGui.IsWindowAppearing(ctx) or modalState.refocusRows then
+          ImGui.SetKeyboardFocusHere(ctx)
+          modalState.refocusRows = nil
+        end
+        ImGui.PushID(ctx, modalState.rowsGen)
+        local rvR, rows = ImGui.InputText(ctx, '##takeprops_rows', modalState.rowsBuf)
+        ImGui.PopID(ctx)
+        if rvR then modalState.rowsBuf = rows end
+        ImGui.SameLine(ctx); if ImGui.Button(ctx, '\xc3\x97' .. '2') then scaleBy(2)   end  -- ×2
+        ImGui.SameLine(ctx); if ImGui.Button(ctx, '\xc3\xb7' .. '2') then scaleBy(0.5) end  -- ÷2
+
+        for i, m in ipairs{ {'resize', 'Resize'}, {'rescale', 'Rescale'}, {'tile', 'Tile'} } do
+          if i > 1 then ImGui.SameLine(ctx) end
+          if ImGui.RadioButton(ctx, m[2], modalState.mode == m[1]) then modalState.mode = m[1] end
+        end
+
+        local okPressed     = ImGui.Button(ctx, 'OK')
+                           or ImGui.IsKeyPressed(ctx, ImGui.Key_Enter)
+                           or ImGui.IsKeyPressed(ctx, ImGui.Key_KeypadEnter)
+        ImGui.SameLine(ctx)
+        local cancelPressed = ImGui.Button(ctx, 'Cancel')
+                           or ImGui.IsKeyPressed(ctx, ImGui.Key_Escape)
+        if     okPressed     then close(true, modalState.nameBuf, tonumber(modalState.rowsBuf), modalState.mode)
+        elseif cancelPressed then close(false) end
       else
         if ImGui.IsWindowAppearing(ctx) then
           ImGui.SetKeyboardFocusHere(ctx)
@@ -1265,6 +1611,7 @@ function newRenderManager(vm, cm, cmgr)
     else
       modalState = nil
     end
+    popChromeWindow()
   end
 
   ----- Modal-driven commands
@@ -1274,10 +1621,10 @@ function newRenderManager(vm, cm, cmgr)
     ImGui.OpenPopup(ctx, title)
   end
 
-  local function openConfirm(title, callback)
+  local function openConfirm(title, callback, prompt)
     modalState = {
       title    = title,
-      prompt   = 'No selection — ' .. title .. ' whole take? (y/n)',
+      prompt   = prompt or ('No selection — ' .. title .. ' whole take? (y/n)'),
       kind     = 'confirm',
       callback = callback,
       buf      = '',
@@ -1300,6 +1647,34 @@ function newRenderManager(vm, cm, cmgr)
       openPrompt('Rows per beat', '1-32', function(buf)
         local n = tonumber(buf); if n then vm:setRowPerBeat(n) end
       end)
+    end,
+
+    takeProperties = function()
+      local origRows = vm.grid.numRows or 0
+      local title    = 'Take properties'
+      modalState = {
+        kind     = 'takeProps',
+        title    = title,
+        nameBuf  = vm:takeName() or '',
+        rowsBuf  = tostring(origRows),
+        rowsGen  = 0,
+        mode     = 'resize',
+        callback = function(name, rows, mode)
+          if not rows or rows < 1 then return end
+          rows = math.floor(rows)
+          local apply = function() vm:applyTakeProperties{ name = name, rows = rows, mode = mode } end
+          -- rescale is the monotone stretch — never deletes events.
+          -- resize and tile both fall back to truncation when shrinking.
+          if rows < origRows and mode ~= 'rescale' then
+            openConfirm('Truncate take', function(yes) if yes then apply() end end,
+              ('Truncate to %d rows? Events past row %d will be deleted. (y/n)')
+              :format(rows, rows))
+          else
+            apply()
+          end
+        end,
+      }
+      ImGui.OpenPopup(ctx, title)
     end,
 
     addTypedCol = function()
@@ -1640,21 +2015,9 @@ function newRenderManager(vm, cm, cmgr)
       swingEditor.lastCount = n
     end
 
-    -- Match the toolbar's chrome family, then add window-shape styling
-    -- (border, title bar, window bg, separator) so the editor reads as a
-    -- sibling of the toolbar rather than a default-grey ImGui panel
-    -- floating over the parchment grid. Surfaces use editor.bg (opaque
-    -- pale) — toolbar.bg is authored at 0.5 alpha, which would bleed the
-    -- grid through a floating window.
-    pushChromeStyles()
-    ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowBorderSize, 1)
-    ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg,         colour('editor.bg'))
-    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBg,          colour('editor.bg'))
-    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgActive,    colour('editor.bg'))
-    ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgCollapsed, colour('editor.bg'))
-    ImGui.PushStyleColor(ctx, ImGui.Col_Separator,        colour('toolbar.buttonBorder'))
+    pushChromeWindow()
     local visible, open = ImGui.Begin(ctx, 'Swing', true,
-      ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_NoDocking)
+      ImGui.WindowFlags_NoDecoration | ImGui.WindowFlags_NoDocking)
     if not open then swingEditor = nil end
 
     if visible and swingEditor then
@@ -1762,9 +2125,7 @@ function newRenderManager(vm, cm, cmgr)
       end
     end
     ImGui.End(ctx)
-    ImGui.PopStyleColor(ctx, 5)
-    ImGui.PopStyleVar(ctx, 1)
-    popChromeStyles()
+    popChromeWindow()
   end
 
   ---------- PUBLIC

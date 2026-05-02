@@ -1,0 +1,1097 @@
+desc:Readium Sampler
+tags: sampler tracker readium
+version: 0.01
+author: Readium
+license: MIT
+about:
+  Sample player driven by the Readium tracker.
+  - Sample selected per channel by Program Change.
+  - Note On: pitch on msg2, velocity on msg3 (real velocity).
+  - CC 7  = channel volume.
+  - CC 10 = channel pan.
+  - 32-voice global pool, hard-steal at saturation.
+
+options:gmem=Readium_sampler
+options:want_all_kb
+options:no_meter
+options:maxmem=64000000
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+slider1:interpolation=2<0,3,1{Draft,Low,Medium,High}>Resampling quality
+slider2:fade_in_slider=8<0,16,1{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536}>Fade in (samples)
+slider3:fade_out_slider=8<0,16,1{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536}>Fade out (samples)
+
+import rs_resampler.jsfx-inc
+
+@init
+// ============================================================
+// Constants
+// ============================================================
+N_SAMPLES        = 64;
+N_VOICES         = 32;
+N_CHANNELS       = 16;
+
+SAMPLE_HEADER_SIZE   = 16;
+SAMPLE_BUFFER_FRAMES = 480000;     // ≈ 5 s stereo @ 96 k or 11 s mono @ 44.1 k
+SAMPLE_SLOT_SIZE     = SAMPLE_HEADER_SIZE + SAMPLE_BUFFER_FRAMES;
+
+// Upper bound on sinc-table footprint across all interpolation modes.
+// High mode is the largest (1+2*128*256 + 1+2*64*256 + 12*(1+2*32*256) ≈ 295 K).
+// Reserved upfront so @slider rebuilds never grow into the sample heap.
+SINC_RESERVE     = 300000;
+
+PARAMS_STRIDE    = 128;            // per-sample params (filter, env, lfo, …)
+// JSFX caps user string slots at 1023, so name slots and the rename backup
+// must live in the low range. DROP_PATH_STR=14 (defined in @gfx) is the only
+// other reserved slot; 15..31 is scratch space, 32..(32+N_SAMPLES-1) holds
+// names. Matches Hackey_Sample_Playback's SAMPLE_NAMES=32 convention.
+NAME_BASE         = 32;            // string-pool base for sample names (one per slot)
+RENAME_BACKUP_STR = 15;            // string slot holding pre-edit name for revert-on-Esc
+THUMB_W           = 100;           // waveform thumbnail width (px columns), min/max packed
+
+// Sample header field offsets
+SH_LENGTH     = 0;   SH_FS         = 1;   SH_BASENOTE = 2;
+SH_LOOP_START = 3;   SH_LOOP_STOP  = 4;   SH_LOOP_TYPE = 5;
+SH_START      = 6;   SH_END        = 7;
+// 8..15 reserved
+
+// Voice struct field offsets (all live in a flat 128-float block per voice)
+VOICE_FIELDS    = 128;
+V_STATE          = 0;
+V_CHANNEL        = 1;
+V_NOTE           = 2;
+V_SAMPLE_IDX     = 3;
+V_VEL            = 4;
+V_POSITION       = 5;
+V_SPEED          = 6;
+V_FADE_POSITION  = 7;
+V_FADE_LEVEL     = 8;
+V_CLEFT          = 9;
+V_CRIGHT         = 10;
+V_START_PTR      = 11;
+V_STOP_POSITION  = 12;
+V_FADE_START     = 13;
+V_LOOP_START     = 14;
+V_LOOP_STOP      = 15;
+V_LOOP_TYPE      = 16;
+V_NEXT           = 17;
+V_PREV           = 18;
+V_OUTL           = 19;
+V_OUTR           = 20;
+V_SINC_TABLE     = 21;
+V_TABLE_LEN      = 22;
+V_AT_BASE_RATE   = 23;
+V_FIR_L_BASE     = 32;             // 37 floats
+V_FIR_R_BASE     = 80;             // 37 floats; both well within 128
+
+VS_FREE       = 0;
+VS_PLAYING    = 1;
+VS_FADING_OUT = 2;
+
+// Channel struct
+CHAN_FIELDS       = 8;
+C_CURRENT_SAMPLE  = 0;
+C_VOL             = 1;
+C_PAN             = 2;
+C_LPAN            = 3;
+C_RPAN            = 4;
+PREVIEW_CHAN      = N_CHANNELS;   // dedicated chan_struct slot for UI preview voices.
+                                  // Lives above MIDI's 0..15 range, so `m1 & 15`
+                                  // dispatch can never address it.
+
+// ============================================================
+// Memory layout
+// ============================================================
+// All fixed structures live below heap_top; sample audio buffers are allocated
+// lazily by ensure_slot() as samples are loaded. JSFX caps maxmem at 32 M slots
+// regardless of the options:maxmem request, so eagerly reserving 128 × 480016
+// floats up front silently blew past the cap and turned every @sample iteration
+// into an OOB-induced infinite loop. Lazy allocation keeps the realistic working
+// set (a handful of loaded slots) well under the cap.
+freemem = 0;
+
+samplelocs      = freemem; freemem += N_SAMPLES;        // pointer per slot, 0 if unloaded
+params_base     = freemem; freemem += N_SAMPLES * PARAMS_STRIDE;
+mute_flags      = freemem; freemem += N_SAMPLES;
+solo_flags      = freemem; freemem += N_SAMPLES;
+thumb_base      = freemem; freemem += N_SAMPLES * THUMB_W * 2;  // min/max per column
+thumb_dirty     = freemem; freemem += N_SAMPLES;        // 1 → needs rebuild on next draw
+voice_pool_base = freemem; freemem += N_VOICES * VOICE_FIELDS;
+free_list       = freemem; freemem += N_VOICES;
+chan_base       = freemem; freemem += (N_CHANNELS + 1) * CHAN_FIELDS;  // +1 for PREVIEW_CHAN
+midimem         = freemem; freemem += 32768;
+
+sinc_tables_mem = freemem; freemem += SINC_RESERVE;
+build_all_sinc_tables(sinc_tables_mem);
+
+heap_top = freemem;
+
+dc_coeff = exp(-2 * $pi * 10 / srate);     // 10 Hz DC blocker
+
+// ============================================================
+// Slot allocation (lazy)
+// ============================================================
+function ensure_slot(idx)
+  global(samplelocs, heap_top, SAMPLE_SLOT_SIZE)
+( samplelocs[idx] ? samplelocs[idx]
+  : heap_top + SAMPLE_SLOT_SIZE > __memtop() ? 0
+  : ( samplelocs[idx] = heap_top; heap_top += SAMPLE_SLOT_SIZE; samplelocs[idx]; ); );
+
+// ============================================================
+// Channel helpers
+// ============================================================
+function chan_ptr(ch)
+  global(chan_base, CHAN_FIELDS)
+( chan_base + ch * CHAN_FIELDS; );
+
+function chan_set_pan(ch, pan)
+  local(c, p)
+  global(chan_base, CHAN_FIELDS, C_PAN, C_LPAN, C_RPAN)
+(
+  c = chan_base + ch * CHAN_FIELDS;
+  pan > 0.99 ? pan = 1;
+  p = 0.5 * $pi * pan;
+  c[C_PAN]  = pan;
+  c[C_LPAN] = cos(p);
+  c[C_RPAN] = sin(p);
+);
+
+function chan_default(ch)
+  local(c)
+  global(chan_base, CHAN_FIELDS, C_CURRENT_SAMPLE, C_VOL)
+(
+  c = chan_base + ch * CHAN_FIELDS;
+  c[C_CURRENT_SAMPLE] = 0;
+  c[C_VOL] = 1;
+  chan_set_pan(ch, 0.5);
+);
+
+init_i = 0; loop(N_CHANNELS, chan_default(init_i); init_i += 1; );
+chan_default(PREVIEW_CHAN);
+
+// ============================================================
+// Voice pool — free list and play list (intrusive doubly-linked)
+// ============================================================
+play_head = -1;
+play_tail = -1;
+free_top  = -1;
+
+init_i = N_VOICES - 1;
+loop(N_VOICES,
+  free_top += 1; free_list[free_top] = init_i;
+  init_v = voice_pool_base + init_i * VOICE_FIELDS;
+  init_v[V_STATE] = VS_FREE;
+  init_v[V_NEXT]  = -1;
+  init_v[V_PREV]  = -1;
+  init_i -= 1;
+);
+
+function voice_ptr(idx)
+  global(voice_pool_base, VOICE_FIELDS)
+( voice_pool_base + idx * VOICE_FIELDS; );
+
+function play_list_append(v_idx)
+  local(vb, tb)
+  global(voice_pool_base, VOICE_FIELDS, V_NEXT, V_PREV, play_head, play_tail)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+  vb[V_NEXT] = -1;
+  vb[V_PREV] = play_tail;
+  play_tail >= 0 ? (
+    tb = voice_pool_base + play_tail * VOICE_FIELDS;
+    tb[V_NEXT] = v_idx;
+  ) : (
+    play_head = v_idx;
+  );
+  play_tail = v_idx;
+);
+
+function play_list_remove(v_idx)
+  local(vb, pb, nb)
+  global(voice_pool_base, VOICE_FIELDS, V_NEXT, V_PREV, play_head, play_tail)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+  vb[V_PREV] >= 0 ? (
+    pb = voice_pool_base + vb[V_PREV] * VOICE_FIELDS;
+    pb[V_NEXT] = vb[V_NEXT];
+  ) : (
+    play_head = vb[V_NEXT];
+  );
+  vb[V_NEXT] >= 0 ? (
+    nb = voice_pool_base + vb[V_NEXT] * VOICE_FIELDS;
+    nb[V_PREV] = vb[V_PREV];
+  ) : (
+    play_tail = vb[V_PREV];
+  );
+  vb[V_NEXT] = -1;
+  vb[V_PREV] = -1;
+);
+
+// Pop a free voice; if pool saturated, hard-steal the oldest playing one.
+function voice_alloc()
+  local(idx)
+  global(free_top, free_list, play_head)
+(
+  free_top >= 0 ? (
+    idx = free_list[free_top]; free_top -= 1; idx;
+  ) : (
+    idx = play_head;
+    play_list_remove(idx);
+    idx;
+  );
+);
+
+function voice_free(v_idx)
+  local(vb)
+  global(free_top, free_list, voice_pool_base, VOICE_FIELDS, V_STATE, VS_FREE)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+  vb[V_STATE] = VS_FREE;
+  free_top += 1;
+  free_list[free_top] = v_idx;
+);
+
+// ============================================================
+// Voice — start, release, render
+// ============================================================
+function voice_set_speed(vb, new_speed)
+  local(pitch_ratio, kernel_idx)
+  global(sinc_tables,
+         V_SPEED, V_SINC_TABLE, V_TABLE_LEN, V_AT_BASE_RATE)
+(
+  pitch_ratio = abs(new_speed);
+  vb[V_AT_BASE_RATE] = pitch_ratio == 1 ? 1 : 0;
+  kernel_idx = select_sinc_kernel(pitch_ratio);
+  vb[V_SINC_TABLE] = sinc_tables[kernel_idx] + 1;
+  vb[V_TABLE_LEN]  = sinc_tables[kernel_idx][0];
+  vb[V_SPEED] = new_speed;
+);
+
+// start_override / end_override: -1 ⇒ use slot's SH_START / SH_END defaults;
+//   otherwise the literal frame index. ignore_loop: when 1, the voice plays
+//   one-shot regardless of slot loop metadata (used by UI preview).
+function voice_start(v_idx, sample_idx, channel, note, vel,
+                     start_override, end_override, ignore_loop)
+  local(vb, sl, fs, base_note, len, start_pos, end_pos)
+  global(samplelocs, voice_pool_base, VOICE_FIELDS, srate,
+         fade_in_samples, fade_out_samples,
+         SH_LENGTH, SH_FS, SH_BASENOTE, SH_START, SH_END,
+         SH_LOOP_START, SH_LOOP_STOP, SH_LOOP_TYPE,
+         SAMPLE_HEADER_SIZE,
+         V_STATE, V_CHANNEL, V_NOTE, V_SAMPLE_IDX, V_VEL,
+         V_POSITION, V_FADE_POSITION, V_FADE_LEVEL,
+         V_START_PTR, V_STOP_POSITION, V_FADE_START,
+         V_LOOP_START, V_LOOP_STOP, V_LOOP_TYPE,
+         V_CLEFT, V_CRIGHT,
+         V_FIR_L_BASE, V_FIR_R_BASE,
+         VS_PLAYING)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+  sl = samplelocs[sample_idx];
+  // sl == 0 means slot was never loaded (lazy allocation); short-circuit before
+  // dereferencing — sl[SH_LENGTH] would alias mem[0] = samplelocs[0].
+  len = sl ? sl[SH_LENGTH] : 0;
+
+  len < 1 ? (
+    // Empty / unloaded slot — return voice to pool, no playback.
+    voice_free(v_idx);
+  ) : (
+    fs = sl[SH_FS]; fs < 90 ? fs = srate;
+    base_note = sl[SH_BASENOTE]; base_note < 1 ? base_note = 60;
+
+    vb[V_CHANNEL]    = channel;
+    vb[V_NOTE]       = note;
+    vb[V_VEL]        = vel;
+    vb[V_SAMPLE_IDX] = sample_idx;
+
+    vb[V_START_PTR] = sl + SAMPLE_HEADER_SIZE;
+    start_pos = start_override < 0 ? sl[SH_START] : start_override;
+    end_pos   = end_override   < 0 ? sl[SH_END]   : end_override;
+    end_pos < 1 ? end_pos = len / 2 - 2;
+    vb[V_STOP_POSITION] = end_pos;
+
+    // Auto-fade trigger lands fade_out_samples before end_pos. Click suppression
+    // at start/end is delegated to V_FADE_LEVEL ramping (fade_in/out sliders) —
+    // no zero-crossing snap, so the SH_START/SH_END handles are honoured literally.
+    vb[V_FADE_START] = max(vb[V_START_PTR],
+                           vb[V_START_PTR] + 2 * (end_pos - fade_out_samples));
+
+    vb[V_LOOP_START] = ignore_loop ? 0 : sl[SH_LOOP_START];
+    vb[V_LOOP_STOP]  = ignore_loop ? 0 : sl[SH_LOOP_STOP];
+    vb[V_LOOP_TYPE]  = ignore_loop ? 0 : sl[SH_LOOP_TYPE];
+
+    vb[V_POSITION] = start_pos;
+    voice_set_speed(vb, 2 ^ ((note - base_note) / 12) * (fs / srate));
+
+    vb[V_FADE_POSITION] = fade_in_samples;
+    vb[V_FADE_LEVEL]    = 0;
+    vb[V_CLEFT]         = 0;
+    vb[V_CRIGHT]        = 0;
+
+    reset_fir(vb + V_FIR_L_BASE);
+    reset_fir(vb + V_FIR_R_BASE);
+
+    vb[V_STATE] = VS_PLAYING;
+    play_list_append(v_idx);
+  );
+);
+
+function voice_release(v_idx)
+  local(vb)
+  global(voice_pool_base, VOICE_FIELDS, fade_out_samples,
+         V_STATE, V_FADE_POSITION,
+         VS_PLAYING, VS_FADING_OUT)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+  vb[V_STATE] == VS_PLAYING ? (
+    vb[V_FADE_POSITION] = -fade_out_samples;
+    vb[V_STATE] = VS_FADING_OUT;
+  );
+);
+
+function voice_render(v_idx)
+  local(vb, frac, ism1, is0, is1, is2, id0, id1, id2, id3, fade_fraction, read_ptr, sp)
+  global(voice_pool_base, VOICE_FIELDS, fade_in_samples, fade_out_samples,
+         interpolation,
+         V_STATE, V_FADE_POSITION, V_FADE_LEVEL, V_POSITION, V_SPEED,
+         V_START_PTR, V_STOP_POSITION, V_FADE_START,
+         V_LOOP_START, V_LOOP_STOP, V_LOOP_TYPE,
+         V_OUTL, V_OUTR, V_SINC_TABLE, V_TABLE_LEN, V_AT_BASE_RATE,
+         V_FIR_L_BASE, V_FIR_R_BASE,
+         VS_FREE, VS_PLAYING, VS_FADING_OUT)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+
+  // ---------- Envelope / loop / end-detection ----------
+  vb[V_FADE_POSITION] > 0.01 ? (
+    fade_fraction = 1 - (vb[V_FADE_POSITION] - 1) / fade_in_samples;
+    vb[V_FADE_LEVEL] = 10*fade_fraction^3 - 15*fade_fraction^4 + 6*fade_fraction^5;
+    vb[V_FADE_POSITION] -= 1;
+  ) : vb[V_FADE_POSITION] < -0.01 ? (
+    fade_fraction = max(0, 1 + (vb[V_FADE_POSITION] + 1) / fade_out_samples);
+    vb[V_FADE_LEVEL] = 1 - 10*fade_fraction^3 + 15*fade_fraction^4 - 6*fade_fraction^5;
+    vb[V_FADE_POSITION] += 1;
+    (vb[V_FADE_POSITION] == 0 || vb[V_POSITION] > vb[V_STOP_POSITION]) ? (
+      vb[V_STATE] = VS_FREE;     // marks for cleanup in @sample loop
+      vb[V_SPEED] = 0;
+    );
+  ) : vb[V_STATE] == VS_PLAYING ? (
+    vb[V_FADE_LEVEL] = 1;
+    vb[V_LOOP_START] > 0 ? (
+      vb[V_LOOP_TYPE] == 0 ? (
+        vb[V_POSITION] > vb[V_LOOP_STOP] ?
+          vb[V_POSITION] -= (vb[V_LOOP_STOP] - vb[V_LOOP_START]);
+      ) : (
+        vb[V_POSITION] > vb[V_LOOP_STOP] ? vb[V_SPEED] = -vb[V_SPEED]
+        : vb[V_POSITION] < vb[V_LOOP_START] ? vb[V_SPEED] = abs(vb[V_SPEED]);
+      );
+    ) : (
+      sp = vb[V_START_PTR] + 2 * floor(vb[V_POSITION]);
+      ((sp > vb[V_FADE_START]) && (vb[V_SPEED] > 0)) ||
+      ((sp < vb[V_START_PTR] - 2 * vb[V_SPEED] * fade_out_samples) && (vb[V_SPEED] < 0)) ? (
+        vb[V_FADE_POSITION] = -fade_out_samples;
+        vb[V_STATE] = VS_FADING_OUT;
+      );
+    );
+  );
+
+  // ---------- Sample read ----------
+  (vb[V_STATE] == VS_PLAYING || vb[V_STATE] == VS_FADING_OUT) ? (
+    interpolation == 0 ? (
+      frac = vb[V_POSITION] - floor(vb[V_POSITION]);
+      read_ptr = vb[V_START_PTR] + 2 * floor(vb[V_POSITION]) - 2;
+      vb[V_OUTL] = vb[V_FADE_LEVEL] * (read_ptr[]  * (1 - frac) + frac * read_ptr[2]);
+      vb[V_OUTR] = vb[V_FADE_LEVEL] * (read_ptr[1] * (1 - frac) + frac * read_ptr[3]);
+    ) : interpolation == 1 ? (
+      frac = vb[V_POSITION] - floor(vb[V_POSITION]);
+      read_ptr = vb[V_START_PTR] + 2 * floor(vb[V_POSITION]) - 8;
+      ism1 = read_ptr[];  is0 = read_ptr[2]; is1 = read_ptr[4]; is2 = read_ptr[6];
+      id0 = is0;
+      id1 = 0.5 * (is1 - ism1);
+      id2 = ism1 - 2.5*is0 + 2*is1 - 0.5*is2;
+      id3 = 0.5 * (is2 - ism1) + 1.5 * (is0 - is1);
+      vb[V_OUTL] = vb[V_FADE_LEVEL] * (((id3*frac + id2)*frac + id1)*frac + id0);
+      ism1 = read_ptr[1]; is0 = read_ptr[3]; is1 = read_ptr[5]; is2 = read_ptr[7];
+      id0 = is0;
+      id1 = 0.5 * (is1 - ism1);
+      id2 = ism1 - 2.5*is0 + 2*is1 - 0.5*is2;
+      id3 = 0.5 * (is2 - ism1) + 1.5 * (is0 - is1);
+      vb[V_OUTR] = vb[V_FADE_LEVEL] * (((id3*frac + id2)*frac + id1)*frac + id0);
+    ) : interpolation == 2 ? (
+      vb[V_OUTL] = vb[V_FADE_LEVEL] *
+        sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
+                    vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]);
+      vb[V_OUTR] = vb[V_FADE_LEVEL] *
+        sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
+                    vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]);
+    ) : (
+      abs(vb[V_SPEED]) <= 1 ? (
+        vb[V_OUTL] = downsample_fir_step(vb + V_FIR_L_BASE,
+          2 * vb[V_FADE_LEVEL] *
+          sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
+                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]), 0);
+        vb[V_OUTR] = downsample_fir_step(vb + V_FIR_R_BASE,
+          2 * vb[V_FADE_LEVEL] *
+          sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
+                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]), 0);
+      ) : (
+        vb[V_OUTL] = downsample_fir_step(vb + V_FIR_L_BASE,
+          vb[V_FADE_LEVEL] *
+          sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
+                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]),
+          vb[V_FADE_LEVEL] *
+          sinc_interp(vb[V_START_PTR], vb[V_POSITION] + vb[V_SPEED]/2, 0,
+                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]));
+        vb[V_OUTR] = downsample_fir_step(vb + V_FIR_R_BASE,
+          vb[V_FADE_LEVEL] *
+          sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
+                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]),
+          vb[V_FADE_LEVEL] *
+          sinc_interp(vb[V_START_PTR], vb[V_POSITION] + vb[V_SPEED]/2, 1,
+                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]));
+      );
+    );
+    vb[V_POSITION] += vb[V_SPEED];
+  );
+);
+
+// One-pole smoothing of channel-derived level into voice-local cleft/cright.
+function voice_smooth(v_idx)
+  local(vb, c, target_l, target_r)
+  global(voice_pool_base, VOICE_FIELDS, chan_base, CHAN_FIELDS,
+         V_CHANNEL, V_VEL, V_CLEFT, V_CRIGHT,
+         C_VOL, C_LPAN, C_RPAN)
+(
+  vb = voice_pool_base + v_idx * VOICE_FIELDS;
+  c  = chan_base + vb[V_CHANNEL] * CHAN_FIELDS;
+  target_l = vb[V_VEL] * c[C_VOL] * c[C_LPAN];
+  target_r = vb[V_VEL] * c[C_VOL] * c[C_RPAN];
+  vb[V_CLEFT]  = 0.998 * vb[V_CLEFT]  + 0.002 * target_l;
+  vb[V_CRIGHT] = 0.998 * vb[V_CRIGHT] + 0.002 * target_r;
+);
+
+// Find a playing voice matching (channel, note) for note-off.
+function voice_find(channel, note)
+  local(idx, vb, found)
+  global(play_head, voice_pool_base, VOICE_FIELDS,
+         V_NEXT, V_CHANNEL, V_NOTE, V_STATE, VS_PLAYING)
+(
+  idx = play_head; found = -1;
+  while (idx >= 0 && found < 0) (
+    vb = voice_pool_base + idx * VOICE_FIELDS;
+    (vb[V_STATE] == VS_PLAYING && vb[V_CHANNEL] == channel && vb[V_NOTE] == note) ?
+      ( found = idx; ) :
+      ( idx = vb[V_NEXT]; );
+  );
+  found;
+);
+
+// ============================================================
+// Sample loading (from disk path)
+// ============================================================
+// Write basename of `path` (no directory, no extension) into `dest_str`.
+// Handles both '/' and '\' separators.
+function basename_to(dest_str, path)
+  local(n, i, ch, dot_idx, sep_idx)
+(
+  n = strlen(path);
+  dot_idx = n; sep_idx = -1;
+  i = 0;
+  while (i < n) (
+    ch = str_getchar(path, i);
+    ch == 46 ? dot_idx = i;                                // '.'
+    (ch == 47 || ch == 92) ? ( sep_idx = i; dot_idx = n; );// '/' or '\' resets pending dot
+    i += 1;
+  );
+  strcpy_substr(dest_str, path, sep_idx + 1, dot_idx - sep_idx - 1);
+);
+
+// Load wav at path_str into slot `idx`. Mono is duplicated to stereo.
+// Length is capped to SAMPLE_BUFFER_FRAMES (interleaved floats).
+// Silently no-ops if ensure_slot() can't allocate (heap exhausted).
+function load_sample_from_file(idx, path_str)
+  local(fh, num_channels, samplerate, length, ptr, max_mono_frames, slot)
+  global(NAME_BASE, thumb_dirty,
+         SAMPLE_HEADER_SIZE, SAMPLE_BUFFER_FRAMES, SAMPLE_SLOT_SIZE,
+         SH_LENGTH, SH_FS, SH_BASENOTE)
+(
+  slot = ensure_slot(idx);
+  slot ? (
+    fh = file_open(path_str);
+    fh >= 0 ? (
+      file_riff(fh, num_channels, samplerate);
+      memset(slot, 0, SAMPLE_SLOT_SIZE);
+      length = 0;
+
+      num_channels == 2 ? (
+        length = min(file_avail(fh), SAMPLE_BUFFER_FRAMES - 4);
+        file_mem(fh, slot + SAMPLE_HEADER_SIZE, length);
+      ) : num_channels == 1 ? (
+        max_mono_frames = floor(0.5 * SAMPLE_BUFFER_FRAMES) - 4;
+        length = min(file_avail(fh), max_mono_frames);
+        ptr = slot + SAMPLE_HEADER_SIZE;
+        loop(length,
+          file_var(fh, ptr[]);
+          ptr[1] = ptr[];
+          ptr += 2;
+        );
+        length *= 2;
+      );
+
+      slot[SH_LENGTH]   = length;
+      slot[SH_FS]       = samplerate;
+      slot[SH_BASENOTE] = 60;   // middle C
+      // SH_LOOP_*, SH_START, SH_END left zero by memset; voice_start treats 0 as default.
+
+      basename_to(NAME_BASE + idx, path_str);
+      file_close(fh);
+      thumb_dirty[idx] = 1;
+    );
+  );
+);
+
+// ============================================================
+// Waveform thumbnails
+// ============================================================
+// Min/max-decimated summary, one slot, packed as [min0, max0, min1, max1, ...]
+// at thumb_base + idx * THUMB_W * 2. Built lazily from @gfx — at most one slot
+// per frame so a project full of dirty thumbs doesn't hitch the audio thread on
+// the first redraw after deserialise.
+function thumb_build(idx)
+  local(sl, frames, audio, x, span_start, span_end, mn, mx, lr, vL, vR, v, base)
+  global(samplelocs, thumb_base, thumb_dirty,
+         THUMB_W, SAMPLE_HEADER_SIZE, SH_LENGTH)
+(
+  sl   = samplelocs[idx];
+  base = thumb_base + idx * THUMB_W * 2;
+  memset(base, 0, THUMB_W * 2);
+  sl && sl[SH_LENGTH] > 0 ? (
+    frames = sl[SH_LENGTH] / 2;
+    audio  = sl + SAMPLE_HEADER_SIZE;
+    x = 0;
+    while (x < THUMB_W) (
+      span_start = floor(x       * frames / THUMB_W);
+      span_end   = floor((x + 1) * frames / THUMB_W);
+      span_end <= span_start ? span_end = span_start + 1;
+      mn =  1; mx = -1;
+      lr = span_start;
+      while (lr < span_end) (
+        vL = audio[lr * 2];
+        vR = audio[lr * 2 + 1];
+        v  = (vL + vR) * 0.5;
+        v < mn ? mn = v;
+        v > mx ? mx = v;
+        lr += 1;
+      );
+      base[x * 2]     = mn;
+      base[x * 2 + 1] = mx;
+      x += 1;
+    );
+  );
+  thumb_dirty[idx] = 0;
+);
+
+function thumb_draw(idx, rx, ry, rw, rh)
+  local(base, x, mid, half)
+  global(thumb_base, THUMB_W)
+(
+  base = thumb_base + idx * THUMB_W * 2;
+  mid  = ry + rh * 0.5;
+  half = rh * 0.45;
+  x = 0;
+  while (x < THUMB_W && x < rw) (
+    gfx_line(rx + x, mid - base[x * 2 + 1] * half,
+             rx + x, mid - base[x * 2]     * half);
+    x += 1;
+  );
+);
+
+// ============================================================
+// UI palette + helpers — mirrors Readium's cm palette atoms
+// (configManager.lua: palette.bg/shade/mid/inactive/danger/positive/amber/steel).
+// pal_* are called for their gfx_set side-effect; subsequent gfx_line / gfx_rect
+// inherit that colour. Alpha threaded as the only argument since the same role
+// gets used at multiple opacities.
+// ============================================================
+function pal_bg(a)     ( gfx_set(218/255, 214/255, 201/255, a); );
+function pal_shade(a)  ( gfx_set( 48/255,  48/255,  33/255, a); );
+function pal_mid(a)    ( gfx_set(159/255, 147/255, 115/255, a); );
+function pal_inact(a)  ( gfx_set(138/255, 134/255, 121/255, a); );
+function pal_danger(a) ( gfx_set(218/255,  48/255,  33/255, a); );
+function pal_pos(a)    ( gfx_set( 86/255, 138/255,  64/255, a); );
+function pal_amber(a)  ( gfx_set(220/255, 180/255,  50/255, a); );
+function pal_steel(a)  ( gfx_set(100/255, 130/255, 160/255, a); );
+
+// Marker line plus top/bottom grab tabs. Caller sets the colour first.
+function draw_handle(x)
+  global(wave_y, wave_h, HANDLE_TAB_W, HANDLE_TAB_H)
+( gfx_line(x, wave_y, x, wave_y + wave_h);
+  gfx_rect(x - HANDLE_TAB_W * 0.5, wave_y, HANDLE_TAB_W, HANDLE_TAB_H);
+  gfx_rect(x - HANDLE_TAB_W * 0.5, wave_y + wave_h - HANDLE_TAB_H,
+           HANDLE_TAB_W, HANDLE_TAB_H);
+);
+
+// One row at (rx, ry, rw, rh): index | name | waveform | frame count.
+// Drawing only — caller handles thumb_build throttling and hit-testing.
+function row_draw(idx, rx, ry, rw, rh)
+  local(sl, len, has, fs, name_x, thumb_x, frames_x, baseline)
+  global(samplelocs, NAME_BASE, SH_LENGTH, SH_FS, THUMB_W, gfx_x, gfx_y, srate,
+         sel_idx, rename_idx)
+(
+  sl  = samplelocs[idx];
+  len = sl ? sl[SH_LENGTH] : 0;
+  has = len > 0;
+
+  // Background — rename > selection > zebra.
+  idx == rename_idx ? (
+    pal_amber(0.35); gfx_rect(rx, ry, rw, rh);
+  ) : idx == sel_idx ? (
+    pal_steel(0.35); gfx_rect(rx, ry, rw, rh);
+  ) : (idx & 1) ? (
+    pal_mid(0.12);   gfx_rect(rx, ry, rw, rh);
+  );
+
+  name_x   = rx + 32;
+  thumb_x  = rx + rw - 64 - THUMB_W;
+  frames_x = rx + rw - 56;
+  baseline = ry + (rh - 12) * 0.5;
+
+  gfx_x = rx + 4; gfx_y = baseline;
+  pal_inact(1);
+  gfx_drawnumber(idx, 0);
+
+  gfx_x = name_x; gfx_y = baseline;
+  has ? pal_shade(1) : pal_inact(0.7);
+  strlen(NAME_BASE + idx) > 0 ? gfx_drawstr(NAME_BASE + idx)
+                              : gfx_drawstr("(empty)");
+  idx == rename_idx ? ( pal_amber(1); gfx_drawstr("|"); );
+
+  has ? (
+    pal_pos(0.9);
+    thumb_draw(idx, thumb_x, ry + 2, THUMB_W, rh - 4);
+    gfx_x = frames_x; gfx_y = baseline;
+    pal_inact(0.8);
+    fs = sl[SH_FS]; fs < 90 ? fs = srate;
+    gfx_drawnumber(len / (2 * fs), 2);
+    gfx_drawstr("s");
+  );
+);
+
+// ============================================================
+// MIDI dispatch
+// ============================================================
+function handle_note_off(channel, note)
+  local(idx)
+( idx = voice_find(channel, note);
+  idx >= 0 ? voice_release(idx); );
+
+function handle_note_on(channel, note, vel)
+  local(c, idx)
+  global(chan_base, CHAN_FIELDS, C_CURRENT_SAMPLE)
+(
+  vel == 0 ? handle_note_off(channel, note) : (
+    c = chan_base + channel * CHAN_FIELDS;
+    idx = voice_alloc();
+    voice_start(idx, c[C_CURRENT_SAMPLE], channel, note, vel / 127, -1, -1, 0);
+  );
+);
+
+function handle_pc(channel, program)
+  local(c)
+  global(chan_base, CHAN_FIELDS, C_CURRENT_SAMPLE)
+(
+  c = chan_base + channel * CHAN_FIELDS;
+  c[C_CURRENT_SAMPLE] = program & 127;
+);
+
+function handle_cc(channel, cc, val)
+  local(c, v)
+  global(chan_base, CHAN_FIELDS, C_VOL)
+(
+  cc == 7 ? (
+    c = chan_base + channel * CHAN_FIELDS;
+    v = val / 127;
+    c[C_VOL] = v * v;            // perceptual taper, matches original
+  ) : cc == 10 ? (
+    chan_set_pan(channel, val / 127);
+  );
+);
+
+// ============================================================
+// MIDI block buffering (folded from htp_midi)
+// ============================================================
+midi_pass = 1;
+
+// ============================================================
+// UI preview — @gfx posts a single-shot request, @block consumes it.
+// Cleared by the consumer; -1 means no pending request.
+// ============================================================
+function preview_consume()
+  local(psl, pbase, pidx)
+  global(samplelocs, PREVIEW_CHAN, SH_BASENOTE,
+         preview_request_slot, preview_request_bounds)
+(
+  psl = samplelocs[preview_request_slot];
+  psl ? (
+    pbase = psl[SH_BASENOTE]; pbase < 1 ? pbase = 60;
+    pidx  = voice_alloc();
+    // Bounds-mode passes -1 sentinels so voice_start uses SH_START/SH_END;
+    // full-mode passes 0 so the slot's own crop is bypassed.
+    voice_start(pidx, preview_request_slot, PREVIEW_CHAN, pbase, 1,
+                preview_request_bounds ? -1 : 0,
+                preview_request_bounds ? -1 : 0,
+                1);
+  );
+  preview_request_slot = -1;
+);
+
+// ============================================================
+// UI state (driven by @gfx)
+// ============================================================
+sel_idx                = 0;     // selected sample — drives bottom strip
+rename_idx             = -1;    // -1 = not renaming; else idx of name being edited
+mouse_prev             = 0;     // prev mouse_cap & 1, for edge detection
+drag_handle            = 0;     // 0 none, 1 SH_START handle, 2 SH_END handle
+preview_request_slot   = -1;    // -1 none, else sample idx to preview at next @block
+preview_request_bounds = 0;     // 0 = play full file, 1 = honour SH_START/SH_END
+
+@slider
+fade_in_samples  = 2 ^ fade_in_slider;
+fade_out_samples = 2 ^ fade_out_slider;
+interpolation > 2 ? (pdc_delay = 24; pdc_bot_ch = 0; pdc_top_ch = 2;);
+// Rebuild in place — sinc_tables_mem reserved SINC_RESERVE floats at @init,
+// so growing into high-quality tables won't disturb the sample heap above it.
+build_all_sinc_tables(sinc_tables_mem);
+
+@serialize
+writing = file_avail(0) < 0;
+file_var(0, version);
+ser_i = 0;
+loop(N_SAMPLES,
+  // Per-slot presence flag: empty slots cost one float on disk and need no
+  // ensure_slot() on read, which keeps the lazy invariant intact.
+  writing ? has_data = samplelocs[ser_i] && samplelocs[ser_i][SH_LENGTH] > 0;
+  file_var(0, has_data);
+  has_data ? (
+    writing ? 0 : ensure_slot(ser_i);
+    samplelocs[ser_i] ? (
+      file_mem(0, samplelocs[ser_i], SAMPLE_HEADER_SIZE);
+      file_mem(0, samplelocs[ser_i] + SAMPLE_HEADER_SIZE,
+               samplelocs[ser_i][SH_LENGTH]);
+      writing ? 0 : thumb_dirty[ser_i] = 1;
+    );
+  );
+  file_string(0, NAME_BASE + ser_i);
+  file_mem(0, params_base + ser_i * PARAMS_STRIDE, PARAMS_STRIDE);
+  ser_i += 1;
+);
+file_mem(0, mute_flags, N_SAMPLES);
+file_mem(0, solo_flags, N_SAMPLES);
+
+@block
+// Readium → sampler import hook lands here: poll gmem[Readium_sampler] for a
+// magic-tagged record { magic, slot_idx, path_chars..., 0 } and route through
+// load_sample_from_file(slot, path) — same loader as drag-drop. Not wired yet.
+
+note_ptr = midimem;
+while (midirecv(offset, msg1, msg2, msg3)) (
+  status = msg1 & $xF0;
+  (status == $x90 || status == $x80 || status == $xB0 || status == $xC0) ? (
+    note_ptr[] = offset;  note_ptr += 1;
+    note_ptr[] = msg1;    note_ptr += 1;
+    note_ptr[] = msg2;    note_ptr += 1;
+    note_ptr[] = msg3;    note_ptr += 1;
+  );
+  midi_pass ? midisend(offset, msg1, msg2, msg3);
+);
+note_ptr[] = -1337;
+note_ptr   = midimem;
+cur_sample = 0;
+next_offset = note_ptr[];
+
+preview_request_slot >= 0 ? preview_consume();
+
+@sample
+function process_midi_for_this_tick()
+  local(channel, status, m1, m2, m3)
+  global(note_ptr, next_offset, cur_sample)
+(
+  while (next_offset != -1337 && next_offset == cur_sample) (
+    note_ptr += 1;
+    m1 = note_ptr[];     note_ptr += 1;
+    m2 = note_ptr[];     note_ptr += 1;
+    m3 = note_ptr[];     note_ptr += 1;
+    channel = m1 & 15;
+    status  = m1 & $xF0;
+
+    status == $x90 ? (
+      m3 == 0 ? handle_note_off(channel, m2) : handle_note_on(channel, m2, m3);
+    ) : status == $x80 ? handle_note_off(channel, m2)
+    : status == $xB0 ? handle_cc(channel, m2, m3)
+    : status == $xC0 ? handle_pc(channel, m2);
+
+    next_offset = note_ptr[];
+  );
+  cur_sample += 1;
+);
+
+process_midi_for_this_tick();
+
+ssl = ssr = 0;
+// CAREFUL: EEL2 is case-insensitive AND has no scoping at @sample top-level,
+// so a local-looking `v_next` here would alias the V_NEXT constant (=17) and
+// silently overwrite it each iteration. Names like vit/vnxt avoid the trap;
+// the same applies to any `v_state`/`v_position`/etc. used in this scope.
+// Iteration cap is 4× pool size — bounded insurance against any future
+// runaway, since blocking the audio thread freezes REAPER's GUI too.
+vit = play_head;
+vnit = 0;
+while (vit >= 0 && vnit < 4 * N_VOICES) (
+  vnxt = voice_pool_base[vit * VOICE_FIELDS + V_NEXT];
+  voice_render(vit);
+
+  voice_pool_base[vit * VOICE_FIELDS + V_STATE] == VS_FREE ? (
+    play_list_remove(vit);
+    voice_free(vit);
+  ) : (
+    voice_smooth(vit);
+    ssl += voice_pool_base[vit * VOICE_FIELDS + V_OUTL] *
+           voice_pool_base[vit * VOICE_FIELDS + V_CLEFT];
+    ssr += voice_pool_base[vit * VOICE_FIELDS + V_OUTR] *
+           voice_pool_base[vit * VOICE_FIELDS + V_CRIGHT];
+  );
+
+  vit = vnxt;
+  vnit += 1;
+);
+
+// 10 Hz DC blocker
+dc_tmp = ssl;
+ssl -= dc_xL - dc_coeff * dc_yL;
+dc_yL = ssl;
+dc_xL = dc_tmp;
+
+dc_tmp = ssr;
+ssr -= dc_xR - dc_coeff * dc_yR;
+dc_yR = ssr;
+dc_xR = dc_tmp;
+
+spl0 = ssl;
+spl1 = ssr;
+
+@gfx 760 880
+// ------------------------------------------------------------
+// UI: 2-column slot grid + bottom strip with draggable start/end markers
+// + click-to-rename name field. Layout, input, and rendering live here.
+// ------------------------------------------------------------
+UI_ROWS_TOP    = 28;
+UI_COL_PAD     = 6;
+ui_row_h       = 22;
+N_COLS         = 2;
+N_ROWS_PER_COL = N_SAMPLES / N_COLS;
+STRIP_TOP_PAD  = 8;
+STRIP_BOT_PAD  = 8;
+STRIP_LABEL_H  = 14;
+WAVE_INSET     = 16;       // horizontal padding inside the strip — keeps handles
+                           // off the window edge and gives them grab room.
+MARKER_GRAB_PX = 10;       // ± hit radius around each marker line
+HANDLE_TAB_W   = 10;
+HANDLE_TAB_H   = 6;
+DROP_PATH_STR  = 14;
+
+ui_col_w  = (gfx_w - UI_COL_PAD * (N_COLS + 1)) / N_COLS;
+grid_bot  = UI_ROWS_TOP + N_ROWS_PER_COL * ui_row_h;
+strip_top = grid_bot + STRIP_TOP_PAD;
+strip_h   = gfx_h - strip_top - STRIP_BOT_PAD;
+strip_x   = 8;
+strip_w   = gfx_w - 16;
+wave_x    = strip_x + WAVE_INSET;
+wave_w    = strip_w - 2 * WAVE_INSET;
+wave_y    = strip_top + STRIP_LABEL_H;
+wave_h    = strip_h - STRIP_LABEL_H;
+
+pal_bg(1); gfx_rect(0, 0, gfx_w, gfx_h);
+gfx_setfont(1, "Arial", 13);
+
+gfx_y = 6; gfx_x = 8;
+pal_shade(1);
+gfx_drawstr("Readium Sampler");
+
+// ---------- Mouse edge detect ----------
+mouse_dn   = (mouse_cap & 1) && !mouse_prev;
+mouse_held = mouse_cap & 1;
+mouse_up   = !(mouse_cap & 1) && mouse_prev;
+mouse_prev = mouse_cap & 1;
+
+// ---------- Keyboard (drain even when not renaming so keys don't queue) ----------
+while ((rk = gfx_getchar()) > 0) (
+  rename_idx >= 0 ? (
+    rk == 27 ? (                                              // Esc — revert
+      strcpy(NAME_BASE + rename_idx, RENAME_BACKUP_STR);
+      rename_idx = -1;
+    ) : rk == 13 ? rename_idx = -1                            // Enter — commit
+    : rk == 8 ? str_setlen(NAME_BASE + rename_idx,            // Backspace
+                           max(0, strlen(NAME_BASE + rename_idx) - 1))
+    : (rk >= 32 && rk <= 126) ? str_setchar(NAME_BASE + rename_idx,
+                                            strlen(NAME_BASE + rename_idx), rk);
+  );
+);
+
+// ---------- File drag-drop (consume before clicks so the drop gesture
+// doesn't double as a row-click) ----------
+file_dropped = gfx_getdropfile(0, DROP_PATH_STR);
+file_dropped ? (
+  hit_col = mouse_x < gfx_w * 0.5 ? 0 : 1;
+  hit_row = floor((mouse_y - UI_ROWS_TOP) / ui_row_h);
+  (hit_row >= 0 && hit_row < N_ROWS_PER_COL) ? (
+    drop_row = hit_col * N_ROWS_PER_COL + hit_row;
+  ) : (
+    drop_row = 0;
+    while (drop_row < N_SAMPLES &&
+           samplelocs[drop_row] && samplelocs[drop_row][SH_LENGTH] > 0) (
+      drop_row += 1;
+    );
+  );
+  drop_file = 0;
+  while (drop_row < N_SAMPLES && gfx_getdropfile(drop_file, DROP_PATH_STR) > 0) (
+    load_sample_from_file(drop_row, DROP_PATH_STR);
+    drop_file += 1;
+    drop_row  += 1;
+  );
+  gfx_getdropfile(-1);
+);
+
+// ---------- Click routing ----------
+sl_sel = samplelocs[sel_idx];
+sel_has = sl_sel && sl_sel[SH_LENGTH] > 0;
+in_strip = sel_has
+  && mouse_y >= strip_top && mouse_y <= strip_top + strip_h
+  && mouse_x >= strip_x   && mouse_x <= strip_x + strip_w;
+
+(mouse_dn && !file_dropped) ? (
+  rename_idx  = -1;                                           // any click commits
+  drag_handle = 0;
+  in_strip ? (
+    frames_s  = sl_sel[SH_LENGTH] / 2;
+    end_eff   = sl_sel[SH_END] > 0 ? sl_sel[SH_END] : frames_s - 2;
+    sx_marker = wave_x + sl_sel[SH_START] / frames_s * wave_w;
+    ex_marker = wave_x + end_eff          / frames_s * wave_w;
+    abs(mouse_x - sx_marker) <= MARKER_GRAB_PX ? drag_handle = 1
+    : abs(mouse_x - ex_marker) <= MARKER_GRAB_PX ? drag_handle = 2
+    : ( preview_request_slot = sel_idx; preview_request_bounds = 1; );
+  ) : (
+    hit_col = mouse_x < gfx_w * 0.5 ? 0 : 1;
+    hit_row = floor((mouse_y - UI_ROWS_TOP) / ui_row_h);
+    rx_hit  = UI_COL_PAD + hit_col * (ui_col_w + UI_COL_PAD);
+    in_grid = hit_row >= 0 && hit_row < N_ROWS_PER_COL
+           && mouse_x >= rx_hit && mouse_x <= rx_hit + ui_col_w;
+    in_grid ? (
+      hit_idx = hit_col * N_ROWS_PER_COL + hit_row;
+      sel_idx = hit_idx;
+      // Name + thumbnail regions match row_draw layout exactly.
+      name_lo  = rx_hit + 32;
+      thumb_lo = rx_hit + ui_col_w - 64 - THUMB_W;
+      thumb_hi = rx_hit + ui_col_w - 64;
+      (samplelocs[hit_idx] && samplelocs[hit_idx][SH_LENGTH] > 0) ? (
+        mouse_x >= thumb_lo && mouse_x <= thumb_hi ? (
+          preview_request_slot   = hit_idx;
+          preview_request_bounds = 0;
+        ) : mouse_x >= name_lo && mouse_x < thumb_lo ? (
+          strcpy(RENAME_BACKUP_STR, NAME_BASE + hit_idx);
+          rename_idx = hit_idx;
+        );
+      );
+    );
+  );
+);
+
+// ---------- Active marker drag ----------
+(mouse_held && drag_handle > 0 && sel_has) ? (
+  frames_d = sl_sel[SH_LENGTH] / 2;
+  rel_x    = (mouse_x - wave_x) / wave_w;
+  rel_x < 0 ? rel_x = 0;
+  rel_x > 1 ? rel_x = 1;
+  drag_pos = floor(rel_x * frames_d);
+  drag_handle == 1 ? (
+    end_eff_d = sl_sel[SH_END] > 0 ? sl_sel[SH_END] : frames_d - 2;
+    drag_pos < 0              ? drag_pos = 0;
+    drag_pos > end_eff_d - 1  ? drag_pos = end_eff_d - 1;
+    sl_sel[SH_START] = drag_pos;
+  ) : (
+    drag_pos < sl_sel[SH_START] + 1 ? drag_pos = sl_sel[SH_START] + 1;
+    drag_pos > frames_d - 2         ? drag_pos = frames_d - 2;
+    sl_sel[SH_END] = drag_pos;
+  );
+);
+mouse_up ? drag_handle = 0;
+
+// ---------- Grid ----------
+built_this_tick = 0;
+ui_col = 0;
+while (ui_col < N_COLS) (
+  ui_row = 0;
+  while (ui_row < N_ROWS_PER_COL) (
+    ui_idx = ui_col * N_ROWS_PER_COL + ui_row;
+    !built_this_tick && thumb_dirty[ui_idx] && samplelocs[ui_idx] ? (
+      thumb_build(ui_idx);
+      built_this_tick = 1;
+    );
+    row_draw(ui_idx,
+             UI_COL_PAD + ui_col * (ui_col_w + UI_COL_PAD),
+             UI_ROWS_TOP + ui_row * ui_row_h,
+             ui_col_w, ui_row_h);
+    ui_row += 1;
+  );
+  ui_col += 1;
+);
+
+// ---------- Bottom strip ----------
+pal_mid(0.18);
+gfx_rect(strip_x, strip_top, strip_w, strip_h);
+
+sel_has ? (
+  frames_v = sl_sel[SH_LENGTH] / 2;
+  audio_v  = sl_sel + SAMPLE_HEADER_SIZE;
+
+  gfx_x = strip_x + 4; gfx_y = strip_top + 1;
+  pal_shade(0.85);
+  gfx_drawstr("#"); gfx_drawnumber(sel_idx, 0); gfx_x += 8;
+  strlen(NAME_BASE + sel_idx) > 0 ? gfx_drawstr(NAME_BASE + sel_idx)
+                                  : gfx_drawstr("(unnamed)");
+
+  pal_pos(0.9);
+  mid_v  = wave_y + wave_h * 0.5;
+  half_v = wave_h * 0.45;
+  vx = 0;
+  while (vx < wave_w) (
+    span_lo = floor(vx       * frames_v / wave_w);
+    span_hi = floor((vx + 1) * frames_v / wave_w);
+    span_hi <= span_lo ? span_hi = span_lo + 1;
+    span_hi > frames_v ? span_hi = frames_v;
+    mn_v = 1; mx_v = -1;
+    lr_v = span_lo;
+    while (lr_v < span_hi) (
+      v_v = (audio_v[lr_v * 2] + audio_v[lr_v * 2 + 1]) * 0.5;
+      v_v < mn_v ? mn_v = v_v;
+      v_v > mx_v ? mx_v = v_v;
+      lr_v += 1;
+    );
+    gfx_line(wave_x + vx, mid_v - mx_v * half_v,
+             wave_x + vx, mid_v - mn_v * half_v);
+    vx += 1;
+  );
+
+  end_eff_v = sl_sel[SH_END] > 0 ? sl_sel[SH_END] : frames_v - 2;
+  start_x_v = wave_x + sl_sel[SH_START] / frames_v * wave_w;
+  end_x_v   = wave_x + end_eff_v          / frames_v * wave_w;
+  pal_danger(drag_handle == 1 ? 1 : 0.75); draw_handle(start_x_v);
+  pal_steel (drag_handle == 2 ? 1 : 0.75); draw_handle(end_x_v);
+) : (
+  gfx_x = strip_x + 8; gfx_y = strip_top + strip_h * 0.5 - 6;
+  pal_inact(1);
+  gfx_drawstr("(no sample selected — click a row)");
+);

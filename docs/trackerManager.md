@@ -229,6 +229,14 @@ Reentrancy-guarded by `rebuilding`. Steps:
    - `pa` — attach to note column containing `(pitch, ppq)`.
    - `cc` — append to `ccs[cc]`.
    - `at` / `pc` — append to the channel's singleton column.
+
+   All four branches go through `projectCC(cc, loc, overlay)`, which
+   strips only the routing fields the destination col owns
+   (`chan`, `msgType`, `cc`) and overlays the per-msgType derived
+   fields. Anything else on the source — including custom metadata
+   fields not yet known here — rides through verbatim. The strip set
+   is rule-based, not a fixed allowlist, so future event metadata
+   reaches `col.events` without changes to this layer.
 4. **Reconcile extras.** Grow `extraColumns[chan].notes` if live
    allocation exceeded it; pad empty note lanes; materialise
    user-opened singletons/ccs that carry no events. Writes back via
@@ -404,6 +412,49 @@ Delay nudges shift `ppq` / `endppq` only — `ppqL` is
 delay-independent and rides through unchanged.
 
 Update values may include `util.REMOVE` to delete the field.
+
+### Take length
+
+```
+tm:setName(name)
+tm:setLength(newPpq)        -- truncate (events past newPpq deleted;
+                            -- spanning notes have endppq clamped) or
+                            -- extend (no event mutation)
+tm:rescaleLength(newPpq)    -- logical-frame stretch by f = newPpq/oldPpq
+tm:tileLength(newPpq)       -- loop the [0, oldPpq) pattern to fill newPpq
+```
+
+- **rescale** applies the linear map `t ↦ f·t` to every `ppqL` /
+  `endppqL`, then rederives `ppq` / `endppq` through the current
+  swing snapshot. Under identity swing this collapses to scaling all
+  `ppq` by `f`. Under non-identity swing each event keeps its
+  *logical row*: an event on logical row `r` ends up on row `f·r`,
+  which keeps reswing well-defined. Note delays scale by `f` so the
+  realised stretch is locally proportional. No events are deleted.
+  Implementation: `applyTimeMap` walks column-projected events.
+
+- **tile** snapshots every mm-level event in `[0, oldPpq)`, then for
+  each `k = 1..ceil(newPpq/oldPpq)-1` re-adds the snapshot shifted by
+  `k·oldPpq`. Copies whose shifted ppq lands at-or-past `newPpq` are
+  dropped; copy endppqs that extend past `newPpq` are clamped.
+  Originals are untouched. Shrinks (`newPpq ≤ oldPpq`) fall through
+  to `setLength`.
+
+  Tile walks `mm:notes()` / `mm:ccs()` directly rather than the
+  column projections used by rescale. Two reasons remain even after
+  the projection fix made `col.events` carry custom metadata, `pb.fake`,
+  and other previously-stripped fields:
+
+  - `pb.val` lives in the column view as cents-minus-detune, while a
+    verbatim copy needs the raw 14-bit value mm gave us. Re-deriving
+    raw from `(cents+detune) → centsToRaw` is lossy.
+  - Pbs would route through `addPb`'s detune-aware carry, which
+    rewrites the surrounding pb stream — wrong for replication.
+
+  Pbs are copied as raw absolute values; whatever carry the source's
+  pb stream had into `oldPpq` is what each copy inherits at `k·oldPpq`.
+  Because take length aligns to QN, `k·oldPpq` is identical in logical
+  and realised frames, so a single delta serves both `ppq` and `ppqL`.
 
 ### Mute
 

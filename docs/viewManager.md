@@ -505,6 +505,10 @@ on ec (reach via `vm:ec()`).
 ```
 vm:setGridSize(w, h)           -- visible viewport in chars / rows
 vm:setRowPerBeat(n)            -- clamped 1..32; cursor row rescales
+vm:applyTakeProperties{        -- take-properties dialog commit;
+  name, rows,                  --   rows × ctx:ppqPerRow() → newPpq;
+  mode='resize'|'rescale'|'tile' --   dispatch on mode (default resize)
+}                              --   rescale/tile: see docs/trackerManager.md
 ```
 
 ### Channel mute / solo

@@ -475,6 +475,25 @@ end
 
 ---------- CLIPBOARD
 
+-- Reserved keys never carried verbatim through copy/paste: position is
+-- rebuilt from `row` at paste, identity is decided by the destination
+-- column, REAPER bookkeeping must not round-trip, and the type tag lives on
+-- the clip envelope. Everything else — known fields and any future
+-- metadata — rides through. Keep this list small and rule-based; do not
+-- allowlist event payload.
+local CLIP_RESERVED = {
+  -- position (rebuilt from row + cursor)
+  ppq = true, endppq = true, ppqL = true, endppqL = true,
+  -- destination identity
+  chan = true, frame = true, lane = true, cc = true,
+  -- mm/REAPER bookkeeping
+  loc = true, idx = true, uuid = true, uuidIdx = true,
+  -- envelope-level
+  type = true, msgType = true,
+}
+-- Clip-only fields stripped before a paste materialises into a write event.
+local CLIP_ARTIFACTS = { row = true, endRow = true }
+
 function newClipboard(deps)
 
   ---------- PRIVATE
@@ -490,7 +509,7 @@ function newClipboard(deps)
   local getLength    = deps.getLength
 
   local function save(clip)
-    reaper.SetExtState('rdm', 'clipboard', util.serialise(clip, { loc = true, sourceIdx = true }), false)
+    reaper.SetExtState('rdm', 'clipboard', util.serialise(clip), false)
   end
 
   local function load()
@@ -503,23 +522,43 @@ function newClipboard(deps)
     local ctx = getCtx()
     local r1, r2, c1, c2, kind1 = ec:region()
     local numRows  = r2 - r1 + 1
+    local logPerRow = ctx:ppqPerRow()
 
-    -- Rows are encoded per source column, in that column's own swing frame,
-    -- via ppqToRow_c. Paste decodes into the destination column via
-    -- rowToPPQ_c, so the round-trip is consistent even when source and
-    -- destination columns have different effective swings.
-    local function noteEvent(col, evt, endppq)
-      local chan = col.midiChan
-      local ce = { row = ctx:ppqToRow(evt.ppq, chan) - r1,
-                   pitch = evt.pitch, vel = evt.vel, loc = evt.loc }
+    -- ppqL is the exact authoring-frame coordinate; dividing it skips the
+    -- ppqToRow round-trip's float drift. Fall back to ctx:ppqToRow under the
+    -- swing inverse for events that lack a stamp (raw mm reads, pre-authoring).
+    local function rowOf(p, pL, chan)
+      return (pL and pL / logPerRow or ctx:ppqToRow(p, chan)) - r1
+    end
+
+    -- Note clip event: the whole source note minus reserved keys, plus
+    -- a row-relative position. endRow is set only when the note ends
+    -- inside the selection; spanning notes get their tail clamped at paste.
+    local function noteEvent(evt, chan, endppq)
+      local ce = util.clone(evt, CLIP_RESERVED)
+      ce.row = rowOf(evt.ppq, evt.ppqL, chan)
       if util.isNote(evt) and evt.endppq <= endppq then
-        ce.endRow = ctx:ppqToRow(evt.endppq, chan) - r1
+        ce.endRow = rowOf(evt.endppq, evt.endppqL, chan)
       end
       return ce
     end
 
-    local function scalarEvent(col, evt, val)
-      return { row = ctx:ppqToRow(evt.ppq, col.midiChan) - r1, val = val, loc = evt.loc }
+    -- Scalar (pb/cc/at/pc) clip event: the whole source minus reserved
+    -- keys. `val` rides through verbatim (it's not reserved); custom
+    -- metadata like `fake` or user-added fields rides through too.
+    local function scalarEvent(evt, chan)
+      local ce = util.clone(evt, CLIP_RESERVED)
+      ce.row = rowOf(evt.ppq, evt.ppqL, chan)
+      return ce
+    end
+
+    -- Vel-mode clip event: a deliberate scalar abstraction over a note.
+    -- Only `val` (= source vel) is meaningful — pasting a vel clip onto a
+    -- note column writes vel via pasteVelocities; pasting onto a CC column
+    -- writes the value as a CC. Carrying the source note's pitch/detune/etc.
+    -- would land them on a CC event as bogus metadata.
+    local function velEvent(evt, chan)
+      return { row = rowOf(evt.ppq, evt.ppqL, chan), val = evt.vel }
     end
 
     -- Single-column mode
@@ -530,22 +569,22 @@ function newClipboard(deps)
 
       local clipType, events = nil, {}
       local emit
+      local chan = col.midiChan
       if col.type == 'note' and kind1 == 'pitch' then
-        clipType, emit = 'note', function(e) return noteEvent(col, e, endppq) end
+        clipType, emit = 'note', function(e) return noteEvent(e, chan, endppq) end
       elseif col.type == 'note' and kind1 == 'vel' then
-        clipType, emit = '7bit', function(e) return scalarEvent(col, e, e.vel) end
+        clipType, emit = '7bit', function(e) return velEvent(e, chan) end
       elseif col.type == 'pb' then
-        clipType, emit = 'pb',   function(e) return scalarEvent(col, e, e.val) end
+        clipType, emit = 'pb',   function(e) return scalarEvent(e, chan) end
       else
-        clipType, emit = '7bit', function(e) return scalarEvent(col, e, e.val) end
+        clipType, emit = '7bit', function(e) return scalarEvent(e, chan) end
       end
       for evt in util.between(col.events, startppq, endppq) do
         util.add(events, emit(evt))
       end
 
       if #events == 0 then return end
-      return { mode = 'single', type = clipType, numRows = numRows,
-               sourceIdx = c1, events = events }
+      return { mode = 'single', type = clipType, numRows = numRows, events = events }
     end
 
     -- Multi-column mode. Each col carries (type, chanDelta, key, events):
@@ -571,12 +610,13 @@ function newClipboard(deps)
         entry.key = col.cc
       end
 
-      local startppq, endppq = ctx:rowToPPQ(r1, col.midiChan), ctx:rowToPPQ(r2 + 1, col.midiChan)
+      local chan = col.midiChan
+      local startppq, endppq = ctx:rowToPPQ(r1, chan), ctx:rowToPPQ(r2 + 1, chan)
       for evt in util.between(col.events, startppq, endppq) do
         if col.type == 'note' then
-          util.add(entry.events, noteEvent(col, evt, endppq))
+          util.add(entry.events, noteEvent(evt, chan, endppq))
         else
-          util.add(entry.events, scalarEvent(col, evt, evt.val))
+          util.add(entry.events, scalarEvent(evt, chan))
         end
       end
       util.add(cols, entry)
@@ -642,15 +682,18 @@ function newClipboard(deps)
 
     -- Resolve clipboard events to target PPQs, truncating past end.
     -- ppqL rides alongside ppq so the destination keeps its
-    -- authoring-row identity in the current take frame.
+    -- authoring-row identity in the current take frame. The clone
+    -- carries every preserved field (pitch/vel/detune/fake/custom/...);
+    -- the destination identity (chan/lane/cc/frame) is overlaid below.
     local events = {}
     for _, ce in ipairs(clip.events) do
       local ppq = ctx:rowToPPQ(r + ce.row, chan)
       if ppq >= endppq then goto nextCe end
-      local e = util.assign({ ppq = ppq, ppqL = (r + ce.row) * logPerRow }, ce)
+      local e = util.clone(ce, CLIP_ARTIFACTS)
+      e.ppq, e.ppqL = ppq, (r + ce.row) * logPerRow
       if ce.endRow then
         local eRow = math.min(r + ce.endRow, capRow)
-        e.endppq         = math.min(ctx:rowToPPQ(r + ce.endRow, chan), endppq)
+        e.endppq  = math.min(ctx:rowToPPQ(r + ce.endRow, chan), endppq)
         e.endppqL = eRow * logPerRow
       end
       util.add(events, e)
@@ -670,7 +713,10 @@ function newClipboard(deps)
 
       local lastNote = util.seek(dstCol.events, 'before', startppq, util.isNote)
       local nextNote = util.seek(dstCol.events, 'at-or-after', endppq, util.isNote)
-      local nextNotePPQ = nextNote and nextNote.ppq or getLength()
+      local nextNotePpq  = nextNote and nextNote.ppq or getLength()
+      local nextNotePpqL = nextNote
+        and (nextNote.ppqL or ctx:ppqToRow(nextNote.ppq, chan) * logPerRow)
+        or getLength()
       local lane = dstCol.lane
 
       -- Delete in-region events directly: queueDeleteNotes' survivor-extension
@@ -684,22 +730,16 @@ function newClipboard(deps)
       end
 
       local frame = currentFrame(dstCol.midiChan)
-      local capEndppqL = ctx:ppqToRow(nextNotePPQ, chan) * logPerRow
       local vi = 1
-      for _, ce in ipairs(events) do
-        while vi <= #velList and velList[vi].ppq <= ce.ppq do
+      for _, e in ipairs(events) do
+        while vi <= #velList and velList[vi].ppq <= e.ppq do
           currentVel = util.clamp(velList[vi].val, 1, 127)
           vi = vi + 1
         end
-        tm:addEvent('note', {
-          ppq            = ce.ppq,
-          endppq         = ce.endppq         or nextNotePPQ,
-          ppqL    = ce.ppqL,
-          endppqL = ce.endppqL or capEndppqL,
-          chan = dstCol.midiChan, pitch = ce.pitch, vel = currentVel,
-          lane = lane,
-          frame = frame,
-        })
+        e.endppq  = e.endppq  or nextNotePpq
+        e.endppqL = e.endppqL or nextNotePpqL
+        e.chan, e.vel, e.lane, e.frame = dstCol.midiChan, currentVel, lane, frame
+        tm:addEvent('note', e)
       end
       tm:flush()
       return
@@ -717,13 +757,10 @@ function newClipboard(deps)
       end
 
       local frame = currentFrame(dstCol.midiChan)
-      for _, ce in ipairs(events) do
-        local add = {
-          ppq = ce.ppq, ppqL = ce.ppqL,
-          chan = dstCol.midiChan, val = ce.val, frame = frame,
-        }
-        if dstCol.type == 'cc' then add.cc = dstCol.cc end
-        tm:addEvent(dstCol.type, add)
+      for _, e in ipairs(events) do
+        e.chan, e.frame = dstCol.midiChan, frame
+        if dstCol.type == 'cc' then e.cc = dstCol.cc end
+        tm:addEvent(dstCol.type, e)
       end
       tm:flush()
       return
@@ -795,15 +832,18 @@ function newClipboard(deps)
       local startppq = ctx:rowToPPQ(cRow, r.chan)
       local endppq   = ctx:rowToPPQ(capRow, r.chan)
 
-      -- Materialise clip events to target PPQs, sorted.
+      -- Materialise clip events to target PPQs, sorted. Same shape as
+      -- pasteSingle: clone preserves payload + custom metadata, then
+      -- the destination identity is overlaid in the write loop below.
       local events = {}
       for _, ce in ipairs(clipCol.events) do
         local ppq = ctx:rowToPPQ(cRow + ce.row, r.chan)
         if ppq < endppq then
-          local e = util.assign({ ppq = ppq, ppqL = (cRow + ce.row) * logPerRow }, ce)
+          local e = util.clone(ce, CLIP_ARTIFACTS)
+          e.ppq, e.ppqL = ppq, (cRow + ce.row) * logPerRow
           if ce.endRow then
             local eRow = math.min(cRow + ce.endRow, capRow)
-            e.endppq         = math.min(ctx:rowToPPQ(cRow + ce.endRow, r.chan), endppq)
+            e.endppq  = math.min(ctx:rowToPPQ(cRow + ce.endRow, r.chan), endppq)
             e.endppqL = eRow * logPerRow
           end
           util.add(events, e)
@@ -833,38 +873,29 @@ function newClipboard(deps)
       end
 
       -- End cap for pasted notes that lack an explicit endppq.
-      local capPPQ      = endppq
+      local capPPQ  = endppq
       local capppqL = capRow * logPerRow
       if r.type == 'note' and dst then
         local nn = util.seek(dst.events, 'at-or-after', endppq, util.isNote)
         if nn then
-          capPPQ      = math.min(capPPQ, nn.ppq)
-          capppqL = math.min(capppqL, ctx:ppqToRow(nn.ppq, r.chan) * logPerRow)
+          capPPQ  = math.min(capPPQ, nn.ppq)
+          capppqL = math.min(capppqL, nn.ppqL or ctx:ppqToRow(nn.ppq, r.chan) * logPerRow)
         end
       end
 
-      -- Write clip events.
+      -- Write clip events. The clone in materialise carries the payload
+      -- and any custom metadata; here we overlay only destination identity.
       local frame = currentFrame(r.chan)
       for _, e in ipairs(events) do
+        e.chan, e.frame = r.chan, frame
         if r.type == 'note' then
-          tm:addEvent('note', {
-            ppq = e.ppq, endppq = e.endppq or capPPQ,
-            ppqL    = e.ppqL,
-            endppqL = e.endppqL or capppqL,
-            chan = r.chan, pitch = e.pitch, vel = e.vel,
-            lane = r.lane, frame = frame,
-          })
+          e.endppq  = e.endppq  or capPPQ
+          e.endppqL = e.endppqL or capppqL
+          e.lane    = r.lane
         elseif r.type == 'cc' then
-          tm:addEvent('cc', {
-            ppq = e.ppq, ppqL = e.ppqL,
-            chan = r.chan, cc = r.ccNum, val = e.val, frame = frame,
-          })
-        else
-          tm:addEvent(r.type, {
-            ppq = e.ppq, ppqL = e.ppqL,
-            chan = r.chan, val = e.val, frame = frame,
-          })
+          e.cc = r.ccNum
         end
+        tm:addEvent(r.type, e)
       end
       ::nextCol::
     end
