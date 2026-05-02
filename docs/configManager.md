@@ -56,10 +56,10 @@ reloads (e.g. `viewManager`'s match-grid-to-cursor frame override). On
 
 | level     | backend                                            |
 |-----------|----------------------------------------------------|
-| global    | Lua file at `<script-dir>/rdm_cfg.txt`             |
+| global    | Lua file at `<script-dir>/ctm_cfg.txt`             |
 | project   | `SetProjExtState(0, 'rdm', 'config', …)`           |
-| track     | track `P_EXT:rdm_config`                           |
-| take      | take `P_EXT:rdm_config`                            |
+| track     | track `P_EXT:ctm_config`                           |
+| take      | take `P_EXT:ctm_config`                            |
 | transient | none — in-memory only, reset to `{}` on reload     |
 
 The four persisted backends use `util.serialise` / `util.unserialise`

@@ -1,17 +1,17 @@
-desc:Readium Sampler
-tags: sampler tracker readium
+desc:Continuum Sampler
+tags: sampler tracker continuum
 version: 0.01
-author: Readium
+author: Continuum
 license: MIT
 about:
-  Sample player driven by the Readium tracker.
+  Sample player driven by the Continuum tracker.
   - Sample selected per channel by Program Change.
   - Note On: pitch on msg2, velocity on msg3 (real velocity).
   - CC 7  = channel volume.
   - CC 10 = channel pan.
   - 32-voice global pool, hard-steal at saturation.
 
-options:gmem=Readium_sampler
+options:gmem=Continuum_sampler
 options:want_all_kb
 options:no_meter
 options:maxmem=64000000
@@ -611,7 +611,7 @@ function thumb_draw(idx, rx, ry, rw, rh)
 );
 
 // ============================================================
-// UI palette + helpers — mirrors Readium's cm palette atoms
+// UI palette + helpers — mirrors Continuum's cm palette atoms
 // (configManager.lua: palette.bg/shade/mid/inactive/danger/positive/amber/steel).
 // pal_* are called for their gfx_set side-effect; subsequent gfx_line / gfx_rect
 // inherit that colour. Alpha threaded as the only argument since the same role
@@ -793,7 +793,7 @@ file_mem(0, mute_flags, N_SAMPLES);
 file_mem(0, solo_flags, N_SAMPLES);
 
 @block
-// Readium → sampler import hook lands here: poll gmem[Readium_sampler] for a
+// Continuum → sampler import hook lands here: poll gmem[Continuum_sampler] for a
 // magic-tagged record { magic, slot_idx, path_chars..., 0 } and route through
 // load_sample_from_file(slot, path) — same loader as drag-drop. Not wired yet.
 
@@ -919,7 +919,7 @@ gfx_setfont(1, "Arial", 13);
 
 gfx_y = 6; gfx_x = 8;
 pal_shade(1);
-gfx_drawstr("Readium Sampler");
+gfx_drawstr("Continuum Sampler");
 
 // ---------- Mouse edge detect ----------
 mouse_dn   = (mouse_cap & 1) && !mouse_prev;

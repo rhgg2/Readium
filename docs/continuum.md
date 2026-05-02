@@ -1,4 +1,4 @@
-# readium
+# continuum
 
 Entry point. Loads every module, wires the managers together in the
 layered order, and drives the render loop via `reaper.defer`.
@@ -76,9 +76,9 @@ itself via `reaper.defer(loop)`.
 ## API reference
 
 ```
-loadModule(name)                 -- relative require, used by readium.lua itself
+loadModule(name)                 -- relative require, used by continuum.lua itself
 Main()                           -- bound to the ReaScript action
 ```
 
 No public Lua API — downstream code talks to the managers, not to
-readium itself.
+continuum itself.

@@ -8,10 +8,10 @@ mutation lock.
 
 Every uuid'd event has a metadata blob in **take extension data** under
 two key families:
-- `P_EXT:rdm_keys` — comma-separated list of all UUID texts. Loader's entry point.
-- `P_EXT:rdm_<uuidTxt>` — `util.serialise`d field table per event.
+- `P_EXT:ctm_keys` — comma-separated list of all UUID texts. Loader's entry point.
+- `P_EXT:ctm_<uuidTxt>` — `util.serialise`d field table per event.
 
-Stale keys (present in `rdm_keys` but no longer in `uuids`) are cleared by
+Stale keys (present in `ctm_keys` but no longer in `uuids`) are cleared by
 writing an empty string to their extension slot — REAPER treats this as
 deletion. UUIDs are monotonic integers, base-36 encoded; the namespace is
 unified across notes and ccs.
@@ -19,7 +19,7 @@ unified across notes and ccs.
 ### Notes — notation-event carrier
 
 Every note carries a UUID stored as a REAPER **notation event**
-`NOTE <chan> <pitch> custom rdm_<base36uuid>`, co-located with the note at
+`NOTE <chan> <pitch> custom ctm_<base36uuid>`, co-located with the note at
 the same ppq. UUIDs are universal: every note gets one on load whether or not
 it carries metadata.
 
@@ -41,16 +41,16 @@ On load, duplicates, missing UUIDs, and collisions are reconciled:
 
 CCs (and the cc-family events `pa`/`pb`/`pc`/`at`) acquire a UUID **only when
 metadata is written**. Plain automation streams stay free of overhead until
-Readium touches them.
+Continuum touches them.
 
-The carrier is a coincident sysex with a Readium magic prefix
+The carrier is a coincident sysex with a Continuum magic prefix
 (`F0 7D 52 44 4D ... F7` on disk; `7D 52 44 4D ...` body when handled via
 `MIDI_*TextSysexEvt(... type=-1 ...)` — REAPER frames it). The body encodes
 `(uuid, msgType, chan, [cc|pitch], val)` so the carrier can re-bind to its
 event at load time even after drift.
 
 Sidecars sit alongside ordinary sysex but are routed to an internal
-`sidecars` table during load — Readium only surfaces notes and CCs to its
+`sidecars` table during load — Continuum only surfaces notes and CCs to its
 upper layers, so plain sysex/text events have no public accessors.
 
 **Reconciliation (load-time).** Sidecars don't have a REAPER-side anchor to
@@ -84,10 +84,10 @@ flagged guess.
    provably-wrong event.
 
 After binding the bound cc gets `uuid` and `uuidIdx` (the sysex index of its
-sidecar); metadata from `rdm_<uuid>` is merged onto the cc just like for
+sidecar); metadata from `ctm_<uuid>` is merged onto the cc just like for
 notes. Non-silent binds (stages 2-4) also rewrite the sidecar's ppq + body
 so the next load is stage-1 silent. Sidecars unbound after reconcile
-(orphaned / ambiguous) are deleted from the take and their `rdm_<uuid>`
+(orphaned / ambiguous) are deleted from the take and their `ctm_<uuid>`
 ext-data is purged by the stale-key sweep.
 
 **Dedup (pre-reconciliation).** ccs are dedup'd by `(ppq, chan, msgType,
@@ -107,7 +107,7 @@ just been dropped — or that never had one — flows through reconciliation
 as a `valueRebound` / `consensusRebound` / `guessedRebound` / `ambiguous`
 / `orphaned` event, and the post-reconcile cleanup deletes orphan
 sidecars. The stale-key sweep in `saveMetadata` purges any
-`rdm_<uuid>` ext-data left behind. Emits `ccsDeduped` with one event per
+`ctm_<uuid>` ext-data left behind. Emits `ccsDeduped` with one event per
 group; running before reconciliation means dedup has no uuid attachments
 to report, so the event no longer carries `keptHadUuid`.
 
@@ -225,13 +225,13 @@ fast-start, fast-end, bezier` → 0..5. `tension` is only meaningful for
 
 ## Text / sysex events
 
-Readium reads two text-event types and ignores the rest:
-- Notation events (REAPER type 15) matching the `rdm_<uuid>` pattern bind
+Continuum reads two text-event types and ignores the rest:
+- Notation events (REAPER type 15) matching the `ctm_<uuid>` pattern bind
   to their note via `note.uuidIdx`.
-- Sysex events (REAPER type -1) whose body starts with the Readium magic
+- Sysex events (REAPER type -1) whose body starts with the Continuum magic
   (`}RDM`, `7D 52 44 4D`) are cc sidecars and feed the `sidecars` table.
 
-Everything else passes through untouched — Readium neither surfaces nor
+Everything else passes through untouched — Continuum neither surfaces nor
 mutates plain sysex/text events.
 
 ## LUT discipline
@@ -301,7 +301,7 @@ mm:assignCC(loc, t)      -- merge t into CC
     -> still requires lock (allocates a uuid + inserts a sidecar)
   any event-field change rewrites the sidecar fingerprint, and a ppq change
     moves the sidecar so next load is tier-1 clean
-mm:deleteCC(loc)         -- also removes the sidecar and clears the rdm_<uuid> slot
+mm:deleteCC(loc)         -- also removes the sidecar and clears the ctm_<uuid> slot
 ```
 
 ### Take data

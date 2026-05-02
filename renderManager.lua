@@ -2133,7 +2133,7 @@ function newRenderManager(vm, cm, cmgr)
   local rm = {}
 
   function rm:init()
-    ctx    = ImGui.CreateContext('Readium Tracker')
+    ctx    = ImGui.CreateContext('Continuum Tracker')
     ImGui.SetConfigVar(ctx, ImGui.ConfigVar_ViewportsNoDecoration, 0)
     -- macOS' system font is private (dot-prefixed) and not reachable by
     -- family name, so load SFNS.ttf directly. Other platforms resolve by name.
@@ -2162,7 +2162,7 @@ function newRenderManager(vm, cm, cmgr)
     -- the parchment grid go edge-to-edge. Each child sets its own inner
     -- WindowPadding for breathing room around its content.
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, 0, 0)
-    local visible, open = ImGui.Begin(ctx, 'Readium Tracker', true,
+    local visible, open = ImGui.Begin(ctx, 'Continuum Tracker', true,
       ImGui.WindowFlags_NoScrollbar
       | ImGui.WindowFlags_NoScrollWithMouse
       | ImGui.WindowFlags_NoDocking

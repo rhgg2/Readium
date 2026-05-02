@@ -107,7 +107,7 @@ return {
       -- stale key alongside a valid one.
       local serialised = util.serialise({ pbRange = 5, legacyKey = 'oops' })
       local take = 'take1'
-      h.reaper._state.takeExt[take .. '/P_EXT:rdm_config'] = serialised
+      h.reaper._state.takeExt[take .. '/P_EXT:ctm_config'] = serialised
 
       -- Fresh cm sharing the same reaper state.
       local cm2 = newConfigManager()
@@ -117,7 +117,7 @@ return {
       t.falsy(ok, 'stale key is not reachable through get (would raise if tried)')
       -- And a write to an unrelated valid key must not resurrect legacyKey.
       cm2:set('take', 'rowPerBeat', 9)
-      local raw = h.reaper._state.takeExt[take .. '/P_EXT:rdm_config']
+      local raw = h.reaper._state.takeExt[take .. '/P_EXT:ctm_config']
       t.falsy(raw:find('legacyKey'), 'legacyKey was pruned on load and did not round-trip: ' .. raw)
     end,
   },

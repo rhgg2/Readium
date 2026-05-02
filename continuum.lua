@@ -1,4 +1,4 @@
--- See docs/readium.md for the model and API reference.
+-- See docs/continuum.md for the model and API reference.
 
 function loadModule(module)
   local info = debug.getinfo(1,'S')

@@ -41,7 +41,7 @@ local function packCc(c)
 end
 
 -- Spec for an event-row plus optional metadata. Sidecar specs that include
--- a `metadata` field also get an rdm_<uuid> ext-data entry. uuids must be
+-- a `metadata` field also get an ctm_<uuid> ext-data entry. uuids must be
 -- explicit and globally unique within the take.
 local function seed(take, reaper, spec)
   local notes, ccs, texts = {}, {}, {}
@@ -64,7 +64,7 @@ local function seed(take, reaper, spec)
   end
   reaper:seedMidi(take, { notes = notes, ccs = ccs, texts = texts })
 
-  -- Lay down rdm_<uuid> ext-data and rdm_keys for any sidecar carrying metadata.
+  -- Lay down ctm_<uuid> ext-data and ctm_keys for any sidecar carrying metadata.
   local keys = {}
   local function uuidTxt(u)
     local s, n = '', u
@@ -77,12 +77,12 @@ local function seed(take, reaper, spec)
     if sc.metadata then
       local txt = uuidTxt(sc.uuid)
       keys[#keys+1] = txt
-      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. txt,
+      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_' .. txt,
         util.serialise(sc.metadata, {}), true)
     end
   end
   if #keys > 0 then
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keys, ','), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', table.concat(keys, ','), true)
   end
 end
 
@@ -116,7 +116,7 @@ return {
       t.eq(captured.ccsReconciled, nil, 'no signal on tier-1 silent bind')
       local cc = mm:getCC(1)
       t.eq(cc.uuid, 1, 'cc bound to sidecar uuid')
-      t.eq(cc.foo, 'bar', 'metadata merged from rdm_<uuid>')
+      t.eq(cc.foo, 'bar', 'metadata merged from ctm_<uuid>')
     end,
   },
 
@@ -194,8 +194,8 @@ return {
       t.eq(txtCount, 0, 'orphan sidecar removed')
 
       -- Ext-data slot purged by saveMetadata's stale-key sweep.
-      local _, keys = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
-      t.eq(keys, '', 'rdm_keys cleared')
+      local _, keys = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', '', false)
+      t.eq(keys, '', 'ctm_keys cleared')
     end,
   },
 

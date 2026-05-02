@@ -9,10 +9,10 @@
 --                       prints op 13 grep-snippet, prints final table.
 --
 -- Between runs the user must save the project, close REAPER, reopen, and
--- re-run the script. State carries across via reaper ExtState ("rdm_spike").
+-- re-run the script. State carries across via reaper ExtState ("ctm_spike").
 --
--- The spike adds two scratch tracks ("rdm_spike_scratch", "rdm_spike_probes")
--- and a destination track for op 12 ("rdm_spike_dest"). Phase B deletes them
+-- The spike adds two scratch tracks ("ctm_spike_scratch", "ctm_spike_probes")
+-- and a destination track for op 12 ("ctm_spike_dest"). Phase B deletes them
 -- on completion. Run on a scratch project — your work will be wrapped in an
 -- undo block but you should not run this on a real session.
 
@@ -49,7 +49,7 @@ local function info(op, d) record(op, "INFO", d) end
 
 ----- ExtState (phase only)
 
-local NS = "rdm_spike"
+local NS = "ctm_spike"
 local function getPhase()   return reaper.GetExtState(NS, "phase") end
 local function setPhase(p)  reaper.SetExtState(NS, "phase", p, false) end
 local function clearPhase() reaper.DeleteExtState(NS, "phase", false) end
@@ -427,9 +427,9 @@ local function runPhaseA()
   out("===== rdm sidecar spike — phase A =====")
   reaper.Undo_BeginBlock()
 
-  local scratch = ensureTrack("rdm_spike_scratch")
-  local probes  = ensureTrack("rdm_spike_probes")
-  local dest    = ensureTrack("rdm_spike_dest")
+  local scratch = ensureTrack("ctm_spike_scratch")
+  local probes  = ensureTrack("ctm_spike_probes")
+  local dest    = ensureTrack("ctm_spike_dest")
 
   op1_immediate_readback(scratch)
   op5_glue(scratch)
@@ -444,11 +444,11 @@ local function runPhaseA()
   setupProbes(probes)
   clearTrack(scratch)
   clearTrack(dest)
-  deleteTrack("rdm_spike_scratch")
-  deleteTrack("rdm_spike_dest")
+  deleteTrack("ctm_spike_scratch")
+  deleteTrack("ctm_spike_dest")
 
   setPhase("B")
-  reaper.Undo_EndBlock("rdm_spike phase A", -1)
+  reaper.Undo_EndBlock("ctm_spike phase A", -1)
   reaper.UpdateArrange()
 
   summarise()
@@ -465,18 +465,18 @@ local function runPhaseB()
   out("===== rdm sidecar spike — phase B =====")
   reaper.Undo_BeginBlock()
 
-  local probes = findTrack("rdm_spike_probes")
+  local probes = findTrack("ctm_spike_probes")
   if not probes then
-    fail("?", "rdm_spike_probes track not found — was the project saved between phases?")
+    fail("?", "ctm_spike_probes track not found — was the project saved between phases?")
   else
     phaseB(probes)
   end
 
   -- Cleanup
-  deleteTrack("rdm_spike_probes")
+  deleteTrack("ctm_spike_probes")
   clearPhase()
 
-  reaper.Undo_EndBlock("rdm_spike phase B", -1)
+  reaper.Undo_EndBlock("ctm_spike phase B", -1)
   reaper.UpdateArrange()
 
   summarise()

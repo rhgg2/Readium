@@ -1,12 +1,12 @@
 # timing
 
-Cross-cutting reference for time in Readium: the three frames, who owns
+Cross-cutting reference for time in Continuum: the three frames, who owns
 them, and the transforms between them. Also the API reference for
 `timing.lua`, the pure module that implements those transforms.
 
 ## The three frames
 
-Time in Readium lives in three frames, stacked from authoring down to
+Time in Continuum lives in three frames, stacked from authoring down to
 storage:
 
 - **logical** (`ppqL`) — the authoring grid. Row `r` sits at

@@ -62,12 +62,12 @@ local function seed(take, reaper, spec)
     if sc.metadata then
       local txt = uuidTxt(sc.uuid)
       keys[#keys+1] = txt
-      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. txt,
+      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_' .. txt,
         util.serialise(sc.metadata, {}), true)
     end
   end
   if #keys > 0 then
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keys, ','), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', table.concat(keys, ','), true)
   end
 end
 
@@ -229,11 +229,11 @@ return {
       t.eq(#bodies, 1, 'loser sidecar deleted by reconcile orphan path')
       t.eq(bodies[1].uuid, survivor.uuid)
 
-      local _, keys = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
-      t.eq(keys, uuidTxt(survivor.uuid), 'only winner uuid remains in rdm_keys')
+      local _, keys = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', '', false)
+      t.eq(keys, uuidTxt(survivor.uuid), 'only winner uuid remains in ctm_keys')
       local _, loserSlot = reaper.GetSetMediaItemTakeInfo_String(
-        take, 'P_EXT:rdm_' .. uuidTxt(loserUuid), '', false)
-      t.eq(loserSlot, '', 'loser rdm_<uuid> slot purged')
+        take, 'P_EXT:ctm_' .. uuidTxt(loserUuid), '', false)
+      t.eq(loserSlot, '', 'loser ctm_<uuid> slot purged')
     end,
   },
 

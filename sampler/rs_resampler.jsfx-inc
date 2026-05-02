@@ -1,4 +1,4 @@
-desc:Readium Sampler — sinc resampling kernels
+desc:Continuum Sampler — sinc resampling kernels
 @init
 
 KERNEL_PHASES = 256;

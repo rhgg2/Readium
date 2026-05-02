@@ -94,7 +94,7 @@ function M.new()
 
   function r.ShowConsoleMsg(msg)
     state.console[#state.console + 1] = msg
-    if os.getenv('RDM_TEST_VERBOSE') then io.write(msg) end
+    if os.getenv('CTM_TEST_VERBOSE') then io.write(msg) end
   end
 
   -- MIDI take store. Created lazily on first reference. Each list keeps

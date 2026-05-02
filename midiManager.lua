@@ -110,11 +110,11 @@ function newMidiManager(take)
     local function idOf(cc) return cc.cc or cc.pitch or 0 end
 
     function noteSidecarEncode(note)
-      return string.format('NOTE %d %d custom rdm_%s', note.chan-1, note.pitch, toBase36(note.uuid))
+      return string.format('NOTE %d %d custom ctm_%s', note.chan-1, note.pitch, toBase36(note.uuid))
     end
 
     function noteSidecarDecode(msg)
-      local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+rdm_(.+)$')
+      local chan, pitch, uuidTxt = msg:match('^NOTE%s+(%d+)%s+(%d+)%s+custom%s+ctm_(.+)$')
       if uuidTxt then
         return { chan = chan + 1, pitch = pitch, uuid = fromBase36(uuidTxt) }
       end
@@ -163,14 +163,14 @@ function newMidiManager(take)
   local function loadMetadata()
     if not take then return {} end
 
-    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
+    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', '', false)
     if not (ok and keysText and keysText ~= '') then return {} end
     local tbl = {}
     for uuidTxt in keysText:gmatch('[^,]+') do
       local uuid = fromBase36(uuidTxt)
       tbl[uuid] = { }
 
-      local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, '', false)
+      local entryOk, fields = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_' .. uuidTxt, '', false)
       if entryOk and fields then
         tbl[uuid] = util.unserialise(fields)
       end
@@ -202,13 +202,13 @@ function newMidiManager(take)
     end
 
     local strip = evt.msgType and ccEventFields or noteEventFields
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. uuidTxt, util.serialise(evt, strip), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_' .. uuidTxt, util.serialise(evt, strip), true)
 
     -- Ensure this UUID is in the keys list so loadMetadata() finds it on reload
-    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
+    local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', '', false)
     if not ok or not keysText or not keysText:find(uuidTxt, 1, true) then
       local keys = (ok and keysText and keysText ~= '') and (keysText .. ',' .. uuidTxt) or uuidTxt
-      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', keys, true)
+      reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', keys, true)
     end
   end
 
@@ -224,17 +224,17 @@ function newMidiManager(take)
       saveMetadatum(uuid)
     end
 
-    local ok, oldKeysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', '', false)
+    local ok, oldKeysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', '', false)
     if ok and oldKeysText and oldKeysText ~= '' then
       for oldUuidTxt in oldKeysText:gmatch('[^,]+') do
         if not newKeys[oldUuidTxt] then
           -- Writing an empty string effectively removes the extension data
-          reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_' .. oldUuidTxt, '', true)
+          reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_' .. oldUuidTxt, '', true)
         end
       end
     end
 
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_keys', table.concat(keyList, ','), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', table.concat(keyList, ','), true)
   end
 
   ----- Utils
@@ -803,7 +803,7 @@ function newMidiManager(take)
       -- modify() resolves uuids → live sysex idxs at end of fn.
       util.add(pendingSysexDeletes, msg.uuid)
       eventsByUuid[msg.uuid] = nil
-      -- saveMetadata at end-of-modify purges the rdm_<uuid> ext-data slot
+      -- saveMetadata at end-of-modify purges the ctm_<uuid> ext-data slot
     end
     ccs[loc] = nil
   end

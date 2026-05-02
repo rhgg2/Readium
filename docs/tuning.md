@@ -1,6 +1,6 @@
 # tuning
 
-Cross-cutting reference for pitch in Readium: how a note's tuning is
+Cross-cutting reference for pitch in Continuum: how a note's tuning is
 *authored* (the coordinate system) and how it is *realised* (the
 intent / realisation split). Also the API reference for `tuning.lua`,
 the pure module that owns the coordinate-system layer.
@@ -13,7 +13,7 @@ sites without losing precision in headings and comments.
 
 ## The pitch model
 
-Pitch in Readium splits into two concerns that don't contaminate each
+Pitch in Continuum splits into two concerns that don't contaminate each
 other:
 
 - **Coordinate system** — how a note's pitch is *named*. The MIDI

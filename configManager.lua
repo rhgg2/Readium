@@ -147,9 +147,9 @@ function newConfigManager()
 
   ---------- PRIVATE DATA
 
-  local CONFIG_PREFIX = 'rdm_'
+  local CONFIG_PREFIX = 'ctm_'
   local SCRIPT_PATH = debug.getinfo(1,'S').source:match[[^@?(.*[\/])[^\/]-$]]
-  local CONFIG_GLOBAL_PATH = SCRIPT_PATH .. 'rdm_cfg.txt'
+  local CONFIG_GLOBAL_PATH = SCRIPT_PATH .. 'ctm_cfg.txt'
 
   local take      = nil
   local track     = nil
@@ -232,7 +232,7 @@ function newConfigManager()
 
   local function loadTake()
     if not take then return {} end
-    local ok, val = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', '', false)
+    local ok, val = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_config', '', false)
     return ok and parse(val)
   end
 
@@ -241,7 +241,7 @@ function newConfigManager()
       print('Error! No take context for config storage')
       return
     end
-    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:rdm_config', util.serialise(tbl), true)
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_config', util.serialise(tbl), true)
   end
 
   local loaders = {
