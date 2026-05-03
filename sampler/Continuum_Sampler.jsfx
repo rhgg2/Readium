@@ -60,11 +60,18 @@ THUMB_W           = 100;           // waveform thumbnail width (px columns), min
 //     [2..] path bytes, 0-terminated
 //   gmem[NAMES_BASE..NAMES_BASE+N_SAMPLES*NAME_STRIDE-1] : names slab (sampler→Continuum)
 //     one slot per sample: ASCII bytes then 0-terminator
+//   gmem[PREVIEW_BASE..PREVIEW_BASE+1023] : Continuum→sampler preview mailbox
+//     [0]   magic (0=empty, MAGIC=pending; written last)
+//     [1]   slot index (0..N_SAMPLES-1 = preview existing slot;
+//                       PREVIEW_SLOT_IDX = load path bytes into hidden slot first)
+//     [2]   bounds flag (0 full file, 1 honour SH_START/SH_END)
+//     [3..] path bytes, 0-terminated (only read when slot == PREVIEW_SLOT_IDX)
 // Continuum mirrors these constants — keep in sync.
-CTM_GMEM_MAGIC       = 1717658484;    // 'CTML' as 32-bit ASCII
-CTM_GMEM_PATH_MAX    = 1022;          // load slab fits in 1024 floats
-CTM_GMEM_NAMES_BASE  = 1024;
-CTM_GMEM_NAME_STRIDE = 64;            // chars per name including 0-terminator
+CTM_GMEM_MAGIC         = 1717658484;    // 'CTML' as 32-bit ASCII
+CTM_GMEM_PATH_MAX      = 1022;          // load / preview slabs fit in 1024 floats
+CTM_GMEM_NAMES_BASE    = 1024;
+CTM_GMEM_NAME_STRIDE   = 64;            // chars per name including 0-terminator
+CTM_GMEM_PREVIEW_BASE  = 5120;          // = NAMES_BASE + N_SAMPLES * NAME_STRIDE
 
 // Sample header field offsets
 SH_LENGTH     = 0;   SH_FS         = 1;   SH_BASENOTE = 2;
@@ -115,6 +122,11 @@ C_RPAN            = 4;
 PREVIEW_CHAN      = N_CHANNELS;   // dedicated chan_struct slot for UI preview voices.
                                   // Lives above MIDI's 0..15 range, so `m1 & 15`
                                   // dispatch can never address it.
+PREVIEW_SLOT_IDX  = N_SAMPLES;    // hidden slot above the user-facing 0..N_SAMPLES-1.
+                                  // Path-preview from the Continuum browser loads
+                                  // here so it never clobbers a real slot. UI loops
+                                  // (grid, names publish, serialize) iterate
+                                  // 0..N_SAMPLES-1 so this slot stays invisible.
 
 // ============================================================
 // Memory layout
@@ -127,7 +139,8 @@ PREVIEW_CHAN      = N_CHANNELS;   // dedicated chan_struct slot for UI preview v
 // set (a handful of loaded slots) well under the cap.
 freemem = 0;
 
-samplelocs      = freemem; freemem += N_SAMPLES;        // pointer per slot, 0 if unloaded
+samplelocs      = freemem; freemem += N_SAMPLES + 1;    // pointer per slot, 0 if unloaded;
+                                                        // +1 reserves PREVIEW_SLOT_IDX
 params_base     = freemem; freemem += N_SAMPLES * PARAMS_STRIDE;
 mute_flags      = freemem; freemem += N_SAMPLES;
 solo_flags      = freemem; freemem += N_SAMPLES;
@@ -149,7 +162,7 @@ heap_top = freemem;
 // would hand a fresh slot the same address as a still-referenced old one,
 // silently merging two slots (shared buffer, handles, preview).
 ifix = 0;
-loop(N_SAMPLES,
+loop(N_SAMPLES + 1,
   samplelocs[ifix] >= heap_top ?
     heap_top = samplelocs[ifix] + SAMPLE_SLOT_SIZE;
   ifix += 1;
@@ -535,7 +548,7 @@ function basename_to(dest_str, path)
 // Silently no-ops if ensure_slot() can't allocate (heap exhausted).
 function load_sample_from_file(idx, path_str)
   local(fh, num_channels, samplerate, length, ptr, max_mono_frames, slot)
-  global(NAME_BASE, thumb_dirty,
+  global(NAME_BASE, thumb_dirty, N_SAMPLES,
          SAMPLE_HEADER_SIZE, SAMPLE_BUFFER_FRAMES, SAMPLE_SLOT_SIZE,
          SH_LENGTH, SH_FS, SH_BASENOTE)
 (
@@ -569,7 +582,9 @@ function load_sample_from_file(idx, path_str)
 
       basename_to(NAME_BASE + idx, path_str);
       file_close(fh);
-      thumb_dirty[idx] = 1;
+      // thumb_dirty/thumb_base sized N_SAMPLES; preview slot is ephemeral
+      // and never rendered in the grid, so skip thumbnail bookkeeping for it.
+      idx < N_SAMPLES ? thumb_dirty[idx] = 1;
     );
   );
 );
@@ -827,6 +842,31 @@ gmem[0] == CTM_GMEM_MAGIC ? (
   ctm_slot >= 0 && ctm_slot < N_SAMPLES ?
     load_sample_from_file(ctm_slot, CTM_GMEM_PATH_STR);
   gmem[0] = 0;
+);
+
+// Continuum → sampler preview request. slot field discriminates: < N_SAMPLES
+// previews an existing slot; == PREVIEW_SLOT_IDX path-loads into the hidden
+// slot first, then previews. preview_consume() (driven from @block tail) does
+// the voice work. Bounds=1 honours SH_START/SH_END, 0 plays the full file.
+gmem[CTM_GMEM_PREVIEW_BASE] == CTM_GMEM_MAGIC ? (
+  pv_slot   = gmem[CTM_GMEM_PREVIEW_BASE + 1];
+  pv_bounds = gmem[CTM_GMEM_PREVIEW_BASE + 2];
+  pv_slot == PREVIEW_SLOT_IDX ? (
+    strcpy(CTM_GMEM_PATH_STR, "");
+    pv_i = 0;
+    pv_done = 0;
+    while (pv_i < CTM_GMEM_PATH_MAX && !pv_done) (
+      pv_ch = gmem[CTM_GMEM_PREVIEW_BASE + 3 + pv_i];
+      pv_ch == 0 ? pv_done = 1
+      : ( str_setchar(CTM_GMEM_PATH_STR, pv_i, pv_ch); pv_i += 1; );
+    );
+    load_sample_from_file(PREVIEW_SLOT_IDX, CTM_GMEM_PATH_STR);
+  );
+  pv_slot >= 0 && pv_slot <= PREVIEW_SLOT_IDX ? (
+    preview_request_slot   = pv_slot;
+    preview_request_bounds = pv_bounds;
+  );
+  gmem[CTM_GMEM_PREVIEW_BASE] = 0;
 );
 
 // Publish sample names to gmem so Continuum can show them. Always re-emit;

@@ -43,6 +43,15 @@ function probeTrackerMode(mm, cm)
   if cm:get('trackerMode') ~= detected then
     cm:set('transient', 'trackerMode', detected)
   end
+  -- Anticipative FX puts the sampler to sleep when idle; preview mailbox
+  -- wake-up then takes 200–500 ms. I_PERFFLAGS bit 2 disables it on this
+  -- track only. Persistent (saved with the project), set once.
+  if detected then
+    local pf = reaper.GetMediaTrackInfo_Value(track, 'I_PERFFLAGS')
+    if (pf & 2) == 0 then
+      reaper.SetMediaTrackInfo_Value(track, 'I_PERFFLAGS', pf | 2)
+    end
+  end
 end
 
 -- gmem[Continuum_sampler] layout:
@@ -52,22 +61,50 @@ end
 --     [2..] path bytes, 0-terminated
 --   [NAMES_BASE..NAMES_BASE+N*STRIDE-1] names slab (sampler→Continuum)
 --     one slot per sample: ASCII bytes then 0-terminator
--- N_SAMPLES + NAME_STRIDE must match the JSFX constants.
-local CTM_GMEM_NS          = 'Continuum_sampler'
-local CTM_GMEM_MAGIC       = 1717658484   -- 'CTML' as 32-bit ASCII
-local CTM_GMEM_NAMES_BASE  = 1024
-local CTM_GMEM_NAME_STRIDE = 64
-local CTM_N_SAMPLES        = 64
+--   [PREVIEW_BASE..PREVIEW_BASE+1023]  preview mailbox (Continuum→sampler)
+--     [0]   magic
+--     [1]   slot (0..N-1 = preview existing slot; PREVIEW_SLOT_IDX = path-load first)
+--     [2]   bounds (0 full file, 1 honour SH_START/SH_END)
+--     [3..] path bytes, 0-terminated (only when slot == PREVIEW_SLOT_IDX)
+-- All constants must match the JSFX side.
+local CTM_GMEM_NS            = 'Continuum_sampler'
+local CTM_GMEM_MAGIC         = 1717658484   -- 'CTML' as 32-bit ASCII
+local CTM_GMEM_NAMES_BASE    = 1024
+local CTM_GMEM_NAME_STRIDE   = 64
+local CTM_N_SAMPLES          = 64
+local CTM_GMEM_PREVIEW_BASE  = 5120         -- = NAMES_BASE + N_SAMPLES * NAME_STRIDE
+local CTM_PREVIEW_SLOT_IDX   = CTM_N_SAMPLES
+
+local function writeGmemPath(base, path)
+  for i = 1, #path do reaper.gmem_write(base + i - 1, path:byte(i)) end
+  reaper.gmem_write(base + #path, 0)
+end
 
 function samplerLoadSlot(slot, path)
   reaper.gmem_attach(CTM_GMEM_NS)
   if reaper.gmem_read(0) ~= 0 then return false end
-  for i = 1, #path do
-    reaper.gmem_write(1 + i, path:byte(i))
-  end
-  reaper.gmem_write(2 + #path, 0)
+  writeGmemPath(2, path)
   reaper.gmem_write(1, slot)
   reaper.gmem_write(0, CTM_GMEM_MAGIC)
+  return true
+end
+
+function samplerPreviewSlot(slot, bounds)
+  reaper.gmem_attach(CTM_GMEM_NS)
+  if reaper.gmem_read(CTM_GMEM_PREVIEW_BASE) ~= 0 then return false end
+  reaper.gmem_write(CTM_GMEM_PREVIEW_BASE + 1, slot)
+  reaper.gmem_write(CTM_GMEM_PREVIEW_BASE + 2, bounds)
+  reaper.gmem_write(CTM_GMEM_PREVIEW_BASE, CTM_GMEM_MAGIC)
+  return true
+end
+
+function samplerPreviewPath(path)
+  reaper.gmem_attach(CTM_GMEM_NS)
+  if reaper.gmem_read(CTM_GMEM_PREVIEW_BASE) ~= 0 then return false end
+  writeGmemPath(CTM_GMEM_PREVIEW_BASE + 3, path)
+  reaper.gmem_write(CTM_GMEM_PREVIEW_BASE + 1, CTM_PREVIEW_SLOT_IDX)
+  reaper.gmem_write(CTM_GMEM_PREVIEW_BASE + 2, 0)
+  reaper.gmem_write(CTM_GMEM_PREVIEW_BASE, CTM_GMEM_MAGIC)
   return true
 end
 
@@ -121,7 +158,7 @@ function Main()
   end)
 
   local vm = newViewManager(tm, cm, cmgr)
-  local sv = newSampleView(cm, samplerLoadSlot)
+  local sv = newSampleView(cm, samplerLoadSlot, samplerPreviewSlot, samplerPreviewPath)
   local renderer = newRenderManager(vm, cm, cmgr, sv)
   probeTrackerMode(mm, cm)
   renderer:init()

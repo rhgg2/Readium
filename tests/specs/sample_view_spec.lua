@@ -70,4 +70,42 @@ return {
       t.eq(calls[1][2], '/x.wav', "path is selectedFile")
     end,
   },
+  {
+    name = "auditionPath(nil) is a no-op",
+    run = function(harness)
+      local h = harness.mk()
+      local calls = {}
+      local sv = newSampleView(h.cm, function() end,
+        function() calls[#calls+1] = 'slot' end,
+        function() calls[#calls+1] = 'path' end)
+      t.eq(sv:auditionPath(nil), false, "returns false")
+      t.eq(#calls, 0, "previewPath not invoked")
+    end,
+  },
+  {
+    name = "auditionPath(p) calls previewPath with that path",
+    run = function(harness)
+      local h = harness.mk()
+      local pathCalls = {}
+      local sv = newSampleView(h.cm, function() end, function() end,
+        function(p) pathCalls[#pathCalls+1] = p end)
+      t.eq(sv:auditionPath('/kick.wav'), true, "returns true")
+      t.eq(#pathCalls, 1, "previewPath called once")
+      t.eq(pathCalls[1], '/kick.wav', "path forwarded")
+    end,
+  },
+  {
+    name = "auditionSlot(idx) calls previewSlot(idx, 1)",
+    run = function(harness)
+      local h = harness.mk()
+      local slotCalls = {}
+      local sv = newSampleView(h.cm, function() end,
+        function(slot, bounds) slotCalls[#slotCalls+1] = { slot, bounds } end,
+        function() end)
+      sv:auditionSlot(7)
+      t.eq(#slotCalls, 1, "previewSlot called once")
+      t.eq(slotCalls[1][1], 7, "slot forwarded")
+      t.eq(slotCalls[1][2], 1, "bounds=1 (honour SH_START/SH_END)")
+    end,
+  },
 }

@@ -3,8 +3,8 @@
 -- Take-independent view for sample mode. Slot list + browser key against
 -- a REAPER track, not a take; continuum.lua's loop pushes the selected
 -- track in via setTrack each tick. Browser root comes from cm
--- (`sampleBrowserRoot`); $HOME is the lazy fallback. loadSlot is the
--- gmem-mailbox writer (samplerLoadSlot in continuum.lua); injecting it
+-- (`sampleBrowserRoot`); $HOME is the lazy fallback. loadSlot / previewSlot /
+-- previewPath are the gmem-mailbox writers in continuum.lua; injecting them
 -- keeps sv free of gmem vocabulary and testable without REAPER.
 
 loadModule('fs')
@@ -15,8 +15,9 @@ loadModule('fs')
 local ImGui
 
 local N_SLOTS = 64
+local PLAY    = '\xe2\x96\xb6'  -- U+25B6 ▶
 
-function newSampleView(cm, loadSlot)
+function newSampleView(cm, loadSlot, previewSlot, previewPath)
   local sv = {}
   local track         = nil
   local currentFolder = nil  -- folder whose files fill the middle pane
@@ -43,6 +44,10 @@ function newSampleView(cm, loadSlot)
   local function drawFiles(ctx, path)
     for _, file in ipairs(fs.listAudioFiles(path)) do
       local full = fs.join(path, file)
+      if ImGui.SmallButton(ctx, PLAY .. '##' .. full) then
+        sv:auditionPath(full)
+      end
+      ImGui.SameLine(ctx)
       local clicked = ImGui.Selectable(ctx, file, selectedFile == full,
                                        ImGui.SelectableFlags_AllowDoubleClick)
       if clicked then
@@ -58,6 +63,10 @@ function newSampleView(cm, loadSlot)
     local names   = cm:get('samplerNames') or {}
     local current = cm:get('currentSample')
     for idx = 0, N_SLOTS - 1 do
+      if ImGui.SmallButton(ctx, PLAY .. '##slot' .. idx) then
+        sv:auditionSlot(idx)
+      end
+      ImGui.SameLine(ctx)
       local label = string.format('[%02d] %s', idx, names[idx] or '(empty)')
       if ImGui.Selectable(ctx, label, idx == current) then
         cm:set('transient', 'currentSample', idx)
@@ -74,6 +83,16 @@ function newSampleView(cm, loadSlot)
     if not selectedFile then return false end
     loadSlot(cm:get('currentSample'), selectedFile)
     return true
+  end
+
+  function sv:auditionPath(path)
+    if not path then return false end
+    previewPath(path)
+    return true
+  end
+
+  function sv:auditionSlot(idx)
+    previewSlot(idx, 1)
   end
 
   function sv:draw(ctx)
