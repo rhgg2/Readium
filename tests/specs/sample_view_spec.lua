@@ -48,26 +48,35 @@ return {
       local h = harness.mk()
       local calls = {}
       local sv = newSampleView(h.cm, function(slot, path)
-        calls[#calls+1] = { slot, path }
+        calls[#calls+1] = { slot, path }; return true
       end)
       t.eq(sv:loadSelectedIntoCurrent(), false, "returns false")
-      t.eq(#calls, 0, "loadSlot not invoked")
+      t.eq(#calls, 0, "assignSlot not invoked")
     end,
   },
   {
-    name = "loadSelectedIntoCurrent passes (currentSample, selectedFile) to loadSlot",
+    name = "loadSelectedIntoCurrent passes (currentSample, selectedFile) to assignSlot",
     run = function(harness)
       local h = harness.mk()
       local calls = {}
       local sv = newSampleView(h.cm, function(slot, path)
-        calls[#calls+1] = { slot, path }
+        calls[#calls+1] = { slot, path }; return true
       end)
       h.cm:set('transient', 'currentSample', 5)
       sv:setSelectedFile('/x.wav')
       t.eq(sv:loadSelectedIntoCurrent(), true, "returns true")
-      t.eq(#calls, 1, "loadSlot called once")
+      t.eq(#calls, 1, "assignSlot called once")
       t.eq(calls[1][1], 5, "slot is currentSample")
       t.eq(calls[1][2], '/x.wav', "path is selectedFile")
+    end,
+  },
+  {
+    name = "loadSelectedIntoCurrent surfaces assignSlot failure",
+    run = function(harness)
+      local h = harness.mk()
+      local sv = newSampleView(h.cm, function() return false end)
+      sv:setSelectedFile('/x.wav')
+      t.eq(sv:loadSelectedIntoCurrent(), false, "false propagates from assignSlot")
     end,
   },
   {

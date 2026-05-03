@@ -51,6 +51,7 @@ local declarations = {
   { 'extraColumns',    {}    },
   { 'noteDelay',       {}    },
   { 'samplerNames',    {}    },
+  { 'slotEntries',     {}    },
 
   -- Colour table: a flat keyspace whose entries take three forms.
   -- Atoms live under `palette.*` (parchment, used by the tracker grid)

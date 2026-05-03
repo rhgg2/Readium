@@ -13,8 +13,11 @@ loadModule('trackerManager')
 loadModule('commandManager')
 loadModule('editCursor')
 loadModule('viewManager')
+loadModule('slotStore')
 loadModule('sampleView')
 loadModule('renderManager')
+
+math.randomseed(os.time())
 
 local function print(...)
   return util.print(...)
@@ -89,6 +92,31 @@ function samplerLoadSlot(slot, path)
   return true
 end
 
+-- Filesystem ops for slotStore. Stream-copy in 64KB chunks so big samples
+-- don't allocate a single Lua string the size of the file. os.rename
+-- fails across filesystems, so move falls back to copy+delete.
+local function copyFileBytes(src, dst)
+  local fin = io.open(src, 'rb');  if not fin  then return false end
+  local fout = io.open(dst, 'wb'); if not fout then fin:close(); return false end
+  while true do
+    local chunk = fin:read(64 * 1024)
+    if not chunk then break end
+    fout:write(chunk)
+  end
+  fin:close(); fout:close()
+  return true
+end
+
+local fileOps = {
+  copy  = copyFileBytes,
+  move  = function(src, dst)
+    if os.rename(src, dst) then return true end
+    if copyFileBytes(src, dst) then os.remove(src); return true end
+    return false
+  end,
+  mkdir = function(dir) reaper.RecursiveCreateDirectory(dir, 0) end,
+}
+
 function samplerPreviewSlot(slot, bounds)
   reaper.gmem_attach(CTM_GMEM_NS)
   if reaper.gmem_read(CTM_GMEM_PREVIEW_BASE) ~= 0 then return false end
@@ -145,11 +173,15 @@ function Main()
   cm:setContext(take)
   local tm = newTrackerManager(mm, cm)
   local cmgr = newCommandManager(cm)
+  local slotStore = newSlotStore(cm, fileOps, samplerLoadSlot)
+  local function assignSlot(slot, srcPath)
+    return slotStore:assign(slot, srcPath, reaper.GetProjectPath(0))
+  end
   cmgr:register('loadSampleAtCurrentSlot', function()
     if not cm:get('trackerMode') then return end
     local rv, path = reaper.GetUserFileNameForRead('', 'Load sample into current slot', '')
     if rv and path ~= '' then
-      samplerLoadSlot(cm:get('currentSample'), path)
+      assignSlot(cm:get('currentSample'), path)
     end
   end)
   cmgr:register('toggleViewMode', function()
@@ -157,15 +189,30 @@ function Main()
       cm:get('viewMode') == 'sample' and 'tracker' or 'sample')
   end)
 
-  local vm = newViewManager(tm, cm, cmgr)
-  local sv = newSampleView(cm, samplerLoadSlot, samplerPreviewSlot, samplerPreviewPath)
+  local sv = newSampleView(cm, assignSlot, samplerPreviewSlot, samplerPreviewPath)
   local renderer = newRenderManager(vm, cm, cmgr, sv)
   probeTrackerMode(mm, cm)
   renderer:init()
 
+  -- sweptForTracker re-arms when trackerMode goes false: a fresh FX needs
+  -- a fresh push of every slot since @serialize starts empty.
+  local sweptForTracker, lastProjectPath = false, nil
   local function loop()
     probeTrackerMode(mm, cm)
-    if cm:get('trackerMode') then readSamplerNames(cm) end
+    local pp = reaper.GetProjectPath(0)
+    if cm:get('trackerMode') then
+      if lastProjectPath and lastProjectPath ~= pp then
+        slotStore:migrate(pp, lastProjectPath)
+      end
+      if not sweptForTracker then
+        slotStore:sweep(pp)
+        sweptForTracker = true
+      end
+      readSamplerNames(cm)
+    else
+      sweptForTracker = false
+    end
+    lastProjectPath = pp
     if cm:get('viewMode') == 'sample' then
       sv:setTrack(reaper.GetSelectedTrack(0, 0))
     end

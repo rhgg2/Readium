@@ -3,9 +3,10 @@
 -- Take-independent view for sample mode. Slot list + browser key against
 -- a REAPER track, not a take; continuum.lua's loop pushes the selected
 -- track in via setTrack each tick. Browser root comes from cm
--- (`sampleBrowserRoot`); $HOME is the lazy fallback. loadSlot / previewSlot /
--- previewPath are the gmem-mailbox writers in continuum.lua; injecting them
--- keeps sv free of gmem vocabulary and testable without REAPER.
+-- (`sampleBrowserRoot`); $HOME is the lazy fallback. assignSlot routes
+-- through slotStore (cm-first); previewSlot / previewPath are the gmem
+-- preview writers in continuum.lua. Injection keeps sv free of gmem and
+-- filesystem vocabulary and testable without REAPER.
 
 loadModule('fs')
 
@@ -17,7 +18,7 @@ local ImGui
 local N_SLOTS = 64
 local PLAY    = '\xe2\x96\xb6'  -- U+25B6 ▶
 
-function newSampleView(cm, loadSlot, previewSlot, previewPath)
+function newSampleView(cm, assignSlot, previewSlot, previewPath)
   local sv = {}
   local track         = nil
   local currentFolder = nil  -- folder whose files fill the middle pane
@@ -81,8 +82,7 @@ function newSampleView(cm, loadSlot, previewSlot, previewPath)
 
   function sv:loadSelectedIntoCurrent()
     if not selectedFile then return false end
-    loadSlot(cm:get('currentSample'), selectedFile)
-    return true
+    return assignSlot(cm:get('currentSample'), selectedFile) and true or false
   end
 
   function sv:auditionPath(path)
