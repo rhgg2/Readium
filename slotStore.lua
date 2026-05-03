@@ -29,7 +29,10 @@ local function relForSrc(srcBase)
 end
 
 -- fileOps: { copy(src,dst)→bool, move(src,dst)→bool, mkdir(dir)→() }
--- loadSlot: (idx, absPath) → ()  -- the gmem load mailbox writer.
+-- loadSlot: (idx, relPath) → ()  -- the gmem load mailbox writer.
+--   Continuum publishes the project prefix separately (samplerSetPrefix),
+--   so loadSlot only needs the project-relative path; the JSFX composes
+--   the absolute and persists the rel directly into @serialize.
 function newSlotStore(cm, fileOps, loadSlot)
   local store = {}
 
@@ -46,14 +49,14 @@ function newSlotStore(cm, fileOps, loadSlot)
     fileOps.mkdir(projectPath .. '/Continuum')
     if not fileOps.copy(srcPath, abs) then return false end
     setEntry(idx, { path = rel })
-    loadSlot(idx, abs)
+    loadSlot(idx, rel)
     return true
   end
 
-  function store:sweep(projectPath)
+  function store:sweep()
     local entries = cm:get('slotEntries')
     for idx, e in pairs(entries) do
-      if e.path then loadSlot(idx, projectPath .. '/' .. e.path) end
+      if e.path then loadSlot(idx, e.path) end
     end
   end
 

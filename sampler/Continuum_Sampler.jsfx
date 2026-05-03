@@ -43,21 +43,28 @@ SAMPLE_SLOT_SIZE     = SAMPLE_HEADER_SIZE + SAMPLE_BUFFER_FRAMES;
 SINC_RESERVE     = 300000;
 
 PARAMS_STRIDE    = 128;            // per-sample params (filter, env, lfo, …)
-// JSFX caps user string slots at 1023, so name slots and the rename backup
-// must live in the low range. DROP_PATH_STR=14 (defined in @gfx) and
-// CTM_GMEM_PATH_STR=13 (Continuum→sampler load mailbox path scratch) are the
-// other reserved slots; 16..31 is scratch space, 32..(32+N_SAMPLES-1) holds
-// names. Matches Hackey_Sample_Playback's SAMPLE_NAMES=32 convention.
-NAME_BASE         = 32;            // string-pool base for sample names (one per slot)
-RENAME_BACKUP_STR = 15;            // string slot holding pre-edit name for revert-on-Esc
-CTM_GMEM_PATH_STR = 13;            // path scratch for Continuum→sampler load requests
+// JSFX caps user string slots at 1023. Reserved low slots:
+//   13 CTM_GMEM_PATH_STR   - rel-path scratch for Continuum→sampler load mailbox
+//   14 DROP_PATH_STR       - drag-drop scratch (defined in @gfx)
+//   15 RENAME_BACKUP_STR   - pre-edit name for revert-on-Esc
+//   16 SER_PREFIX_STR      - project root prefix (persisted in @serialize)
+//   17 SCRATCH_ABS_STR     - assembled absolute path for file_open
+//   18..31                 - free scratch
+//   32..(32+N_SAMPLES-1)   - NAME_BASE: per-slot display names
+//   96..(96+N_SAMPLES-1)   - SLOT_REL_BASE: per-slot rel paths (persisted)
+NAME_BASE         = 32;
+SLOT_REL_BASE     = 96;            // rel path per slot; non-empty ⇒ persistable
+RENAME_BACKUP_STR = 15;
+CTM_GMEM_PATH_STR = 13;
+SER_PREFIX_STR    = 16;
+SCRATCH_ABS_STR   = 17;
 THUMB_W           = 100;           // waveform thumbnail width (px columns), min/max packed
 
 // gmem[Continuum_sampler] layout:
 //   gmem[0..1023]                     : Continuum→sampler load mailbox
 //     [0]   magic (0=empty, MAGIC=pending; written last)
 //     [1]   slot index
-//     [2..] path bytes, 0-terminated
+//     [2..] rel-path bytes, 0-terminated (project-relative; prefix from PREFIX mailbox)
 //   gmem[NAMES_BASE..NAMES_BASE+N_SAMPLES*NAME_STRIDE-1] : names slab (sampler→Continuum)
 //     one slot per sample: ASCII bytes then 0-terminator
 //   gmem[PREVIEW_BASE..PREVIEW_BASE+1023] : Continuum→sampler preview mailbox
@@ -65,13 +72,19 @@ THUMB_W           = 100;           // waveform thumbnail width (px columns), min
 //     [1]   slot index (0..N_SAMPLES-1 = preview existing slot;
 //                       PREVIEW_SLOT_IDX = load path bytes into hidden slot first)
 //     [2]   bounds flag (0 full file, 1 honour SH_START/SH_END)
-//     [3..] path bytes, 0-terminated (only read when slot == PREVIEW_SLOT_IDX)
+//     [3..] absolute path bytes, 0-terminated (only read when slot == PREVIEW_SLOT_IDX;
+//           preview is project-agnostic so abs not rel)
+//   gmem[PREFIX_BASE..PREFIX_BASE+1023] : Continuum→sampler project prefix mailbox
+//     [0]   magic (0=empty, MAGIC=pending; written last)
+//     [1..] absolute project root bytes, 0-terminated. JSFX caches in SER_PREFIX_STR
+//           and uses it to compose abs paths from rel-path loads & on @serialize-read.
 // Continuum mirrors these constants — keep in sync.
 CTM_GMEM_MAGIC         = 1717658484;    // 'CTML' as 32-bit ASCII
-CTM_GMEM_PATH_MAX      = 1022;          // load / preview slabs fit in 1024 floats
+CTM_GMEM_PATH_MAX      = 1022;          // load / preview / prefix slabs fit in 1024 floats
 CTM_GMEM_NAMES_BASE    = 1024;
 CTM_GMEM_NAME_STRIDE   = 64;            // chars per name including 0-terminator
 CTM_GMEM_PREVIEW_BASE  = 5120;          // = NAMES_BASE + N_SAMPLES * NAME_STRIDE
+CTM_GMEM_PREFIX_BASE   = 6144;          // = PREVIEW_BASE + 1024
 
 // Sample header field offsets
 SH_LENGTH     = 0;   SH_FS         = 1;   SH_BASENOTE = 2;
@@ -589,6 +602,23 @@ function load_sample_from_file(idx, path_str)
   );
 );
 
+// Project-relative load. Composes abs = SER_PREFIX_STR + "/" + rel_str into
+// SCRATCH_ABS_STR, calls the abs loader, then on success records the rel in
+// SLOT_REL_BASE+idx so @serialize can write it. Empty prefix ⇒ skip the slash
+// (rel_str interpreted as-is, useful for absolute rels in edge cases).
+function load_sample_from_rel(idx, rel_str)
+  global(samplelocs, SH_LENGTH, SER_PREFIX_STR, SCRATCH_ABS_STR, SLOT_REL_BASE)
+(
+  strlen(SER_PREFIX_STR) > 0 ? (
+    strcpy(SCRATCH_ABS_STR, SER_PREFIX_STR);
+    strcat(SCRATCH_ABS_STR, "/");
+    strcat(SCRATCH_ABS_STR, rel_str);
+  ) : strcpy(SCRATCH_ABS_STR, rel_str);
+  load_sample_from_file(idx, SCRATCH_ABS_STR);
+  samplelocs[idx] && samplelocs[idx][SH_LENGTH] > 0 ?
+    strcpy(SLOT_REL_BASE + idx, rel_str);
+);
+
 // ============================================================
 // Waveform thumbnails
 // ============================================================
@@ -801,21 +831,52 @@ interpolation > 1 ? (pdc_delay = 24; pdc_bot_ch = 0; pdc_top_ch = 2;);
 build_all_sinc_tables(sinc_tables_mem);
 
 @serialize
+// Path-only persistence: project root + per-slot rel paths. Audio is reloaded
+// from disk on @serialize-read (keeps .RPP lean). User-mutable header fields
+// (basenote/loop/start/end) ride alongside the rel path so edits survive.
+// has_data flips on a slot only when SLOT_REL_BASE is non-empty: drag-drop
+// loads (which never went through Continuum) have no rel and silently elide.
+// Continuum's sweep on next attach re-pushes everything cm has, fixing drift.
 writing = file_avail(0) < 0;
 file_var(0, version);
+file_string(0, SER_PREFIX_STR);
 ser_i = 0;
 loop(N_SAMPLES,
-  // Per-slot presence flag: empty slots cost one float on disk and need no
-  // ensure_slot() on read, which keeps the lazy invariant intact.
-  writing ? has_data = samplelocs[ser_i] && samplelocs[ser_i][SH_LENGTH] > 0;
+  writing ? has_data = samplelocs[ser_i] && samplelocs[ser_i][SH_LENGTH] > 0
+            && strlen(SLOT_REL_BASE + ser_i) > 0;
   file_var(0, has_data);
   has_data ? (
-    writing ? 0 : ensure_slot(ser_i);
-    samplelocs[ser_i] ? (
-      file_mem(0, samplelocs[ser_i], SAMPLE_HEADER_SIZE);
-      file_mem(0, samplelocs[ser_i] + SAMPLE_HEADER_SIZE,
-               samplelocs[ser_i][SH_LENGTH]);
-      writing ? 0 : thumb_dirty[ser_i] = 1;
+    file_string(0, SLOT_REL_BASE + ser_i);
+    writing ? (
+      // Snapshot user-mutable header fields into ser_* before file_var writes.
+      ser_basenote   = samplelocs[ser_i][SH_BASENOTE];
+      ser_loop_start = samplelocs[ser_i][SH_LOOP_START];
+      ser_loop_stop  = samplelocs[ser_i][SH_LOOP_STOP];
+      ser_loop_type  = samplelocs[ser_i][SH_LOOP_TYPE];
+      ser_start      = samplelocs[ser_i][SH_START];
+      ser_end        = samplelocs[ser_i][SH_END];
+    ) : (
+      // Read path: load from disk first. Success ⇒ sample header has loader
+      // defaults (basenote=60, loops/start/end=0); the file_var reads below
+      // pull the saved values, applied after. Failure ⇒ slot stays empty and
+      // the 6 floats still get consumed so subsequent slots stay aligned.
+      // Continuum's sweep on next attach retries with current prefix.
+      load_sample_from_rel(ser_i, SLOT_REL_BASE + ser_i);
+    );
+    file_var(0, ser_basenote);
+    file_var(0, ser_loop_start);
+    file_var(0, ser_loop_stop);
+    file_var(0, ser_loop_type);
+    file_var(0, ser_start);
+    file_var(0, ser_end);
+    !writing && samplelocs[ser_i] && samplelocs[ser_i][SH_LENGTH] > 0 ? (
+      samplelocs[ser_i][SH_BASENOTE]   = ser_basenote;
+      samplelocs[ser_i][SH_LOOP_START] = ser_loop_start;
+      samplelocs[ser_i][SH_LOOP_STOP]  = ser_loop_stop;
+      samplelocs[ser_i][SH_LOOP_TYPE]  = ser_loop_type;
+      samplelocs[ser_i][SH_START]      = ser_start;
+      samplelocs[ser_i][SH_END]        = ser_end;
+      thumb_dirty[ser_i] = 1;
     );
   );
   file_string(0, NAME_BASE + ser_i);
@@ -826,9 +887,24 @@ file_mem(0, mute_flags, N_SAMPLES);
 file_mem(0, solo_flags, N_SAMPLES);
 
 @block
+// Continuum → sampler project-prefix update. Continuum publishes its current
+// GetProjectPath() here whenever it (re)attaches; JSFX caches in SER_PREFIX_STR
+// so subsequent rel-path loads can compose absolutes. Persisted via @serialize.
+gmem[CTM_GMEM_PREFIX_BASE] == CTM_GMEM_MAGIC ? (
+  strcpy(SER_PREFIX_STR, "");
+  pf_i = 0;
+  pf_done = 0;
+  while (pf_i < CTM_GMEM_PATH_MAX && !pf_done) (
+    pf_ch = gmem[CTM_GMEM_PREFIX_BASE + 1 + pf_i];
+    pf_ch == 0 ? pf_done = 1
+    : ( str_setchar(SER_PREFIX_STR, pf_i, pf_ch); pf_i += 1; );
+  );
+  gmem[CTM_GMEM_PREFIX_BASE] = 0;
+);
+
 // Continuum → sampler load request. gmem[0]==CTM_GMEM_MAGIC marks a pending
-// record (Continuum writes magic last). Decode path bytes into a string
-// slot, dispatch to the same loader as drag-drop, then ack by zeroing.
+// record (Continuum writes magic last). Path bytes are project-relative;
+// load_sample_from_rel composes the absolute against SER_PREFIX_STR.
 gmem[0] == CTM_GMEM_MAGIC ? (
   ctm_slot = gmem[1];
   strcpy(CTM_GMEM_PATH_STR, "");
@@ -840,7 +916,7 @@ gmem[0] == CTM_GMEM_MAGIC ? (
     : ( str_setchar(CTM_GMEM_PATH_STR, ctm_i, ctm_ch); ctm_i += 1; );
   );
   ctm_slot >= 0 && ctm_slot < N_SAMPLES ?
-    load_sample_from_file(ctm_slot, CTM_GMEM_PATH_STR);
+    load_sample_from_rel(ctm_slot, CTM_GMEM_PATH_STR);
   gmem[0] = 0;
 );
 

@@ -57,7 +57,10 @@ The factory takes:
 
 - `cm` — config manager.
 - `fileOps` — `{ copy(src,dst)→bool, move(src,dst)→bool, mkdir(dir)→() }`.
-- `loadSlot(idx, absPath)` — gmem load mailbox writer.
+- `loadSlot(idx, relPath)` — gmem load mailbox writer. Forwards the
+  project-relative path; the JSFX composes the absolute against the
+  separately-published project prefix and persists `relPath` in
+  `@serialize` so subsequent boots can re-load autonomously.
 
 Tests pass call-recording stubs; production wires the real
 io.open/os.rename/`reaper.RecursiveCreateDirectory` and
@@ -72,8 +75,10 @@ store:assign(idx, srcPath, projectPath) → bool
   -- Copy srcPath into <projectPath>/Continuum/, write cm, fire loadSlot.
   -- Returns false if the copy fails.
 
-store:sweep(projectPath) → ()
-  -- Replay every entry through loadSlot. Called on FX (re-)attach.
+store:sweep() → ()
+  -- Replay every entry through loadSlot (rel paths). Called on FX
+  -- (re-)attach. Continuum publishes the project prefix separately
+  -- (samplerSetPrefix) before invoking sweep.
 
 store:migrate(projectPath, oldProjectPath) → bool
   -- Move slot files from old → new project media folder.

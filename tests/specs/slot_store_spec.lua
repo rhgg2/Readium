@@ -69,7 +69,8 @@ return {
 
       t.eq(#load.calls, 1, 'loadSlot fired once')
       t.eq(load.calls[1][1], 5, 'loadSlot got the right slot')
-      t.eq(load.calls[1][2], ops.copies[1][2], 'loadSlot got the absolute dst path')
+      t.eq(load.calls[1][2], entry.path,
+        'loadSlot got the rel path (JSFX composes abs from prefix)')
     end,
   },
   {
@@ -111,12 +112,12 @@ return {
       local ops, load = mkOps(), mkLoad()
       local store = newSlotStore(h.cm, ops, load.fn)
 
-      store:sweep('/proj')
+      store:sweep()
       t.eq(#load.calls, 2, 'one loadSlot per entry')
       local seen = {}
       for _, c in ipairs(load.calls) do seen[c[1]] = c[2] end
-      t.eq(seen[0], '/proj/Continuum/a.wav', 'slot 0 resolved')
-      t.eq(seen[3], '/proj/Continuum/b.wav', 'slot 3 resolved')
+      t.eq(seen[0], 'Continuum/a.wav', 'slot 0 forwarded as rel')
+      t.eq(seen[3], 'Continuum/b.wav', 'slot 3 forwarded as rel')
     end,
   },
   {
@@ -125,7 +126,7 @@ return {
       local h = harness.mk()
       h.cm:set('track', 'slotEntries', { [1] = { shStart = 50 } })
       local ops, load = mkOps(), mkLoad()
-      newSlotStore(h.cm, ops, load.fn):sweep('/proj')
+      newSlotStore(h.cm, ops, load.fn):sweep()
       t.eq(#load.calls, 0, 'pathless entry not loaded')
     end,
   },

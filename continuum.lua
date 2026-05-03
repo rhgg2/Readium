@@ -61,14 +61,17 @@ end
 --   [0..1023]                          load mailbox (Continuum→sampler)
 --     [0]   magic (0=empty, MAGIC=pending; written last so sampler never reads half)
 --     [1]   slot index
---     [2..] path bytes, 0-terminated
+--     [2..] rel-path bytes, 0-terminated (project-relative; prefix from PREFIX mailbox)
 --   [NAMES_BASE..NAMES_BASE+N*STRIDE-1] names slab (sampler→Continuum)
 --     one slot per sample: ASCII bytes then 0-terminator
 --   [PREVIEW_BASE..PREVIEW_BASE+1023]  preview mailbox (Continuum→sampler)
 --     [0]   magic
 --     [1]   slot (0..N-1 = preview existing slot; PREVIEW_SLOT_IDX = path-load first)
 --     [2]   bounds (0 full file, 1 honour SH_START/SH_END)
---     [3..] path bytes, 0-terminated (only when slot == PREVIEW_SLOT_IDX)
+--     [3..] absolute path bytes, 0-terminated (preview is project-agnostic)
+--   [PREFIX_BASE..PREFIX_BASE+1023]    project-prefix mailbox (Continuum→sampler)
+--     [0]   magic
+--     [1..] absolute project root bytes, 0-terminated. JSFX caches in SER_PREFIX_STR.
 -- All constants must match the JSFX side.
 local CTM_GMEM_NS            = 'Continuum_sampler'
 local CTM_GMEM_MAGIC         = 1717658484   -- 'CTML' as 32-bit ASCII
@@ -76,6 +79,7 @@ local CTM_GMEM_NAMES_BASE    = 1024
 local CTM_GMEM_NAME_STRIDE   = 64
 local CTM_N_SAMPLES          = 64
 local CTM_GMEM_PREVIEW_BASE  = 5120         -- = NAMES_BASE + N_SAMPLES * NAME_STRIDE
+local CTM_GMEM_PREFIX_BASE   = 6144         -- = PREVIEW_BASE + 1024
 local CTM_PREVIEW_SLOT_IDX   = CTM_N_SAMPLES
 
 local function writeGmemPath(base, path)
@@ -83,12 +87,23 @@ local function writeGmemPath(base, path)
   reaper.gmem_write(base + #path, 0)
 end
 
-function samplerLoadSlot(slot, path)
+function samplerLoadSlot(slot, relPath)
   reaper.gmem_attach(CTM_GMEM_NS)
   if reaper.gmem_read(0) ~= 0 then return false end
-  writeGmemPath(2, path)
+  writeGmemPath(2, relPath)
   reaper.gmem_write(1, slot)
   reaper.gmem_write(0, CTM_GMEM_MAGIC)
+  return true
+end
+
+-- Push the project root to the sampler so it can compose abs paths from
+-- rel-path loads and persist the prefix in @serialize. Idempotent; sweep
+-- writes it on every (re-)attach.
+function samplerSetPrefix(prefix)
+  reaper.gmem_attach(CTM_GMEM_NS)
+  if reaper.gmem_read(CTM_GMEM_PREFIX_BASE) ~= 0 then return false end
+  writeGmemPath(CTM_GMEM_PREFIX_BASE + 1, prefix)
+  reaper.gmem_write(CTM_GMEM_PREFIX_BASE, CTM_GMEM_MAGIC)
   return true
 end
 
@@ -152,6 +167,11 @@ function readSamplerNames(cm)
     if #chars > 0 then fresh[idx] = table.concat(chars) end
   end
   local cur = cm:get('samplerNames')
+  -- An empty fresh on a tick where JSFX briefly hasn't republished (e.g. transport
+  -- gating, or a race with @serialize) would otherwise blank cur and the slot
+  -- list flickers '(empty)' between every populated read. JSFX wiping all 64
+  -- names in one go isn't a real workflow, so prefer stickiness.
+  if next(fresh) == nil and next(cur) ~= nil then return end
   for k, v in pairs(fresh) do
     if cur[k] ~= v then cm:set('transient', 'samplerNames', fresh); return end
   end
@@ -173,6 +193,7 @@ function Main()
   cm:setContext(take)
   local tm = newTrackerManager(mm, cm)
   local cmgr = newCommandManager(cm)
+  local vm = newViewManager(tm, cm, cmgr)
   local slotStore = newSlotStore(cm, fileOps, samplerLoadSlot)
   local function assignSlot(slot, srcPath)
     return slotStore:assign(slot, srcPath, reaper.GetProjectPath(0))
@@ -205,7 +226,8 @@ function Main()
         slotStore:migrate(pp, lastProjectPath)
       end
       if not sweptForTracker then
-        slotStore:sweep(pp)
+        samplerSetPrefix(pp)
+        slotStore:sweep()
         sweptForTracker = true
       end
       readSamplerNames(cm)
