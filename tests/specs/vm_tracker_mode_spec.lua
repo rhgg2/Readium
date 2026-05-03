@@ -213,13 +213,28 @@ return {
   },
 
   ----- inputSampleUp / inputSampleDown commands
+  -- Step ±1 across the full 0..127 range. Empty slots are reachable —
+  -- the user may want to author a sample value before the sampler has
+  -- loaded that slot.
 
   {
-    name = 'inputSampleUp increments currentSample',
+    name = 'inputSampleUp increments by 1 even into empty slots',
+    run = function(harness)
+      local h = harness.mk{ config = {
+        take      = { currentSample = 5 },
+        transient = { samplerNames = { [3] = 'a', [10] = 'b' } },
+      } }
+      h.cmgr.commands.inputSampleUp()
+      t.eq(h.cm:get('currentSample'), 6, 'stepped to empty slot 6')
+    end,
+  },
+
+  {
+    name = 'inputSampleDown decrements by 1 even into empty slots',
     run = function(harness)
       local h = harness.mk{ config = { take = { currentSample = 5 } } }
-      h.cmgr.commands.inputSampleUp()
-      t.eq(h.cm:get('currentSample'), 6)
+      h.cmgr.commands.inputSampleDown()
+      t.eq(h.cm:get('currentSample'), 4)
     end,
   },
 
@@ -233,20 +248,110 @@ return {
   },
 
   {
-    name = 'inputSampleDown decrements currentSample',
-    run = function(harness)
-      local h = harness.mk{ config = { take = { currentSample = 5 } } }
-      h.cmgr.commands.inputSampleDown()
-      t.eq(h.cm:get('currentSample'), 4)
-    end,
-  },
-
-  {
     name = 'inputSampleDown clamps at 0',
     run = function(harness)
       local h = harness.mk{ config = { take = { currentSample = 0 } } }
       h.cmgr.commands.inputSampleDown()
       t.eq(h.cm:get('currentSample'), 0)
+    end,
+  },
+
+  ----- Editing a sample stop also updates currentSample
+  -- The intent: the value you just typed becomes the value future
+  -- new notes will be stamped with.
+
+  {
+    name = 'editing a sample stop sets currentSample to the new value',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = { { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100,
+                      detune = 0, delay = 0, sample = 0 } },
+        },
+        config = {
+          transient = { trackerMode = true },
+          take      = { currentSample = 0 },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      local function lane1()
+        for _, c in ipairs(h.vm.grid.cols) do
+          if c.midiChan == 1 and c.type == 'note' and c.lane == 1 then return c end
+        end
+      end
+      local col = lane1()
+      h.ec:setPos(0, 1, 3)
+      h.vm:editEvent(col, col.events[1], 3, string.byte('5'), false)
+      col = lane1()
+      h.vm:editEvent(col, col.events[1], 4, string.byte('5'), false)
+      t.eq(h.cm:get('currentSample'), 0x55,
+           'currentSample tracks the most recent sample-stop edit')
+    end,
+  },
+
+  ----- Sample part is inert on PA cells (typing and delete)
+
+  {
+    name = 'typing into sample part of a PA cell does nothing',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = { { ppq = 0, endppq = 480, chan = 1, pitch = 60, vel = 100,
+                      detune = 0, delay = 0, sample = 0x33 } },
+          ccs   = { { ppq = 240, msgType = 'pa', chan = 1, pitch = 60, val = 80 } },
+        },
+        config = { transient = { trackerMode = true } },
+      }
+      h.vm:setGridSize(80, 40)
+      local function lane1()
+        for _, c in ipairs(h.vm.grid.cols) do
+          if c.midiChan == 1 and c.type == 'note' and c.lane == 1 then return c end
+        end
+      end
+      local col = lane1()
+      local paRow
+      for r, evt in pairs(col.cells) do
+        if evt.type == 'pa' then paRow = r end
+      end
+      t.truthy(paRow, 'PA cell is on the grid')
+      h.ec:setPos(paRow, 1, 3)
+      h.vm:editEvent(col, col.cells[paRow], 3, string.byte('A'), false)
+      local paDump
+      for _, c in ipairs(h.fm:dump().ccs) do
+        if c.msgType == 'pa' then paDump = c end
+      end
+      t.falsy(paDump.sample, 'PA was not tagged with sample')
+      t.eq(h.fm:dump().notes[1].sample, 0x33, 'host note sample untouched')
+    end,
+  },
+
+  {
+    name = 'delete on sample part of a PA cell does nothing',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = { { ppq = 0, endppq = 480, chan = 1, pitch = 60, vel = 100,
+                      detune = 0, delay = 0, sample = 0 } },
+          ccs   = { { ppq = 240, msgType = 'pa', chan = 1, pitch = 60, val = 80 } },
+        },
+        config = { transient = { trackerMode = true } },
+      }
+      h.vm:setGridSize(80, 40)
+      local col
+      for _, c in ipairs(h.vm.grid.cols) do
+        if c.midiChan == 1 and c.type == 'note' and c.lane == 1 then col = c end
+      end
+      local paRow
+      for r, evt in pairs(col.cells) do
+        if evt.type == 'pa' then paRow = r end
+      end
+      h.ec:setPos(paRow, 1, 3)
+      h.cmgr.commands.delete()    -- must not crash and must not delete the PA
+      local stillPA = false
+      for _, c in ipairs(h.fm:dump().ccs) do
+        if c.msgType == 'pa' and c.ppq == 240 then stillPA = true end
+      end
+      t.truthy(stillPA, 'PA event survived delete on sample part')
     end,
   },
 }

@@ -109,9 +109,10 @@ function newRenderManager(vm, cm, cmgr)
     if evt.type ~= 'pa' then
       label = select(1, vm:noteProjection(evt)) or noteName(evt.pitch)
     end
-    local noteTxt   = evt.type == 'pa' and '···' or label
+    local isPA      = evt.type == 'pa'
+    local noteTxt   = isPA and '···' or label
     local velTxt    = evt.vel and string.format('%02X', evt.vel) or '··'
-    local sampleTxt = showSample and (' ' .. string.format('%02X', evt.sample or 0)) or ''
+    local sampleTxt = showSample and (' ' .. (isPA and '··' or string.format('%02X', evt.sample or 0))) or ''
     local text      = noteTxt .. sampleTxt .. ' ' .. velTxt
 
     -- Sample digits sit at fixed positions 5,6 (after 'C-4 '). Shadowed
@@ -490,12 +491,64 @@ function newRenderManager(vm, cm, cmgr)
     popChromeStyles()
   end
 
-  local function drawToolbar()
-    pickerActive = false
-    local rowPerBeat = cm:get('rowPerBeat')
+  -- Sample slot picker for tracker mode. Lists only loaded slots
+  -- (those that published a name via gmem); selecting one writes
+  -- currentSample. The combo label shows the current slot's hex
+  -- index even when unloaded so users can see what `<` / `>` will
+  -- step away from.
+  local function drawSampleDropdown()
+    local cur     = cm:get('currentSample')
+    local names   = cm:get('samplerNames') or {}
+    local curName = names[cur]
+    local label   = string.format('%02X', cur) .. (curName and (' ' .. curName) or '')
 
-    pushChromeStyles()
-    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 10, 3)
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, 'Sample:')
+    ImGui.SameLine(ctx)
+
+    ImGui.SetNextItemWidth(ctx, 220)
+    if ImGui.BeginCombo(ctx, '##sample', label) then
+      pickerActive = true
+      local indices = {}
+      for idx in pairs(names) do indices[#indices + 1] = idx end
+      table.sort(indices)
+      for _, idx in ipairs(indices) do
+        local rowLabel = string.format('%02X  %s', idx, names[idx])
+        if ImGui.Selectable(ctx, rowLabel, idx == cur) then
+          cm:set('take', 'currentSample', idx)
+        end
+      end
+      ImGui.EndCombo(ctx)
+    end
+  end
+
+  -- The mode switcher is the only toolbar element common to all view
+  -- modes; the bits to its right are mode-specific and dispatched on
+  -- cm:get('viewMode').
+  local function drawModeSwitcher()
+    local mode = cm:get('viewMode')
+    local function modeButton(label, value)
+      local active = mode == value
+      if active then
+        ImGui.PushStyleColor(ctx, ImGui.Col_Button, colour('toolbar.buttonActive'))
+      end
+      if ImGui.Button(ctx, label) and not active then
+        cm:set('transient', 'viewMode', value)
+      end
+      if active then ImGui.PopStyleColor(ctx, 1) end
+    end
+    modeButton('Tracker', 'tracker')
+    ImGui.SameLine(ctx, 0, 4)
+    modeButton('Sample',  'sample')
+  end
+
+  local function drawSampleToolbarBits()
+    -- Sample-mode toolbar bits will land alongside the sample browser.
+    -- Empty for now: the mode switcher alone occupies the toolbar.
+  end
+
+  local function drawTrackerToolbarBits()
+    local rowPerBeat = cm:get('rowPerBeat')
 
     -- The outer push is `toolbar.text`; the label inherits it.
     ImGui.AlignTextToFramePadding(ctx)
@@ -566,6 +619,31 @@ function newRenderManager(vm, cm, cmgr)
       onPick   = function(name) pickColSwing(chan, name) end,
     }
     if not chan then ImGui.EndDisabled(ctx) end
+
+    if cm:get('trackerMode') then
+      ImGui.SameLine(ctx, 0, 12)
+      verticalSeparator()
+      ImGui.SameLine(ctx, 0, 12)
+      drawSampleDropdown()
+    end
+  end
+
+  local function drawToolbar()
+    pickerActive = false
+    pushChromeStyles()
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 10, 3)
+
+    drawModeSwitcher()
+    ImGui.SameLine(ctx, 0, 12)
+    verticalSeparator()
+    ImGui.SameLine(ctx, 0, 12)
+
+    local mode = cm:get('viewMode')
+    if mode == 'tracker' then
+      drawTrackerToolbarBits()
+    elseif mode == 'sample' then
+      drawSampleToolbarBits()
+    end
 
     ImGui.PopStyleVar(ctx, 1)
     popChromeStyles()
@@ -1072,6 +1150,13 @@ function newRenderManager(vm, cm, cmgr)
     local rowPerBeat    = cm:get('rowPerBeat')
     local currentOctave = cm:get('currentOctave')
     local advanceBy     = cm:get('advanceBy')
+    local sampleSuffix = ''
+    if cm:get('trackerMode') then
+      local slot = cm:get('currentSample')
+      local name = (cm:get('samplerNames') or {})[slot]
+      sampleSuffix = string.format(' | Sample: %02X', slot)
+                  .. (name and (' ' .. name) or '')
+    end
     local col      = vm.grid.cols[cursorCol]
     local bar, beat, sub = vm:barBeatSub(cursorRow)
     local colLabel = col and col.label or '?'
@@ -1079,8 +1164,8 @@ function newRenderManager(vm, cm, cmgr)
     -- statusBar is rendered inside its own chrome BeginChild whose outer
     -- Col_Text push is `statusBar.text`; we just print, no inner push.
     ImGui.Text(ctx, string.format(
-      '%s | %d:%d.%d/%d | Octave: %d | Advance: %d',
-      colLabel, bar, beat, sub, rowPerBeat, currentOctave, advanceBy
+      '%s | %d:%d.%d/%d | Octave: %d | Advance: %d%s',
+      colLabel, bar, beat, sub, rowPerBeat, currentOctave, advanceBy, sampleSuffix
     ))
   end
 
@@ -2214,12 +2299,17 @@ function newRenderManager(vm, cm, cmgr)
         ImGui.Indent(ctx, CHROME_PAD_X)
         ImGui.SetCursorPosY(ctx, ImGui.GetCursorPosY(ctx) + CHROME_PAD_Y)
 
-        ImGui.PushFont(ctx, font, 15)
-        local availW = ImGui.GetContentRegionAvail(ctx)
-        computeLayout(availW - CHROME_PAD_X, gridBudget - CHROME_PAD_Y)
-        drawLaneStrip()
-        drawTracker()
-        ImGui.PopFont(ctx)
+        local mode = cm:get('viewMode')
+        if mode == 'tracker' then
+          ImGui.PushFont(ctx, font, 15)
+          local availW = ImGui.GetContentRegionAvail(ctx)
+          computeLayout(availW - CHROME_PAD_X, gridBudget - CHROME_PAD_Y)
+          drawLaneStrip()
+          drawTracker()
+          ImGui.PopFont(ctx)
+        elseif mode == 'sample' then
+          ImGui.Text(ctx, 'Sample mode — coming soon.')
+        end
         ImGui.Unindent(ctx, CHROME_PAD_X)
 
         -- Pin the footer to (toolbarBottom + gridBudget); the parchment

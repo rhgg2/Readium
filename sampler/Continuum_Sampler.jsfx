@@ -44,12 +44,27 @@ SINC_RESERVE     = 300000;
 
 PARAMS_STRIDE    = 128;            // per-sample params (filter, env, lfo, …)
 // JSFX caps user string slots at 1023, so name slots and the rename backup
-// must live in the low range. DROP_PATH_STR=14 (defined in @gfx) is the only
-// other reserved slot; 15..31 is scratch space, 32..(32+N_SAMPLES-1) holds
+// must live in the low range. DROP_PATH_STR=14 (defined in @gfx) and
+// CTM_GMEM_PATH_STR=13 (Continuum→sampler load mailbox path scratch) are the
+// other reserved slots; 16..31 is scratch space, 32..(32+N_SAMPLES-1) holds
 // names. Matches Hackey_Sample_Playback's SAMPLE_NAMES=32 convention.
 NAME_BASE         = 32;            // string-pool base for sample names (one per slot)
 RENAME_BACKUP_STR = 15;            // string slot holding pre-edit name for revert-on-Esc
+CTM_GMEM_PATH_STR = 13;            // path scratch for Continuum→sampler load requests
 THUMB_W           = 100;           // waveform thumbnail width (px columns), min/max packed
+
+// gmem[Continuum_sampler] layout:
+//   gmem[0..1023]                     : Continuum→sampler load mailbox
+//     [0]   magic (0=empty, MAGIC=pending; written last)
+//     [1]   slot index
+//     [2..] path bytes, 0-terminated
+//   gmem[NAMES_BASE..NAMES_BASE+N_SAMPLES*NAME_STRIDE-1] : names slab (sampler→Continuum)
+//     one slot per sample: ASCII bytes then 0-terminator
+// Continuum mirrors these constants — keep in sync.
+CTM_GMEM_MAGIC       = 1717658484;    // 'CTML' as 32-bit ASCII
+CTM_GMEM_PATH_MAX    = 1022;          // load slab fits in 1024 floats
+CTM_GMEM_NAMES_BASE  = 1024;
+CTM_GMEM_NAME_STRIDE = 64;            // chars per name including 0-terminator
 
 // Sample header field offsets
 SH_LENGTH     = 0;   SH_FS         = 1;   SH_BASENOTE = 2;
@@ -796,9 +811,40 @@ file_mem(0, mute_flags, N_SAMPLES);
 file_mem(0, solo_flags, N_SAMPLES);
 
 @block
-// Continuum → sampler import hook lands here: poll gmem[Continuum_sampler] for a
-// magic-tagged record { magic, slot_idx, path_chars..., 0 } and route through
-// load_sample_from_file(slot, path) — same loader as drag-drop. Not wired yet.
+// Continuum → sampler load request. gmem[0]==CTM_GMEM_MAGIC marks a pending
+// record (Continuum writes magic last). Decode path bytes into a string
+// slot, dispatch to the same loader as drag-drop, then ack by zeroing.
+gmem[0] == CTM_GMEM_MAGIC ? (
+  ctm_slot = gmem[1];
+  strcpy(CTM_GMEM_PATH_STR, "");
+  ctm_i = 0;
+  ctm_done = 0;
+  while (ctm_i < CTM_GMEM_PATH_MAX && !ctm_done) (
+    ctm_ch = gmem[2 + ctm_i];
+    ctm_ch == 0 ? ctm_done = 1
+    : ( str_setchar(CTM_GMEM_PATH_STR, ctm_i, ctm_ch); ctm_i += 1; );
+  );
+  ctm_slot >= 0 && ctm_slot < N_SAMPLES ?
+    load_sample_from_file(ctm_slot, CTM_GMEM_PATH_STR);
+  gmem[0] = 0;
+);
+
+// Publish sample names to gmem so Continuum can show them. Always re-emit;
+// names rarely change but the cost (~64 names * ~10 chars * 100 blocks/sec)
+// is trivial. Each slot is ASCII bytes then a 0-terminator.
+ctm_pub_idx = 0;
+loop(N_SAMPLES,
+  ctm_name_ptr = NAME_BASE + ctm_pub_idx;
+  ctm_name_len = min(strlen(ctm_name_ptr), CTM_GMEM_NAME_STRIDE - 1);
+  ctm_name_base = CTM_GMEM_NAMES_BASE + ctm_pub_idx * CTM_GMEM_NAME_STRIDE;
+  ctm_pub_j = 0;
+  while (ctm_pub_j < ctm_name_len) (
+    gmem[ctm_name_base + ctm_pub_j] = str_getchar(ctm_name_ptr, ctm_pub_j);
+    ctm_pub_j += 1;
+  );
+  gmem[ctm_name_base + ctm_name_len] = 0;
+  ctm_pub_idx += 1;
+);
 
 note_ptr = midimem;
 while (midirecv(offset, msg1, msg2, msg3)) (

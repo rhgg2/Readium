@@ -35,6 +35,7 @@ local declarations = {
 
   -- string choice
   { 'noteLayout',      'colemak' },
+  { 'viewMode',        'tracker' },
 
   -- null-defaulted (declared, no initial value)
   { 'temper',          nil   },
@@ -48,6 +49,7 @@ local declarations = {
   { 'soloedChannels',  {}    },
   { 'extraColumns',    {}    },
   { 'noteDelay',       {}    },
+  { 'samplerNames',    {}    },
 
   -- Colour table: a flat keyspace whose entries take three forms.
   -- Atoms live under `palette.*` (parchment, used by the tracker grid)

@@ -24,7 +24,6 @@ require('configManager')
 require('trackerManager')
 require('commandManager')
 require('viewManager')
-require('samplerProbe')
 
 -- Build a fresh scenario. Keys:
 --   seed      : seed payload for the fake mm (notes, ccs, resolution, length, timeSigs)

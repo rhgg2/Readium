@@ -806,7 +806,11 @@ function newViewManager(tm, cm, cmgr)
           local newSample = util.clamp(
             util.setDigit(evt.sample or 0, d, 1 - digit, 16, half), 0, 127)
           tm:assignEvent('note', evt, { sample = newSample })
-          return commit()
+          commit()
+          -- After flush so the configChanged-driven rebuild reads the
+          -- already-written sample rather than racing the queued assign.
+          cm:set('take', 'currentSample', newSample)
+          return
 
         -- delay: signed decimal milli-QN, 3 digits, ±999
         elseif part == 'delay' then
@@ -838,7 +842,10 @@ function newViewManager(tm, cm, cmgr)
           end
 
           if evt and evt.type == 'pa' then
-            tm:assignEvent('pa', evt, snap({ val = newVel(evt.val) }))
+            -- Column shape stores the PA's value in `vel` (so it joins the
+            -- prevVel chain like a note); mm stores it in `val`. Read the
+            -- in-memory `vel` and write the update via `val`.
+            tm:assignEvent('pa', evt, snap({ val = newVel(evt.vel) }))
             return commit()
           end
 
@@ -1783,10 +1790,11 @@ function newViewManager(tm, cm, cmgr)
     end
 
     local DELETE_BY_PART = {
-      pitch = queueDeleteNotes,
-      vel   = queueResetVelocities,
-      delay = queueResetDelays,
-      val   = queueDeleteCCs,
+      pitch  = queueDeleteNotes,
+      vel    = queueResetVelocities,
+      delay  = queueResetDelays,
+      val    = queueDeleteCCs,
+      sample = function() end,
     }
 
     function deleteEvent()
@@ -1820,6 +1828,14 @@ function newViewManager(tm, cm, cmgr)
   local function deleteOrBackspace()
     if ec:isSticky() then deleteSelection()
     else ec:selClear(); deleteEvent(); ec:advance() end
+  end
+
+  -- Step currentSample by ±1 across the full 0..127 range. Empty slots
+  -- are reachable — the user may want to author a sample value before
+  -- the sampler has loaded that slot.
+  local function stepSample(dir)
+    cm:set('take', 'currentSample',
+           util.clamp(cm:get('currentSample') + dir, 0, 127))
   end
 
   ----- Duplicate
@@ -1994,8 +2010,8 @@ function newViewManager(tm, cm, cmgr)
     duplicateUp             = function() duplicate(-1) end,
     inputOctaveUp           = function() cm:set('take', 'currentOctave', util.clamp(cm:get('currentOctave')+1, -1, 9)) end,
     inputOctaveDown         = function() cm:set('take', 'currentOctave', util.clamp(cm:get('currentOctave')-1, -1, 9)) end,
-    inputSampleUp           = function() cm:set('take', 'currentSample', util.clamp(cm:get('currentSample')+1,  0, 127)) end,
-    inputSampleDown         = function() cm:set('take', 'currentSample', util.clamp(cm:get('currentSample')-1,  0, 127)) end,
+    inputSampleUp           = function() stepSample( 1) end,
+    inputSampleDown         = function() stepSample(-1) end,
     noteOff                 = noteOff,
     growNote                = function() adjustDuration(1) end,
     shrinkNote              = function() adjustDuration(-1) end,

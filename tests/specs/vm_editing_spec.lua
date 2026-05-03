@@ -291,6 +291,103 @@ return {
     end,
   },
 
+  -- Regression: editing the value of an existing PA event must read its
+  -- current value from `vel` (the in-memory column shape) and write the
+  -- update via `val` (the mm-side field). vm previously read `evt.val`,
+  -- which is nil after rebuild — setDigit(nil, ...) crashed on arithmetic.
+  {
+    name = 'edit existing PA value reads vel and persists via val',
+    run = function(harness)
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0, endppq = 480, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 },
+          },
+          ccs = {
+            { ppq = 120, chan = 1, msgType = 'pa', pitch = 60, val = 0x70 },
+          },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      local col = h.vm.grid.cols[1]
+      local pa = col.cells[2]
+      t.truthy(pa and pa.type == 'pa', 'PA cell at row 2')
+      h.ec:setPos(2, 1, 3) -- row 2 = ppq 120 (PA), high vel nibble
+      h.vm:editEvent(col, pa, 3, string.byte('5'), false)
+
+      local out
+      for _, c in ipairs(h.fm:dump().ccs) do
+        if c.msgType == 'pa' then out = c end
+      end
+      t.truthy(out, 'PA survives')
+      t.eq(out.val, 0x50, 'high nibble updated to 5')
+    end,
+  },
+
+  -- Regression: stamping a PA under non-zero swing must produce a PA
+  -- whose display row matches the cursor row, and that single PA must be
+  -- deletable in one shot. (Two stamps + two deletes guards against the
+  -- "second PA orphans into overflow" failure mode.)
+  {
+    name = 'PA stamped under swing is reachable and deletable',
+    run = function(harness)
+      local c58 = { { atom = 'classic', shift = 0.08, period = 1 } }
+      local hostFrame = { swing = 'c58', colSwing = nil, rpb = 4 }
+      local h = harness.mk{
+        seed = {
+          notes = {
+            { ppq = 0, endppq = 960, chan = 1, pitch = 60, vel = 100,
+              detune = 0, delay = 0, frame = hostFrame },
+          },
+        },
+        config = {
+          project = { swings = { c58 = c58 } },
+          take    = { swing = 'c58', rowPerBeat = 4 },
+        },
+      }
+      h.vm:setGridSize(80, 40)
+      local col = h.vm.grid.cols[1]
+
+      -- Stamp PA at row 1 (off the period boundary under c58).
+      h.ec:setPos(1, 1, 3)
+      h.vm:editEvent(col, nil, 3, string.byte('5'), false)
+
+      col = h.vm.grid.cols[1]
+      local pa = col.cells[1]
+      t.truthy(pa and pa.type == 'pa', 'PA appears at row 1 cell')
+      t.eq(col.overflow[1], nil, 'no overflow at row 1')
+
+      -- Stamp another PA at row 2.
+      h.ec:setPos(2, 1, 3)
+      h.vm:editEvent(h.vm.grid.cols[1], nil, 3, string.byte('7'), false)
+
+      col = h.vm.grid.cols[1]
+      t.truthy(col.cells[1] and col.cells[1].type == 'pa', 'row 1 still PA')
+      t.truthy(col.cells[2] and col.cells[2].type == 'pa', 'row 2 PA')
+      t.eq(col.overflow[1], nil, 'no overflow at row 1')
+      t.eq(col.overflow[2], nil, 'no overflow at row 2')
+
+      -- Delete row 2 PA.
+      h.ec:setPos(2, 1, 3)
+      h.cmgr.commands.delete()
+
+      local survivors = {}
+      for _, c in ipairs(h.fm:dump().ccs) do
+        if c.msgType == 'pa' then survivors[#survivors+1] = c end
+      end
+      t.eq(#survivors, 1, 'one PA remains after deleting row 2')
+
+      -- Delete row 1 PA.
+      h.ec:setPos(1, 1, 3)
+      h.cmgr.commands.delete()
+      survivors = {}
+      for _, c in ipairs(h.fm:dump().ccs) do
+        if c.msgType == 'pa' then survivors[#survivors+1] = c end
+      end
+      t.eq(#survivors, 0, 'all PAs deleted')
+    end,
+  },
+
   {
     name = 'delete on delay stop is a no-op when delay is already 0',
     run = function(harness)

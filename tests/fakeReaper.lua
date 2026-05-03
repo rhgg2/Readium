@@ -53,7 +53,7 @@ function M.new()
     return state.trackForItem[state.itemForTake[take]]
   end
 
-  -- Track FX list (used by samplerProbe to decide trackerMode).
+  -- Track FX list (used by probeTrackerMode in continuum.lua).
   state.fxByTrack = {}
   function r.TrackFX_GetCount(track)
     return #(state.fxByTrack[track] or {})

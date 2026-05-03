@@ -14,7 +14,6 @@ loadModule('commandManager')
 loadModule('editCursor')
 loadModule('viewManager')
 loadModule('renderManager')
-loadModule('samplerProbe')
 
 local function print(...)
   return util.print(...)
@@ -31,6 +30,70 @@ local function run(fn)
   xpcall(fn, err_handler)
 end
 
+local SAMPLER_FX = 'Continuum Sampler'
+
+function probeTrackerMode(mm, cm)
+  local track = reaper.GetMediaItemTake_Track(mm:take())
+  local detected = false
+  for i = 0, reaper.TrackFX_GetCount(track) - 1 do
+    local _, name = reaper.TrackFX_GetFXName(track, i, '')
+    if name:find(SAMPLER_FX, 1, true) then detected = true; break end
+  end
+  if cm:get('trackerMode') ~= detected then
+    cm:set('transient', 'trackerMode', detected)
+  end
+end
+
+-- gmem[Continuum_sampler] layout:
+--   [0..1023]                          load mailbox (Continuum→sampler)
+--     [0]   magic (0=empty, MAGIC=pending; written last so sampler never reads half)
+--     [1]   slot index
+--     [2..] path bytes, 0-terminated
+--   [NAMES_BASE..NAMES_BASE+N*STRIDE-1] names slab (sampler→Continuum)
+--     one slot per sample: ASCII bytes then 0-terminator
+-- N_SAMPLES + NAME_STRIDE must match the JSFX constants.
+local CTM_GMEM_NS          = 'Continuum_sampler'
+local CTM_GMEM_MAGIC       = 1717658484   -- 'CTML' as 32-bit ASCII
+local CTM_GMEM_NAMES_BASE  = 1024
+local CTM_GMEM_NAME_STRIDE = 64
+local CTM_N_SAMPLES        = 64
+
+function samplerLoadSlot(slot, path)
+  reaper.gmem_attach(CTM_GMEM_NS)
+  if reaper.gmem_read(0) ~= 0 then return false end
+  for i = 1, #path do
+    reaper.gmem_write(1 + i, path:byte(i))
+  end
+  reaper.gmem_write(2 + #path, 0)
+  reaper.gmem_write(1, slot)
+  reaper.gmem_write(0, CTM_GMEM_MAGIC)
+  return true
+end
+
+-- Pull sample names from the gmem names slab; only write back to cm when
+-- they actually change so configChanged doesn't fire every frame. Names
+-- are 0-indexed, matching JSFX slot index and MIDI PC values.
+function readSamplerNames(cm)
+  reaper.gmem_attach(CTM_GMEM_NS)
+  local fresh = {}
+  for idx = 0, CTM_N_SAMPLES - 1 do
+    local base, chars = CTM_GMEM_NAMES_BASE + idx * CTM_GMEM_NAME_STRIDE, {}
+    for j = 0, CTM_GMEM_NAME_STRIDE - 1 do
+      local b = reaper.gmem_read(base + j)
+      if not b or b == 0 then break end
+      chars[#chars + 1] = string.char(math.floor(b))
+    end
+    if #chars > 0 then fresh[idx] = table.concat(chars) end
+  end
+  local cur = cm:get('samplerNames')
+  for k, v in pairs(fresh) do
+    if cur[k] ~= v then cm:set('transient', 'samplerNames', fresh); return end
+  end
+  for k, v in pairs(cur) do
+    if fresh[k] ~= v then cm:set('transient', 'samplerNames', fresh); return end
+  end
+end
+
 function Main()
   local item = reaper.GetSelectedMediaItem(0, 0)
   if not item then
@@ -44,6 +107,17 @@ function Main()
   cm:setContext(take)
   local tm = newTrackerManager(mm, cm)
   local cmgr = newCommandManager(cm)
+  cmgr:register('loadSampleAtCurrentSlot', function()
+    if not cm:get('trackerMode') then return end
+    local rv, path = reaper.GetUserFileNameForRead('', 'Load sample into current slot', '')
+    if rv and path ~= '' then
+      samplerLoadSlot(cm:get('currentSample'), path)
+    end
+  end)
+  cmgr:register('toggleViewMode', function()
+    cm:set('transient', 'viewMode',
+      cm:get('viewMode') == 'sample' and 'tracker' or 'sample')
+  end)
 
   local vm = newViewManager(tm, cm, cmgr)
   local renderer = newRenderManager(vm, cm, cmgr)
@@ -52,6 +126,7 @@ function Main()
 
   local function loop()
     probeTrackerMode(mm, cm)
+    if cm:get('trackerMode') then readSamplerNames(cm) end
     if renderer:loop() then
       reaper.defer(loop)
     end
