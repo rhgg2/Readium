@@ -697,6 +697,7 @@ function newViewManager(tm, cm, cmgr)
       update.endppqL  = ctx:ppqToRow(update.endppq, update.chan)
                                * logPerRowFor(update.frame.rpb)
       update.lane            = col.lane
+      if cm:get('trackerMode') then update.sample = cm:get('currentSample') end
       tm:addEvent('note', update)
     end
 
@@ -796,6 +797,16 @@ function newViewManager(tm, cm, cmgr)
           local pitch = util.clamp((oct + 1) * 12 + evt.pitch % 12, 0, 127)
           tm:assignEvent('note', evt, { pitch = pitch })
           return commit(pitch, evt.vel)
+
+        -- sample: 2 hex nibbles, 0..127. Authored on every note in
+        -- tracker mode; tm decides which one wins each realised onset.
+        elseif part == 'sample' then
+          if not util.isNote(evt) then return end
+          local d = hexDigit[char]; if not d then return end
+          local newSample = util.clamp(
+            util.setDigit(evt.sample or 0, d, 1 - digit, 16, half), 0, 127)
+          tm:assignEvent('note', evt, { sample = newSample })
+          return commit()
 
         -- delay: signed decimal milli-QN, 3 digits, ±999
         elseif part == 'delay' then
@@ -2049,6 +2060,7 @@ function newViewManager(tm, cm, cmgr)
       grid.lane1Col     = {}
 
       local noteDelayCfg = cm:get('noteDelay')
+      local trackerMode  = cm:get('trackerMode')
 
       -- `key` is the lane number for note columns, the cc number for cc
       -- columns, and nil for singletons (pb/at/pc).
@@ -2056,14 +2068,15 @@ function newViewManager(tm, cm, cmgr)
         local showDelay = type == 'note' and (noteDelayCfg[chan] or {})[key] or false
 
         local gridCol = {
-          type      = type,
-          cc        = type == 'cc'   and key or nil,
-          lane      = type == 'note' and key or nil,
-          label     = LABELS[type] or '',
-          events    = events or {},
-          showDelay = showDelay,
-          midiChan  = chan,
-          cells     = {},
+          type        = type,
+          cc          = type == 'cc'   and key or nil,
+          lane        = type == 'note' and key or nil,
+          label       = LABELS[type] or '',
+          events      = events or {},
+          showDelay   = showDelay,
+          trackerMode = type == 'note' and trackerMode or nil,
+          midiChan    = chan,
+          cells       = {},
         }
         ec:decorateCol(gridCol)   -- stamps parts/stopPos/partAt/partStart/width
         util.add(grid.cols, gridCol)
@@ -2074,7 +2087,7 @@ function newViewManager(tm, cm, cmgr)
 
       for chan, channel in tm:channels() do
         local c = channel.columns
-        if c.pc then addGridCol(chan, 'pc', nil,  c.pc.events) end
+        if c.pc and not trackerMode then addGridCol(chan, 'pc', nil, c.pc.events) end
         if c.pb then addGridCol(chan, 'pb', nil,  c.pb.events) end
         for lane, col in ipairs(c.notes) do addGridCol(chan, 'note', lane, col.events) end
         if c.at then addGridCol(chan, 'at', nil,  c.at.events) end

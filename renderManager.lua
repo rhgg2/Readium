@@ -96,18 +96,23 @@ function newRenderManager(vm, cm, cmgr)
       return NOTE_NAMES[(pitch % 12) + 1] .. octChar
     end
 
-    local showDelay = col and col.showDelay
+    local showDelay  = col and col.showDelay
+    local showSample = col and col.trackerMode
+
     if not evt then
-      return showDelay and '··· ·· ···' or '··· ··'
+      local s = '···' .. (showSample and ' ··' or '') .. ' ··'
+      if showDelay then s = s .. ' ···' end
+      return s
     end
 
     local label
     if evt.type ~= 'pa' then
       label = select(1, vm:noteProjection(evt)) or noteName(evt.pitch)
     end
-    local noteTxt = evt.type == 'pa' and '···' or label
-    local velTxt  = evt.vel and string.format('%02X', evt.vel) or '··'
-    local text    = noteTxt .. ' ' .. velTxt
+    local noteTxt   = evt.type == 'pa' and '···' or label
+    local velTxt    = evt.vel and string.format('%02X', evt.vel) or '··'
+    local sampleTxt = showSample and (' ' .. string.format('%02X', evt.sample or 0)) or ''
+    local text      = noteTxt .. sampleTxt .. ' ' .. velTxt
 
     if showDelay then
       local d = evt.delay or 0
@@ -115,9 +120,14 @@ function newRenderManager(vm, cm, cmgr)
         return text .. ' ···'
       end
       text = text .. ' ' .. string.format('%03d', math.abs(d))
-      -- Digits sit at char positions 8,9,10 regardless of whether the prefix
-      -- uses ASCII note names or multi-byte '···' for pa. Use char indices.
-      if d < 0 then return text, nil, { [8] = 'negative', [9] = 'negative', [10] = 'negative' } end
+      -- Three delay digits sit at the tail of the composed string.
+      -- Computing positions from #text keeps the override correct
+      -- regardless of upstream parts (sample slot in tracker mode,
+      -- '···' for pa, etc.).
+      if d < 0 then
+        local n = #text
+        return text, nil, { [n-2] = 'negative', [n-1] = 'negative', [n] = 'negative' }
+      end
     end
     return text
   end

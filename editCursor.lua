@@ -444,6 +444,7 @@ function newEditCursor(deps)
     -- skipped — width 3, only 2 stops.
     local PARTS = {
       pitch  = { width = 3, stops = {0, 2}    },   -- C-4
+      sample = { width = 2, stops = {0, 1}    },   -- 7F (tracker mode)
       vel    = { width = 2, stops = {0, 1}    },   -- 30
       delay  = { width = 3, stops = {0, 1, 2} },   -- 040
       pb     = { width = 4, stops = {0, 1, 2, 3} },
@@ -451,10 +452,15 @@ function newEditCursor(deps)
     }
 
     -- Parts list per col type. One char of separator sits between adjacent
-    -- parts in the rendered cell.
-    local function partsFor(type, showDelay)
+    -- parts in the rendered cell. `trackerMode` inserts a `sample` part
+    -- between pitch and vel for note cells.
+    local function partsFor(type, showDelay, trackerMode)
       if type == 'note' then
-        return showDelay and {'pitch','vel','delay'} or {'pitch','vel'}
+        local p = {'pitch'}
+        if trackerMode then util.add(p, 'sample') end
+        util.add(p, 'vel')
+        if showDelay   then util.add(p, 'delay')  end
+        return p
       elseif type == 'pb' then
         return {'pb'}
       else
@@ -463,7 +469,7 @@ function newEditCursor(deps)
     end
 
     function ec:decorateCol(col)
-      local parts = partsFor(col.type, col.showDelay)
+      local parts = partsFor(col.type, col.showDelay, col.trackerMode)
       col.parts = parts
 
       local stopPos, partAt, partStart = {}, {}, {}

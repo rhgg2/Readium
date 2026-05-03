@@ -26,10 +26,12 @@ local declarations = {
   { 'overlapOffset',   1/16  },
   { 'defaultVelocity', 100   },
   { 'currentOctave',   2     },
+  { 'currentSample',   0     },
   { 'advanceBy',       1     },
 
   -- boolean
   { 'polyAftertouch',  true  },
+  { 'trackerMode',     false },
 
   -- string choice
   { 'noteLayout',      'colemak' },
