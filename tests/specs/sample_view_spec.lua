@@ -104,6 +104,50 @@ return {
     end,
   },
   {
+    name = "setTrack with cm injected rekeys cm and clears transient currentSample",
+    run = function(harness)
+      local h = harness.mk()
+      h.cm:set('transient', 'currentSample', 5)
+      local sv = newSampleView(h.cm, function() end, function() end, function() end)
+      local trackB = 'trackB'
+      h.reaper._state.trackExt[trackB .. '/P_EXT:ctm_config'] =
+        util.serialise({ pbRange = 9 })
+      sv:setTrack(trackB)
+      t.eq(sv:getTrack(), trackB, 'sv stored the new track')
+      t.eq(h.cm:getAt('transient', 'currentSample'), nil,
+           'transient currentSample cleared')
+      t.eq(h.cm:getAt('track', 'pbRange'), 9,
+           'cm now reads track-tier from new track')
+    end,
+  },
+  {
+    name = "setTrack with cm and same track is a no-op (no transient clear)",
+    run = function(harness)
+      local h = harness.mk()
+      local sv = newSampleView(h.cm, function() end, function() end, function() end)
+      sv:setTrack('trackA')
+      h.cm:set('transient', 'currentSample', 7)
+      sv:setTrack('trackA')
+      t.eq(h.cm:getAt('transient', 'currentSample'), 7,
+           'no-op setTrack leaves transient alone')
+    end,
+  },
+  {
+    name = "listTracks proxies the injected listSamplerTracks",
+    run = function(harness)
+      local h     = harness.mk()
+      local stub  = { { track = 't1', name = 'Drums' },
+                      { track = 't2', name = 'Synth' } }
+      local calls = 0
+      local sv = newSampleView(h.cm, function() end, function() end, function() end,
+        function() calls = calls + 1; return stub end)
+      local got = sv:listTracks()
+      t.eq(calls,  1,         'injection invoked once')
+      t.eq(#got,   2,         'two tracks returned')
+      t.eq(got[1].name, 'Drums', 'first entry passes through')
+    end,
+  },
+  {
     name = "auditionSlot(idx) calls previewSlot(idx, 1)",
     run = function(harness)
       local h = harness.mk()

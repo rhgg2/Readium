@@ -1,0 +1,35 @@
+@module sampleView  src=sampleView.lua  loc=147  sha=f86ae56
+@deps fs
+
+# Module-level constants
+  @const N_SLOTS = 64
+  @const PLAY = '\xe2\x96\xb6'
+
+@factory newSampleView(cm, assignSlot, previewSlot, previewPath, listSamplerTracks)
+
+  # Private state
+    @state sv = {}
+    @state track = nil
+    @state currentFolder = nil   -- folder whose files fill the middle pane
+    @state selectedFile = nil   -- full path of the file selected in the middle pane
+
+  # Private functions
+    @fn browseRoot()
+    @fn drawTree(ctx, path)
+    @fn drawFiles(ctx, path)
+    @fn drawSlots(ctx)
+
+  # Public API
+    @api sv:setTrack(t)
+        -- Switching tracks rekeys cm to the new track and clears any
+        -- transient currentSample so the merged read falls back to the new
+        -- track's stored slot (or schema default). Test seams pass cm=nil
+        -- and exercise just the local field.
+    @api sv:getTrack()
+    @api sv:listTracks()
+    @api sv:setSelectedFile(p)
+    @api sv:getSelectedFile()
+    @api sv:loadSelectedIntoCurrent()
+    @api sv:auditionPath(path)
+    @api sv:auditionSlot(idx)
+    @api sv:draw(ctx)

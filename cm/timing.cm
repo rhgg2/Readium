@@ -1,0 +1,47 @@
+@module timing  src=timing.lua  loc=278  sha=f73f8a8
+
+# Module-level constants
+  @const M = timing
+  @const EPS = 1e-12
+  @const SAMPLES = 240
+
+# Module-level functions (private)
+  @fn sampled(f)
+  @fn lerp(x0, y0, x1, y1, x)
+  @fn findSegment(S, target, axis)   -- axis = 1 for x (eval), 2 for y (invert).
+
+# Public API (timing.*)
+  @api timing.atomTilePeriod(factor)
+      -- The actual repeat period of a factor in QN: user period × pulsesPerCycle.
+  @api timing.findShape(name, userLib)
+  @api timing.isIdentity(composite)
+  @api timing.periodQN(period)
+      -- Bad shape is a caller bug; fail loudly rather than guessing.
+  @api timing.compositePeriodQN(composite)
+      -- Smallest T at which every factor's tile completes — i.e. the period
+      -- of the composite as a repeating function. For rationals nᵢ/dᵢ that's
+      -- lcm(nᵢ)/gcd(dᵢ). Empty composite ⇒ 1 qn (one beat). Tile periods
+      -- here are the *internal* ones (period × pulsesPerCycle), so the result
+      -- reflects the actual repeat rate of the transform, not the user-period.
+  @api timing.eval(S, x)
+  @api timing.invert(S, y)
+  @api timing.inverse(S)
+      -- Swap (x,y) per control point; monotonicity and endpoints preserved,
+      -- so no re-sort.
+  @api timing.compose(S, T)
+      -- Breakpoints of S∘T are T's x-points ∪ T⁻¹(S's x-points): both drive
+      -- slope changes of the composite.
+  @api timing.tile(S, T, p)
+      -- T <= 0 degrades to identity so callers can drive off empty composites.
+  @api timing.tileInverse(S, T, p)
+  @api timing.applyFactors(factors, ppq)
+  @api timing.unapplyFactors(factors, ppq)
+  @api timing.logPerRow(rpb, denom, resolution)
+      -- ppq width of one logical row at the given (rpb, denom). Pure;
+      -- callers pass `resolution` (PPQ per QN). May be fractional under odd
+      -- (rpb, denom) combinations.
+  @api timing.delayToPPQ(d, res)
+      -- Round at source so the map is an integer bijection on ℤ; every
+      -- intent ± delayToPPQ(d) stays in ℤ and round-trips are algebraic.
+  @api timing.ppqToDelay(p, res)
+

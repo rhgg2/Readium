@@ -7,11 +7,19 @@ sampler JSFX (driven via gmem mailboxes).
 
 ## Identity model
 
-Sample mode keys against a **REAPER track**, not a take. Each frame
-`continuum.lua`'s loop pushes the currently selected track in via
-`sv:setTrack(track)`. Multiple takes on the same track share the same
-sampler state, so the view stays useful while the user moves between
-items.
+Sample mode keys against a **REAPER track**, not a take. The track is
+chosen explicitly through the toolbar picker drawn by `renderManager`,
+which lists tracks carrying the Continuum Sampler FX (supplied by the
+`listSamplerTracks` injection from `continuum.lua`). On entry to
+sample mode `continuum.lua` defaults the picked track to the parent
+track of the last-active take, then `cm:clearTake()` drops the take
+context so take-tier reads stop resolving against it.
+
+`sv:setTrack(track)` is the single rebind path. It calls
+`cm:setTrack(track)` and clears the transient `currentSample` override
+so the merged read falls back to the new track's stored slot (or the
+schema default). Test seams construct sv with `cm = nil`, exercising
+the local field only.
 
 ## gmem boundary
 
@@ -48,8 +56,9 @@ filenames in different folders don't collide.
 ## API
 
 ```
-sv:setTrack(track)        → ()
+sv:setTrack(track)        → ()        -- rebinds cm to track; clears transient
 sv:getTrack()             → track | nil
+sv:listTracks()           → { { track, name }, ... }   -- candidate sampler tracks
 sv:setSelectedFile(path)  → ()        -- mainly for tests
 sv:getSelectedFile()      → path | nil
 sv:loadSelectedIntoCurrent() → bool   -- false if no file selected

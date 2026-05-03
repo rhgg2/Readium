@@ -1,8 +1,10 @@
 -- See docs/sampleView.md for the model and API reference.
 --
 -- Take-independent view for sample mode. Slot list + browser key against
--- a REAPER track, not a take; continuum.lua's loop pushes the selected
--- track in via setTrack each tick. Browser root comes from cm
+-- a REAPER track, not a take; the track is chosen explicitly via the
+-- toolbar picker (listSamplerTracks supplies the candidate list).
+-- continuum.lua sets a default track on entry to sample mode (the
+-- last-active take's parent). Browser root comes from cm
 -- (`sampleBrowserRoot`); $HOME is the lazy fallback. assignSlot routes
 -- through slotStore (cm-first); previewSlot / previewPath are the gmem
 -- preview writers in continuum.lua. Injection keeps sv free of gmem and
@@ -18,11 +20,13 @@ local ImGui
 local N_SLOTS = 64
 local PLAY    = '\xe2\x96\xb6'  -- U+25B6 ▶
 
-function newSampleView(cm, assignSlot, previewSlot, previewPath)
+function newSampleView(cm, assignSlot, previewSlot, previewPath, listSamplerTracks)
   local sv = {}
   local track         = nil
   local currentFolder = nil  -- folder whose files fill the middle pane
   local selectedFile  = nil  -- full path of the file selected in the middle pane
+
+  listSamplerTracks = listSamplerTracks or function() return {} end
 
   local function browseRoot()
     return cm:get('sampleBrowserRoot') or os.getenv('HOME') or '/'
@@ -75,8 +79,20 @@ function newSampleView(cm, assignSlot, previewSlot, previewPath)
     end
   end
 
-  function sv:setTrack(t)        track = t        end
+  -- Switching tracks rekeys cm to the new track and clears any
+  -- transient currentSample so the merged read falls back to the new
+  -- track's stored slot (or schema default). Test seams pass cm=nil
+  -- and exercise just the local field.
+  function sv:setTrack(t)
+    if t == track then return end
+    track = t
+    if cm then
+      cm:setTrack(t)
+      cm:remove('transient', 'currentSample')
+    end
+  end
   function sv:getTrack()         return track     end
+  function sv:listTracks()       return listSamplerTracks() end
   function sv:setSelectedFile(p) selectedFile = p end
   function sv:getSelectedFile()  return selectedFile end
 
@@ -98,14 +114,6 @@ function newSampleView(cm, assignSlot, previewSlot, previewPath)
   function sv:draw(ctx)
     if not ImGui then ImGui = require 'imgui' '0.10' end
     local root = browseRoot()
-
-    if track then
-      local _, name = reaper.GetTrackName(track)
-      ImGui.Text(ctx, 'Track: ' .. (name ~= '' and name or '(unnamed)'))
-    else
-      ImGui.Text(ctx, 'No track selected')
-    end
-    ImGui.Separator(ctx)
 
     local availW, availH = ImGui.GetContentRegionAvail(ctx)
     local treeW  = math.max(220, availW * 0.25)

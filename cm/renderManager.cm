@@ -1,0 +1,138 @@
+@module renderManager  src=renderManager.lua  loc=2380  sha=ceefc8e
+@deps util, timing
+
+# Module-level constants
+  @const ImGui = require 'imgui' '0.10'
+
+# Module-level functions (private)
+  @fn print(...)
+
+@factory newRenderManager(vm, cm, cmgr, sv)
+
+  # Private state
+    @state GUTTER = 4   -- in grid chars
+    @state HEADER = 3   -- in grid rows
+    @state gridX = nil
+    @state gridY = nil
+    @state gridOriginX = 0
+    @state gridOriginY = 0
+    @state gridWidth = 0
+    @state gridHeight = 0
+    @state ctx = nil
+    @state font = nil   -- monospace, used inside the tracker grid
+    @state uiFont = nil   -- system sans-serif, used for chrome (toolbar, status, modals, swing editor)
+    @state dragging = false
+    @state modalState = nil   -- nil = closed, else { title, prompt, callback, buf, kind? }
+    @state swingEditor = nil   -- nil = closed, else { name, snapshot, createBuf, createError }
+    @state quitting = false   -- set by the quit command, observed by rm:loop
+    @state pickerOpenRequest = nil   -- 'temper' | 'swing' | nil; consumed next frame by drawSlotPicker
+    @state pickerFilter = {}   -- kind -> typeahead buffer; reset on each open
+    @state pickerCursor = {}   -- kind -> 1-based highlight index into filtered matches
+    @state pickerActive = false   -- a picker popup owned input this frame; handleKeys must skip
+    @state laneLayout = nil   -- { x0, yTop, yBot, w, valSpan, valMin, valMax,
+    @state laneHover = nil   -- visible event index in laneLayout.events, or nil
+    @state laneSegHover = nil   -- segment-owner visible idx (left endpoint of hovered segment), or nil
+    @state laneSegPin = nil   -- { segI, mx, my, colIdx } or nil
+    @state lanePreview = nil   -- { colIdx, row, ppq, val } — phantom anchor for click-to-insert
+    @state laneDrag = nil   -- { kind='move'|'tension', colIdx, idx, startMx, startMy, moved, ... }
+    @state lanePreviewSuppress = nil   -- { x, y } or nil
+    @state renderFns = {
+    @state colourCache = {}
+
+  # Private functions
+    @fn layoutColumns(cols, scrollCol)   -- Pack columns left-to-right starting at scrollCol, fitting as many as gridWidth allows; set
+    @fn renderNote(evt, col, row)
+    @fn noteName(pitch)
+    @fn renderPB(evt)
+    @fn renderCC(evt)
+    @fn renderCell(evt, col, row)
+    @fn resolveColour(key)   -- Walk the colour table from a starting cm key to a terminal atom. Entries: {r,g,b,a} atom |
+    @fn colour(name)   -- Roles live under `colour.*`; callers pass the bare role name and we prepend the namespace 
+    @fn pushStyles()
+    @fn push(enum, col)
+    @fn printer(ctx, gX, gY, x0, y0)
+    @fn drawTextAt(xpos, ypos, txt, c)
+    @fn laneStripRows()   -- Effective lane-strip row count: 0 when hidden, else the configured size. Single point of t
+    @fn verticalSeparator()   -- reaper-imgui has no Separator(Vertical); draw a 1px vertical line via the window draw list
+    @fn drawSlotPicker(d)   -- The popup carries a typeahead filter (autofocused on open). Enter picks the first survivin
+    @fn pickTemper(name)   -- Seed-and-select wrappers: the picker hands us a name and we ensure the lib has it before c
+    @fn pickSwing(name)
+    @fn pickColSwing(chan, name)
+    @fn pushChromeStyles()   -- Chrome styling shared by the toolbar and the swing editor: hairline frame border + the too
+    @fn popChromeStyles()
+    @fn pushChromeWindow()   -- Surfaces use editor.bg (opaque pale) — toolbar.bg is authored at 0.5 alpha and would bleed
+    @fn popChromeWindow()
+    @fn drawSampleDropdown()   -- Sample slot picker for tracker mode. Lists only loaded slots (those that published a name 
+    @fn drawModeSwitcher()   -- The mode switcher is the only toolbar element common to all view modes; the bits to its ri
+    @fn modeButton(label, value)
+    @fn drawSampleToolbarBits()
+    @fn drawTrackerToolbarBits()
+    @fn drawToolbar()
+    @fn computeLayout(budgetW, budgetH)   -- Establish per-frame layout: char metrics, column packing, and the integer-row grid height 
+    @fn drawLaneStrip()
+    @fn rowToX(row)
+    @fn ppqToX(ppq)
+    @fn valToY(v)
+    @fn evalAtRow(row)
+    @fn drawSegHighlight(segI)   -- Restroke segment segI in the active colour. evalAtRow is bidirectional (segIdx ratchets bo
+    @fn drawTracker()
+    @fn drawStatusBar()
+    @fn nearestStop(mouseX, mouseY)
+    @fn handleLaneStrip()   -- laneDrag.idx indexes laneLayout.events — the *visible* sequence built in drawLaneStrip. Hi
+    @fn seedDragBase(kind, colIdx, idx)   -- startMx/startMy gate the held branch: no edits until mouse moves a pixel, so a click that 
+    @fn seedMoveDrag(colIdx, idx)
+    @fn seedTensionDrag(colIdx, segI, A, B)   -- Tension drag: capture chord endpoints in screen space at click time. The drag axis is the 
+    @fn handleMouse()
+    @fn keySpec(spec)   -- A keymap entry is either a bare key constant or a {key, mod, mod...} chord. Returns (keyCo
+    @fn handleKeys()
+    @fn drawModal()
+    @fn close(invoke, ...)
+    @fn scaleBy(factor)   -- Mutating rowsBuf externally is invisible to an active InputText, which caches its own buff
+    @fn pressedAny(specs)
+    @fn openPrompt(title, prompt, callback)
+    @fn openConfirm(title, callback, prompt)
+    @fn scopedAction(title, base)   -- Selection → vm:<base>Selection();  no selection → confirm → vm:<base>All(). The naming con
+    @fn meterQN()   -- qn-per-beat (denom-derived) and qn-per-bar (num × beat).
+    @fn periodPresetIndex(tileQN)   -- Combo speaks tile-qn (= user-period × pulsesPerCycle), so atoms with ppC > 1 surface their
+    @fn periodLabel(tileQN)
+    @fn periodOverPPC(period, ppC)   -- Preset .period is already a tidy rational; halving it for ppC=2 keeps it tidy ({n,d} → {n,
+    @fn shiftCap(factor, wild)   -- Hard = T_tile · atomMeta.range (the monotonicity edge in QN). Soft = min(SWING_SOFT_QN, ha
+    @fn materialise(composite)
+    @fn drawSwingGrid(composite, periodQN, rpb, w, h, shadeMeter)   -- Horizontal strip showing one period: cells are unswung subdivisions (rpb per qn), Xs land 
+    @fn isInt(x)   -- Classify a tick at qn position p into 'bar' (downbeat), 'midBar' (the bar's midpoint when 
+    @fn classify(p)
+    @fn swingRead()
+    @fn compositesEqual(a, b)
+    @fn swingWrite(composite)
+    @fn patchFactor(i, patch)
+    @fn addFactor()
+    @fn removeFactor(i)
+    @fn moveFactor(i, dir)
+    @fn drawFactorRow(i, f, availW)
+    @fn idealSwingHeight(nFactors)   -- Generous estimate — better to show a few px of empty space than to clip the add-factor but
+    @fn idealSwingWidth()
+    @fn drawSwingEditor()
+
+  # Public API
+    -- Cell renderers
+    -- Colour
+    -- Drawing
+    @api pt:text(x, y, txt, c, font)
+    @api pt:textCentred(x1, x2, y, txt, c)
+    @api pt:textCentredSmall(x1, x2, y, txt, size, c)
+    @api pt:vLine(x, y1, y2, c)
+    @api pt:hLine(x1, x2, y, c, yOff)
+    @api pt:box(x1, x2, y1, y2, c)
+    -- Lane strip
+    -- Input
+    -- Modal-driven commands
+    -- Swing editor
+    @api rm:init()
+    @api rm:loop()
+
+  # REAPER API surface
+    @reaper ImGui_GetBuiltinPath
+    @reaper MB
+    @reaper new_array
+    @reaper ShowConsoleMsg
+    @reaper GetOS

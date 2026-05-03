@@ -1,0 +1,78 @@
+@module configManager  src=configManager.lua  loc=416  sha=f86ae56
+@deps util
+
+# Module-level constants
+  @const declarations = {
+
+# Module-level functions (private)
+  @fn print(...)
+  @fn hex(s, alpha)   -- hex('#RRGGBB', alpha?) → {r,g,b,a} with components in [0,1]. Leading '#' optiona
+  @fn copy(v)
+
+@factory newConfigManager()
+
+  # Private state
+    @state CONFIG_PREFIX = 'ctm_'
+    @state SCRIPT_PATH = debug.getinfo(1,'S').source:match[[^@?(.*[\/])[^\/]-$]]
+    @state CONFIG_GLOBAL_PATH = SCRIPT_PATH .. 'ctm_cfg.txt'
+    @state take = nil
+    @state track = nil
+    @state fire   -- installed below, once cm exists
+    @state cache = {
+    @state levels = { 'global', 'project', 'track', 'take', 'transient' }
+    @state levelSet = {}
+    @state loaders = {
+    @state savers = {
+    @state cm = {}
+
+  # Private functions
+    @fn pruneUnknown(tbl)   -- Tolerant on load: stale keys from a rename shouldn't error.
+    @fn parse(text)
+    @fn loadGlobal()
+    @fn saveGlobal(tbl)
+    @fn loadProject()
+    @fn saveProject(tbl)
+    @fn loadTrack()
+    @fn saveTrack(tbl)
+    @fn loadTake()
+    @fn saveTake(tbl)
+    @fn refreshCache()
+    @fn ensureCache()
+    @fn mergedTable()
+    @fn checkLevel(level)
+    @fn checkKey(key)
+
+  # Public API
+    -- PRIVATE DATA
+    -- STORAGE BACKENDS
+    -- CACHE MANAGEMENT
+    -- PUBLIC INTERFACE
+    @api cm:setContext(newTake)
+    @api cm:clearTake()
+        -- Drops the take half of the context, leaving track/global/project
+        -- unchanged. Used by sample view, which is take-independent: it keys
+        -- track-tier reads against an explicitly chosen track (see setTrack)
+        -- and has no business reading take-tier values.
+    @api cm:setTrack(newTrack)
+        -- Sets the track context independently of any take. Reloads the track
+        -- cache so subsequent reads resolve against the new track's P_EXT.
+        -- setContext continues to derive track from take for tracker view.
+    -- Reading
+    @api cm:get(key)
+    @api cm:getAt(level, key)
+    @api cm:getLevel(key)
+    -- Writing
+    @api cm:set(level, key, value)
+    @api cm:remove(level, key)
+    @api cm:assign(level, updates)
+
+  # Signals emitted (via util.installHooks)
+    @emits configChanged
+
+  # REAPER API surface
+    @reaper GetProjExtState
+    @reaper SetProjExtState
+    @reaper GetSetMediaTrackInfo_String
+    @reaper GetSetMediaItemTakeInfo_String
+    @reaper GetMediaItemTake_Item
+    @reaper GetMediaItemTrack

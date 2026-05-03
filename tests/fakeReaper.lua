@@ -63,6 +63,18 @@ function M.new()
     return names[idx + 1] ~= nil, names[idx + 1] or ''
   end
 
+  -- Project track list (used by listSamplerTracks in continuum.lua).
+  -- Tests register tracks via setProjectTracks(names) — order matters
+  -- because GetTrack(_, i) is index-based.
+  state.projectTracks = {}
+  state.trackNames    = {}
+  function r.CountTracks(_proj)             return #state.projectTracks end
+  function r.GetTrack(_proj, i)             return state.projectTracks[i + 1] end
+  function r.GetTrackName(track)
+    local n = state.trackNames[track]
+    return n ~= nil, n or ''
+  end
+
   -- Transport / cursor
 
   function r.GetCursorPosition() return state.cursorTime end
@@ -260,6 +272,12 @@ function M.new()
   end
   function r:setTrackFX(track, names)
     state.fxByTrack[track] = names
+  end
+  function r:setProjectTracks(tracks)
+    state.projectTracks = tracks
+  end
+  function r:setTrackName(track, name)
+    state.trackNames[track] = name
   end
   function r:clearCalls()   state.calls = {} end
   function r:clearConsole() state.console = {} end

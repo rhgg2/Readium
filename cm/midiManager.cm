@@ -1,0 +1,122 @@
+@module midiManager  src=midiManager.lua  loc=1073  sha=9a38920
+@deps util
+
+# Module-level constants
+  @const chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
+  @const chanMsgTypes   -- inverse of chanMsgLUT
+  @const BASE36 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+# Module-level functions (private)
+  @fn print(...)
+  @fn toBase36(num)
+  @fn fromBase36(txt)
+
+@factory newMidiManager(take)
+
+  # Private state
+    @state notes = {}
+    @state ccs = {}
+    @state eventsByUuid = {}
+    @state maxUUID = 0
+    @state lock = false
+    @state pendingSysexDeletes   -- list of uuids; non-nil only inside a modify()
+    @state INTERNALS = { idx = true, uuidIdx = true }
+    @state shapeLUT = { step = 0, linear = 1, slow = 2, ['fast-start'] = 3, ['f...
+    @state shapeNames = {}
+    @state noteEventFields = {
+    @state ccEventFields = {
+    @state mm = {}
+    @state fire = util.installHooks(mm)
+
+  # Private functions
+    @fn bezierSample(tau, t)
+    @fn idOf(cc)
+    @fn loadMetadata()
+    @fn saveMetadatum(uuid)
+    @fn saveMetadata()
+    @fn compact(t, n)   -- Sparse → dense, preserving order. n is the original (pre-sparsening) length.
+    @fn assignNewUUID(evt)
+    @fn noteKey(n)
+    @fn idOf(cc)
+    @fn ccIdKey(e)
+    @fn ccPPQKey(e)
+    @fn ccFullKey(e)
+    @fn bucketBy(keyFn)
+    @fn bind(s, c, kind, extras)
+    @fn removeFirst(t, e)
+    @fn checkLock()
+    @fn flushPendingSysexDeletes()   -- Resolve pending sidecar deletes by walking REAPER's live sysex array and matching uuids. A
+    @fn reconstruct(tbl)
+    @fn retractEot(buf, targetPpq)   -- Walk the raw event buffer to find the trailing End-Of-Track meta event (msg = 0xFF 0x2F 0x
+
+  # Public API
+    -- Load
+    @api mm:load(newTake)
+        · Helper functions
+        · Read notes
+        · Note dedup → flush. Longest endppq wins; flush before sysex read so
+        · the cascade-deleted notation events don't leave us with stale idxs.
+        · Read ccs + sysex (notation events for notes, magic sidecars for ccs)
+        · CC dedup (in-memory only — flush is bundled into the single bracket below)
+        · UUID unification (notes ↔ noteSidecars). First-arrival wins per tag;
+        · duplicates and orphans get queued for deletion.
+        · Sidecar reconcile (ccs ↔ ccSidecars). Working sets are
+        · clones; what's left in `sidecars` after stage 4 is unmatched
+        · and queued for deletion.
+        · Single bracketed flush: sets first (idx-stable), deletes descending,
+        · inserts last (their idxs aren't tracked — final read will pick them up).
+        · Compact in-memory tables to dense.
+        · Final read pass: refresh idx / uuidIdx from current REAPER state.
+        · Persist + signals
+    @api mm:reload()
+    -- Locking
+    @api mm:modify(fn)
+    -- Notes
+    @api mm:getNote(loc)
+    @api mm:notes()
+    @api mm:deleteNote(loc)
+    @api mm:assignNote(loc, t)
+    @api mm:addNote(t)
+    -- CCs
+    @api mm:getCC(loc)
+    @api mm:ccs()
+    @api mm:deleteCC(loc)
+    @api mm:assignCC(loc, t)
+    @api mm:addCC(t)
+    -- Take data
+    @api mm:take()
+    @api mm:interpolate(A, B, ppq)
+        -- REAPER convention: shape on A governs the curve from A to next.
+    @api mm:resolution()
+    @api mm:length()
+        -- Source length, not item length. The "take" is the source MIDI; the item
+        -- is just a window onto it. setLength below truncates the source's EOT
+        -- marker explicitly so this stays in sync after a shrink.
+    @api mm:name()
+    @api mm:setName(name)
+    @api mm:setLength(qn)
+        -- Resize the take to `qn` quarter-notes. MIDI_SetItemExtents shrinks the
+        -- item but leaves the source's EOT stale on contract; we retract it
+        -- explicitly so the source actually shrinks. Project metadata only —
+        -- no high-level MIDI event mutation, so doesn't go through modify();
+        -- fires reload so tm picks up the new length.
+    @api mm:timeSigs()
+
+  # Signals emitted (via util.installHooks)
+    @emits takeSwapped
+    @emits notesDeduped
+    @emits uuidsReassigned
+    @emits ccsDeduped
+    @emits ccsReconciled
+    @emits reload
+
+  # REAPER API surface
+    @reaper GetSetMediaItemTakeInfo_String
+    @reaper MIDI_CountEvts, MIDI_GetNote, MIDI_DisableSort, MIDI_DeleteNote, MIDI_Sort, MIDI_GetCC, MIDI_GetCCShape, MIDI_GetTextSysexEvt, MIDI_SetTextSysexEvt, MIDI_DeleteCC, MIDI_DeleteTextSysexEvt, MIDI_InsertTextSysexEvt, MIDI_SetNote, MIDI_InsertNote, MIDI_SetCC, MIDI_SetCCShape, MIDI_InsertCC, MIDI_GetPPQPosFromProjQN, MIDI_SetItemExtents, MIDI_GetAllEvts, MIDI_SetAllEvts, MIDI_GetPPQPosFromProjTime
+    @reaper GetMediaItemTake_Source, GetMediaItemTake_Item
+    @reaper GetMediaSourceLength
+    @reaper GetMediaItemInfo_Value
+    @reaper TimeMap2_timeToQN
+    @reaper CountTempoTimeSigMarkers
+    @reaper GetTempoTimeSigMarker
+    @reaper TimeMap_GetTimeSigAtTime

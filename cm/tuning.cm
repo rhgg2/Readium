@@ -1,0 +1,20 @@
+@module tuning  src=tuning.lua  loc=123  sha=f73f8a8
+
+# Module-level constants
+  @const M = tuning
+
+# Module-level functions (private)
+  @fn computeOctaveStep(stepNames)   -- Scan from the end: every trailing C-variant step (e.g. C↓ in 31EDO) is enharmoni
+  @fn edo(n, names)
+  @fn octaveLabel(o)   -- Octave -1 renders as "M" so the cell width stays fixed.
+
+# Public API (tuning.*)
+  @api tuning.findTemper(name, userLib)
+      -- Resolve a temperament slot name within the project library. Mirrors
+      -- `timing.findShape`: presets are seed-only, never consulted here.
+  @api tuning.midiToStep(temper, midi, detune)
+  @api tuning.stepToMidi(temper, step, octave)
+  @api tuning.snap(temper, midi, detune)
+  @api tuning.transposeStep(temper, midi, detune, n)
+  @api tuning.stepToText(temper, step, octave)
+

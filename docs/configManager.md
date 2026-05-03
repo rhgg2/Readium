@@ -74,6 +74,14 @@ callback. Passing `nil` clears the take/track context — `global` and
 `project` remain available; `getAt('track'|'take', …)` returns an empty
 table or nil values.
 
+`cm:clearTake()` and `cm:setTrack(track)` exist for sample view, which
+is take-independent: the user picks a track explicitly. `clearTake`
+drops the take half of the context and empties the take-tier cache,
+leaving track/global/project intact. `setTrack` rebinds the track
+context to an arbitrary track (independent of any take) and reloads
+the track-tier cache from that track's `P_EXT`. Both fire
+`configChanged` with an empty payload, like `setContext`.
+
 ## Signals
 
 cm fires one signal, `'configChanged'`. Payload shape varies by call site:
@@ -103,6 +111,8 @@ cm fires one signal, `'configChanged'`. Payload shape varies by call site:
 ```
 newConfigManager()              -- no take context; global/project only
 cm:setContext(take)             -- take may be nil to clear; fires callback
+cm:clearTake()                  -- drops take half; track/global/project kept
+cm:setTrack(track)              -- rebinds track independent of take
 ```
 
 ### Callbacks

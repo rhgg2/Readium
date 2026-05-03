@@ -1,0 +1,24 @@
+@module commandManager  src=commandManager.lua  loc=175  sha=4e70ca0
+
+# Module-level constants
+  @const layouts = {
+  @const chars = {}
+
+@factory newCommandManager(cm)
+
+  # Private state
+    @state mgr = {
+
+  # Public API
+    @api mgr:register(name, fn)
+    @api mgr:registerAll(tbl)
+    @api mgr:wrap(name, wrapper)
+    @api mgr:doBefore(name, before)
+    @api mgr:doAfter(name, after)
+    @api mgr:bind(name, keys)
+    @api mgr:bindAll(tbl)
+    @api mgr:invoke(name, ...)
+    @api mgr:noteChars(char)
+        -- Re-read noteLayout on each call so a config change takes effect
+        -- without rebuilding vm.
+    @api mgr:installDefaultKeymap(ImGui)

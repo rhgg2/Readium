@@ -1,0 +1,137 @@
+@module trackerManager  src=trackerManager.lua  loc=1328  sha=2dc06d7
+@deps util, midiManager, timing
+
+# Module-level functions (private)
+  @fn print(...)
+  @fn synthesisePCs(chan, records)   -- Groups note records by realised ppq, leftmost lane wins. records: list of { ppq,
+  @fn reconcilePCsForChan(chan, records, existing)   -- Synthesise + diff against the existing PC list for one channel. Carries locs thr
+
+@factory newTrackerManager(mm, cm)
+
+  # Private state
+    @state channels = {}
+    @state fire   -- installed below, once tm exists
+    @state um   -- update manager; set by tm:rebuild
+    @state lastMuteSet = {}   -- { [chan] = true }, pushed by vm via tm:setMutedChannels
+
+  # Private functions
+    @fn sortByPPQ(tbl)
+    @fn centsToRaw(cents)
+    @fn rawToCents(raw)
+    @fn delayToPPQ(d)
+    @fn resolveSlot(name)
+    @fn createUpdateManager()
+    @fn owner(chan, P)
+    @fn detuneAt(chan, P)
+    @fn detuneBefore(chan, P)
+    @fn rawAt(chan, P)
+    @fn rawBefore(chan, P)
+    @fn pbAt(chan, P)
+    @fn logicalAt(chan, P)
+    @fn logicalBefore(chan, P)
+    @fn nextLogicalChange(chan, P)
+    @fn nextRealChange(chan, P)
+    @fn nextNotePPQ(chan, P)
+    @fn forEachAttachedPA(host, fn)
+    @fn addLowlevel(evtType, evt)
+    @fn assignLowlevel(evtType, evt, update)
+    @fn deleteLowlevel(evtType, evt)
+    @fn retuneLowlevel(chan, P1, P2, delta)
+    @fn forcePb(chan, P, extras)
+    @fn markFake(chan, P)
+    @fn unmarkFake(chan, P)
+    @fn reconcileBoundary(chan, P)   -- Restore the fake-pb invariant at note seat P after a detune change has shifted the carry a
+    @fn addPb(pb)
+    @fn deletePb(pb)
+    @fn assignPb(pb, update)
+    @fn dirtyPc(chan)   -- Any add/delete/sample-or-realised-onset change affects the channel's PC synthesis (which n
+    @fn addNote(n)
+    @fn deleteNote(n, keepPAs)
+    @fn resizeNote(n, P1, P2)
+    @fn assignNote(n, update)
+    @fn clearSameKeyRange(chan, pitch, P, Pend, selfEvt)   -- Same-(chan, pitch) overlap reconciliation in REALISED space. MIDI gives one voice per (cha
+    @fn reconcilePcs(chan)   -- Per-chan synthesis at flush time. notesByLoc reflects assigns and deletes; pending note ad
+    @fn realiseNoteUpdate(evt, update)   -- Delay shifts only the note-on; endppq is intent and never carries the delay offset. A dela
+    @fn init()
+    @fn pushNoteCol(channel)
+    @fn noteColumnAccepts(col, note)   -- Overlap is judged in intent space: delay is a realisation-level shift and shouldn't affect
+    @fn allocateNoteColumn(channel, note)
+    @fn findNoteColumnForPitch(channel, pitch, ppq_pos)
+    @fn projectCC(cc, loc, overlay)
+    @fn tidyCol(col)   -- 5) Shift into intent frame and sort by intent ppq. Endppq is intent in storage too — only 
+    @fn forEachEvent(fn)   -- Walk every event in the take, calling fn(type, evt, chan, isNote) once per event. Notes/pa
+    @fn applyTimeMap(tau, slopeAt)   -- Two passes (gather, then mutate) so all reads are stable. Used by rescaleLength and (futur
+    @fn snapshot(iter)
+    @fn shift(c, delta, isNote)
+
+  # Public API
+    -- Swing
+    -- Update manager
+    -- Accessors
+    -- Low-level mutation
+    -- High-level ops
+    -- PC reconciliation (trackerMode mutation hook)
+    -- Public interface
+    @api um:deleteEvent(evtType, evtOrLoc)
+    @api um:assignEvent(evtType, evtOrLoc, update, opts)
+        -- opts.trustGeometry: caller asserts the batch is internally
+        -- consistent (no new same-key overlaps introduced). Skips the
+        -- per-write clamp; rebuild's group-by-pitch normalisation is the
+        -- backstop. Used by reswing, whose monotone reparameterisation
+        -- can't create overlaps that didn't exist in the source frame.
+    @api um:addEvent(evtType, evt)
+    -- Flush: commit accumulated ops to mm.
+    @api um:flush()
+    -- Init: load local cache from mm.
+    -- Column allocation
+    -- Rebuild
+    @api tm:rebuild(takeChanged)
+    -- Accessors
+    @api tm:getChannel(chan)
+    @api tm:channels()
+    @api tm:editCursor()
+    @api tm:length()
+    @api tm:resolution()
+    @api tm:name()
+    @api tm:setName(name)
+    @api tm:setLength(newPpq)
+        -- Resize the take to `newPpq`. On shrink, events at-or-past the boundary
+        -- are deleted; notes that span the boundary keep their onset and have
+        -- endppq clamped.
+    @api tm:rescaleLength(newPpq)
+        -- Stretch the take to `newPpq` by linearly remapping the logical
+        -- frame: each event on logical row r ends up on row f·r where
+        -- f = newPpq/oldPpq. ppqL stamps scale by f; intent ppqs are
+        -- rederived through swing — so under non-identity swing realised
+        -- ppqs are not linearly scaled (rows are preserved instead, which
+        -- keeps reswing well-defined). Note delays scale by f. Frame stamps
+        -- (rpb, swing slot names) are untouched. No events are deleted.
+    @api tm:tileLength(newPpq)
+        -- Because oldPpq sits on a swing-period boundary (take length aligns
+        -- to QN), shifting by k·oldPpq is identical in logical and realised
+        -- frames; one delta serves both ppq and ppqL paths.
+    @api tm:timeSigs()
+    @api tm:interpolate(A, B, ppq)
+    @api tm:swingSnapshot(override)
+        -- E_c: column is inner, global is outer (see docs/timing.md).
+    -- Transport
+    @api tm:playFrom(ppq)
+    @api tm:play()
+    @api tm:stop()
+    @api tm:playPause()
+    -- Mutation
+    @api tm:deleteEvent(type, evt)
+    @api tm:addEvent(type, evt)
+    @api tm:assignEvent(type, evt, update, opts)
+    @api tm:flush()
+    -- Mute
+    @api tm:setMutedChannels(set)
+
+  # Signals emitted (via util.installHooks)
+    @emits rebuild
+
+  # REAPER API surface
+    @reaper GetCursorPosition
+    @reaper MIDI_GetPPQPosFromProjTime, MIDI_GetProjTimeFromPPQPos
+    @reaper SetEditCurPos
+    @reaper Main_OnCommand

@@ -36,6 +36,26 @@ end
 
 local SAMPLER_FX = 'Continuum Sampler'
 
+-- Walks all tracks and returns those carrying the Continuum Sampler FX.
+-- Returned shape: { { track = <track>, name = <track-name> }, ... } —
+-- consumed by sampleView's track picker.
+function listSamplerTracks()
+  local out = {}
+  for i = 0, reaper.CountTracks(0) - 1 do
+    local t = reaper.GetTrack(0, i)
+    for j = 0, reaper.TrackFX_GetCount(t) - 1 do
+      local _, fxName = reaper.TrackFX_GetFXName(t, j, '')
+      if fxName:find(SAMPLER_FX, 1, true) then
+        local _, trackName = reaper.GetTrackName(t)
+        out[#out + 1] = { track = t,
+                          name  = trackName ~= '' and trackName or '(unnamed)' }
+        break
+      end
+    end
+  end
+  return out
+end
+
 function probeTrackerMode(mm, cm)
   local track = reaper.GetMediaItemTake_Track(mm:take())
   local detected = false
@@ -210,10 +230,26 @@ function Main()
       cm:get('viewMode') == 'sample' and 'tracker' or 'sample')
   end)
 
-  local sv = newSampleView(cm, assignSlot, samplerPreviewSlot, samplerPreviewPath)
+  local sv = newSampleView(cm, assignSlot, samplerPreviewSlot, samplerPreviewPath,
+                           listSamplerTracks)
   local renderer = newRenderManager(vm, cm, cmgr, sv)
   probeTrackerMode(mm, cm)
   renderer:init()
+
+  -- Sample mode is take-independent: cm drops the take and rebinds its
+  -- track to whatever the picker (or the default) selected. Tracker mode
+  -- restores the take context so take-tier reads work again. prevMode
+  -- seeds to 'tracker' (the post-Main state); a 'sample' boot is then
+  -- caught by the mismatch on the first iteration.
+  local prevMode = 'tracker'
+  local function applyViewMode(mode)
+    if mode == 'sample' then
+      cm:clearTake()
+      sv:setTrack(reaper.GetMediaItemTake_Track(take))
+    else
+      cm:setContext(take)
+    end
+  end
 
   -- sweptForTracker re-arms when trackerMode goes false: a fresh FX needs
   -- a fresh push of every slot since @serialize starts empty.
@@ -235,9 +271,13 @@ function Main()
       sweptForTracker = false
     end
     lastProjectPath = pp
-    if cm:get('viewMode') == 'sample' then
-      sv:setTrack(reaper.GetSelectedTrack(0, 0))
+
+    local mode = cm:get('viewMode')
+    if mode ~= prevMode then
+      applyViewMode(mode)
+      prevMode = mode
     end
+
     if renderer:loop() then
       reaper.defer(loop)
     end

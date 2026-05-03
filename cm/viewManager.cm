@@ -1,0 +1,380 @@
+@module viewManager  src=viewManager.lua  loc=2255  sha=4e70ca0
+@deps util, midiManager, trackerManager, tuning, commandManager, editCursor
+
+# Module-level functions (private)
+  @fn print(...)
+
+@factory newViewContext(args)
+
+  # Private state
+    @state swing = args.swing
+    @state rowPPQs = args.rowPPQs
+    @state length = args.length
+    @state numRows = args.numRows
+    @state rowPerBeat = args.rowPerBeat
+    @state ppqPerRow = args.ppqPerRow
+    @state timeSigs = args.timeSigs
+    @state temper = args.temper
+    @state ctx = {}
+
+  # Private functions
+    @fn timeSigAt(ppq)
+    @fn tsRow(ts)
+    @fn neighbourEvents(cols, ppq, pred)   -- Closest matching events on each side of `ppq`, across `cols.events`. prev maximises endppq
+    @fn notePreds(excludeEvt)
+    @fn overlapBounds(col, ppq, excludeEvt, allowOverlap)   -- Bounds on placing/extending a note. Different-pitch neighbours bind col-locally in intent 
+    @fn rowBounds(col, ppq, excludeEvt, allowOverlap)   -- Row-space sibling of overlapBounds for row-aligned moves. Reads ppqL/endppqL when present 
+    @fn startL(e, slack)   -- slack > 0 ⇒ go through swing (leniency is an intent-ppq quantity). slack == 0 ⇒ prefer ppq
+    @fn endL(e, slack)
+    @fn conformOverlaps(plans)   -- Each plan entry: `{ col, e, newppq, [newEndppq] }`. Mutates `newppq` / `newEndppq` on plan
+    @fn writePlans(plans)   -- Write a plan list through `tm:assignEvent`. Each plan: any subset of `newppq, newEndppq, n
+    @fn delayRange(col, n)   -- Bounds on a note's `delay` field. Two constraints, both natural to "performance delay":   
+    @fn eventsByCol()
+    @fn logPerRowFor(rpb)   -- Logical ppq width of one row at the given rpb. Take-wide denom comes off timeSigs[1]; reso
+    @fn logicalOf(e)   -- Read logical ppq off an event, falling back to ppq for events with no authored frame (lega
+    @fn endLogicalOf(e)
+    @fn frameAndLogPerRow(chan)   -- Frame + its row scale for the current channel.
+    @fn assignStamp(type, evt, chan, rowS, rowE)   -- Row-aligned authoring stamp + assign. Writes the canonical (ppq, [endppq,] ppqL, [endppqL,
+    @fn paFrame(hostFrame, chan)   -- Frame to stamp on a PA being attached to a host note. Inherits host's swing slot + colSwin
+    @fn assignTail(evt, chan, endppq, endppqL)   -- Pass `endppqL` when known (row-aligned, or partner already in current frame); omit otherwi
+    @fn matchGridToCursor()   -- Set grid to the cursor's frame, or release if already overriding.
+    @fn writeShared(key, value)   -- Slot selections (temper, swing) are views over the data, not data themselves. Mirroring at
+    @fn toggleChannelFlag(key, chan)
+    @fn lastVisibleFrom(startCol)
+    @fn placeNewNote(col, update)   -- Caller has already pinned (ppq, ppqL, frame) onto `update`. Endppq stretches to the next n
+    @fn notePAEvents(col, pitch, startppq, endppq)
+    @fn commit(auditionPitch, auditionVel)
+    @fn snap(update)   -- Off-grid write snaps intent to the cursor row, restamps the frame, and preserves logical d
+    @fn newVel(old)
+    @fn visibleAt(col, i)   -- The i-th visible event in a cc/pb/at column (skips hidden absorbers), or nil. Used by meth
+    @fn nextShape(s)
+    @fn cycleShape(col, A)
+    @fn cursorNoteBefore()
+    @fn applyNoteOff(col, last, targetppq, undo)
+    @fn adjustDurationCore(col, note, rowDelta)   -- Read the current end row exactly off `endppqL` (authored row * logPerRow) so `curRow + row
+    @fn adjustPositionMulti(rowDelta)
+    @fn allGroups()   -- Every column, every event, as a groups list (for *-all variants).
+    @fn reswingCore(groups, opts)   -- opts: { include?, target, restamp? }. Each event carries its own .frame and .ppqL (stamped
+    @fn reswingScope(groups)
+    @fn quantizeScope(groups)   -- Plan-then-write so conformOverlaps can clip plan geometry against col-mates before the wri
+    @fn quantizeKeepRealisedScope(groups)   -- Shift intent onset onto grid; delay absorbs the inverse so realised onset is preserved. En
+    @fn shiftPlan(col, e, dLogical, swing, f)   -- Build a shift plan for one event by `dLogical` rows under `swing` and `f`. ppq is re-reali
+    @fn insertRowCore(col, topRow, numRows)
+    @fn deleteRowCore(col, topRow, numRows)
+    @fn forEachRowOp(core, preSel)
+    @fn pitchStep(coarse)
+    @fn valueInterval(col)   -- Coarse snap interval per column type. nil = no coarse (pc).
+    @fn valueBounds(col)
+    @fn nudgePitch(col, note, dir, coarse, audible)
+    @fn nudgeVel(note, dir, coarse)
+    @fn nudgeDelay(col, note, dir, coarse)
+    @fn nudgeValue(col, evt, dir, coarse)
+    @fn applyNudge(col, evt, part, dir, coarse, audible)
+    @fn cursorRowEvent(col)   -- First event in col that starts anywhere in the cursor row. For note columns, PAs are skipp
+    @fn queueDeleteNotes(col, locs)   -- Delete notes; extend each predecessor that ended at-or-past a deleted run into the next su
+    @fn queueResetDelays(col, locs)
+    @fn queueResetVelocities(col, locs)   -- Reset selected note vels to the prior event's vel (notes or PAs carry forward); delete sel
+    @fn queueDeleteCCs(col, locs)
+    @fn deleteOrBackspace()
+    @fn stepSample(dir)   -- Step currentSample by ±1 across the full 0..127 range. Empty slots are reachable — the use
+    @fn duplicate(dir)   -- Stamp the current selection (or cursor row) onto the adjacent block in the given direction
+    @fn addGridCol(chan, type, key, events)   -- `key` is the lane number for note columns, the cc number for cc columns, and nil for singl
+
+  # Public API
+    -- Temperament
+    @api ctx:activeTemper()
+    @api ctx:noteProjection(evt)
+    -- Timing
+    @api ctx:ppqToRow(ppqI, chan)
+    @api ctx:rowToPPQ(row, chan)
+    @api ctx:snapRow(ppqI, chan)
+    @api ctx:ppqPerRow()
+        -- Logical ppq width of one row in this rebuild's frame.
+    @api ctx:rowBeatInfo(row)
+    @api ctx:barBeatSub(row)
+    -- SHARED HELPERS
+    -- Note geometry (used by editing, adjust*, nudge, quantizeKeepRealised)
+    -- Show events by column, used by lots of selection ops
+    -- Frames & timing
+    @api vm:setRowPerBeat(n)
+    @api vm:applyTakeProperties(props)
+        -- Apply a take-properties dialog submission. Rows are a viewManager concept;
+        -- convert here, then hand the structural change to tm.
+        -- props = { name, rows, mode = 'resize'|'rescale'|'tile' }; mode defaults to 'resize'.
+    @api vm:setSwingSlot(name)
+    @api vm:setTemperSlot(name)
+    @api vm:setColSwingSlot(chan, name)
+        -- colSwing is a per-channel map; cross-track bleed via project would
+        -- mean track A's per-channel pattern surfaces on a fresh track B until
+        -- B overrides every entry. Keep it track-scoped.
+    @api vm:setSwingComposite(name, composite)
+    @api vm:setTemper(name, temper)
+    -- Mute / solo
+    @api vm:isChannelMuted(chan)
+    @api vm:isChannelSoloed(chan)
+    @api vm:isChannelEffectivelyMuted(chan)
+    @api vm:toggleChannelMute(chan)
+    @api vm:toggleChannelSolo(chan)
+    -- Audition
+    @api vm:tick()
+    -- Viewport
+    @api vm:scroll()
+    -- Editing
+    @api vm:editEvent(col, evt, stop, char, half)
+    -- Lane-strip edits (drag, add, delete, shape, tension)
+    @api vm:moveLaneEvent(col, i, toRow, toVal)
+        -- Move event i in a cc/pb/at column to (toRow, toVal). `i` indexes
+        -- the *visible* event sequence (events with `hidden` skipped), matching
+        -- what the lane strip hovers and anchors over; hidden absorber pbs
+        -- don't constrain horizontal motion. Caller passes toRow as either an
+        -- integer (snap-to-row) or a fractional row (shift-drag, off-grid).
+        -- Identity-by-visible-index survives the post-flush rebuild because
+        -- the ppq is clamped strictly inside the visible neighbours' ppqs and
+        -- the visible sequence's order is preserved across flush.
+    @api vm:addLaneEvent(col, colIdx, ppq, val)
+        -- Insert a new cc/pb/at event at `ppq` with value `val`, inheriting the
+        -- envelope shape of the previous *visible* event (so the existing curve
+        -- shape from prev→next is preserved across the new midpoint). Returns
+        -- the visible index of the new event after flush, for the lane-strip
+        -- to seed a drag on.
+    @api vm:deleteLaneEvent(col, i)
+        -- Delete the i-th *visible* event in a cc/pb/at column.
+    @api vm:setLaneTension(col, i, tension)
+        -- Set bezier tension on the i-th visible event. Forces shape to bezier
+        -- so the tension is honoured (REAPER ignores tension on other shapes).
+    -- Interpolation
+    @api vm:cycleLaneShape(col, i)
+        -- Cycle the segment-owner's shape on the i-th visible event in a
+        -- cc/pb/at column. Segment-owner = left endpoint (REAPER convention:
+        -- A.shape governs the curve from A to next).
+    -- Duration & position
+    -- Reswing / quantize
+    @api vm:reswingSelection()
+    @api vm:reswingAll()
+    @api vm:quantizeSelection()
+    @api vm:quantizeAll()
+    @api vm:quantizeKeepRealisedSelection()
+    @api vm:quantizeKeepRealisedAll()
+    @api vm:reswingPreset(name)
+    -- Nudge
+    -- Deletion
+    -- Duplicate
+    @api vm:ec()
+    @api vm:clipboard()
+    -- Accessors for renderManager
+    @api vm:rowPerBar()
+    @api vm:takeName()
+    @api vm:activeTemper()
+    @api vm:noteProjection(evt)
+    @api vm:rowBeatInfo(row)
+    @api vm:barBeatSub(row)
+    @api vm:ppqToRow(ppq, chan)
+    @api vm:rowToPPQ(row, chan)
+    @api vm:sampleCurve(A, B, ppq)
+    @api vm:timeSig()
+    -- Non-command callbacks from renderManager
+    @api vm:setGridSize(w, h)
+    -- Columns
+    @api vm:addExtraCol(type, cc)
+        -- Applies to every unique channel covered by ec:eachSelectedCol
+        -- (selection's channels, or the cursor's channel as 1×1 fallback).
+    @api vm:hideExtraCol()
+    @api vm:showDelay()
+        -- Enables delay sub-col on every note col covered by
+        -- ec:eachSelectedCol (selection's note cols, or cursor's col as fallback).
+    -- Command table
+    -- Rebuild
+    @api vm:rebuild(takeChanged)
+
+  # REAPER API surface
+    @reaper Undo_BeginBlock, Undo_EndBlock
+    @reaper time_precise
+    @reaper StuffMIDIMessage
+    @reaper ShowMessageBox
+@factory newViewManager(tm, cm, cmgr)
+
+  # Private state
+    @state swing = args.swing
+    @state rowPPQs = args.rowPPQs
+    @state length = args.length
+    @state numRows = args.numRows
+    @state rowPerBeat = args.rowPerBeat
+    @state ppqPerRow = args.ppqPerRow
+    @state timeSigs = args.timeSigs
+    @state temper = args.temper
+    @state ctx = {}
+
+  # Private functions
+    @fn timeSigAt(ppq)
+    @fn tsRow(ts)
+    @fn neighbourEvents(cols, ppq, pred)   -- Closest matching events on each side of `ppq`, across `cols.events`. prev maximises endppq
+    @fn notePreds(excludeEvt)
+    @fn overlapBounds(col, ppq, excludeEvt, allowOverlap)   -- Bounds on placing/extending a note. Different-pitch neighbours bind col-locally in intent 
+    @fn rowBounds(col, ppq, excludeEvt, allowOverlap)   -- Row-space sibling of overlapBounds for row-aligned moves. Reads ppqL/endppqL when present 
+    @fn startL(e, slack)   -- slack > 0 ⇒ go through swing (leniency is an intent-ppq quantity). slack == 0 ⇒ prefer ppq
+    @fn endL(e, slack)
+    @fn conformOverlaps(plans)   -- Each plan entry: `{ col, e, newppq, [newEndppq] }`. Mutates `newppq` / `newEndppq` on plan
+    @fn writePlans(plans)   -- Write a plan list through `tm:assignEvent`. Each plan: any subset of `newppq, newEndppq, n
+    @fn delayRange(col, n)   -- Bounds on a note's `delay` field. Two constraints, both natural to "performance delay":   
+    @fn eventsByCol()
+    @fn logPerRowFor(rpb)   -- Logical ppq width of one row at the given rpb. Take-wide denom comes off timeSigs[1]; reso
+    @fn logicalOf(e)   -- Read logical ppq off an event, falling back to ppq for events with no authored frame (lega
+    @fn endLogicalOf(e)
+    @fn frameAndLogPerRow(chan)   -- Frame + its row scale for the current channel.
+    @fn assignStamp(type, evt, chan, rowS, rowE)   -- Row-aligned authoring stamp + assign. Writes the canonical (ppq, [endppq,] ppqL, [endppqL,
+    @fn paFrame(hostFrame, chan)   -- Frame to stamp on a PA being attached to a host note. Inherits host's swing slot + colSwin
+    @fn assignTail(evt, chan, endppq, endppqL)   -- Pass `endppqL` when known (row-aligned, or partner already in current frame); omit otherwi
+    @fn matchGridToCursor()   -- Set grid to the cursor's frame, or release if already overriding.
+    @fn writeShared(key, value)   -- Slot selections (temper, swing) are views over the data, not data themselves. Mirroring at
+    @fn toggleChannelFlag(key, chan)
+    @fn lastVisibleFrom(startCol)
+    @fn placeNewNote(col, update)   -- Caller has already pinned (ppq, ppqL, frame) onto `update`. Endppq stretches to the next n
+    @fn notePAEvents(col, pitch, startppq, endppq)
+    @fn commit(auditionPitch, auditionVel)
+    @fn snap(update)   -- Off-grid write snaps intent to the cursor row, restamps the frame, and preserves logical d
+    @fn newVel(old)
+    @fn visibleAt(col, i)   -- The i-th visible event in a cc/pb/at column (skips hidden absorbers), or nil. Used by meth
+    @fn nextShape(s)
+    @fn cycleShape(col, A)
+    @fn cursorNoteBefore()
+    @fn applyNoteOff(col, last, targetppq, undo)
+    @fn adjustDurationCore(col, note, rowDelta)   -- Read the current end row exactly off `endppqL` (authored row * logPerRow) so `curRow + row
+    @fn adjustPositionMulti(rowDelta)
+    @fn allGroups()   -- Every column, every event, as a groups list (for *-all variants).
+    @fn reswingCore(groups, opts)   -- opts: { include?, target, restamp? }. Each event carries its own .frame and .ppqL (stamped
+    @fn reswingScope(groups)
+    @fn quantizeScope(groups)   -- Plan-then-write so conformOverlaps can clip plan geometry against col-mates before the wri
+    @fn quantizeKeepRealisedScope(groups)   -- Shift intent onset onto grid; delay absorbs the inverse so realised onset is preserved. En
+    @fn shiftPlan(col, e, dLogical, swing, f)   -- Build a shift plan for one event by `dLogical` rows under `swing` and `f`. ppq is re-reali
+    @fn insertRowCore(col, topRow, numRows)
+    @fn deleteRowCore(col, topRow, numRows)
+    @fn forEachRowOp(core, preSel)
+    @fn pitchStep(coarse)
+    @fn valueInterval(col)   -- Coarse snap interval per column type. nil = no coarse (pc).
+    @fn valueBounds(col)
+    @fn nudgePitch(col, note, dir, coarse, audible)
+    @fn nudgeVel(note, dir, coarse)
+    @fn nudgeDelay(col, note, dir, coarse)
+    @fn nudgeValue(col, evt, dir, coarse)
+    @fn applyNudge(col, evt, part, dir, coarse, audible)
+    @fn cursorRowEvent(col)   -- First event in col that starts anywhere in the cursor row. For note columns, PAs are skipp
+    @fn queueDeleteNotes(col, locs)   -- Delete notes; extend each predecessor that ended at-or-past a deleted run into the next su
+    @fn queueResetDelays(col, locs)
+    @fn queueResetVelocities(col, locs)   -- Reset selected note vels to the prior event's vel (notes or PAs carry forward); delete sel
+    @fn queueDeleteCCs(col, locs)
+    @fn deleteOrBackspace()
+    @fn stepSample(dir)   -- Step currentSample by ±1 across the full 0..127 range. Empty slots are reachable — the use
+    @fn duplicate(dir)   -- Stamp the current selection (or cursor row) onto the adjacent block in the given direction
+    @fn addGridCol(chan, type, key, events)   -- `key` is the lane number for note columns, the cc number for cc columns, and nil for singl
+
+  # Public API
+    -- Temperament
+    @api ctx:activeTemper()
+    @api ctx:noteProjection(evt)
+    -- Timing
+    @api ctx:ppqToRow(ppqI, chan)
+    @api ctx:rowToPPQ(row, chan)
+    @api ctx:snapRow(ppqI, chan)
+    @api ctx:ppqPerRow()
+        -- Logical ppq width of one row in this rebuild's frame.
+    @api ctx:rowBeatInfo(row)
+    @api ctx:barBeatSub(row)
+    -- SHARED HELPERS
+    -- Note geometry (used by editing, adjust*, nudge, quantizeKeepRealised)
+    -- Show events by column, used by lots of selection ops
+    -- Frames & timing
+    @api vm:setRowPerBeat(n)
+    @api vm:applyTakeProperties(props)
+        -- Apply a take-properties dialog submission. Rows are a viewManager concept;
+        -- convert here, then hand the structural change to tm.
+        -- props = { name, rows, mode = 'resize'|'rescale'|'tile' }; mode defaults to 'resize'.
+    @api vm:setSwingSlot(name)
+    @api vm:setTemperSlot(name)
+    @api vm:setColSwingSlot(chan, name)
+        -- colSwing is a per-channel map; cross-track bleed via project would
+        -- mean track A's per-channel pattern surfaces on a fresh track B until
+        -- B overrides every entry. Keep it track-scoped.
+    @api vm:setSwingComposite(name, composite)
+    @api vm:setTemper(name, temper)
+    -- Mute / solo
+    @api vm:isChannelMuted(chan)
+    @api vm:isChannelSoloed(chan)
+    @api vm:isChannelEffectivelyMuted(chan)
+    @api vm:toggleChannelMute(chan)
+    @api vm:toggleChannelSolo(chan)
+    -- Audition
+    @api vm:tick()
+    -- Viewport
+    @api vm:scroll()
+    -- Editing
+    @api vm:editEvent(col, evt, stop, char, half)
+    -- Lane-strip edits (drag, add, delete, shape, tension)
+    @api vm:moveLaneEvent(col, i, toRow, toVal)
+        -- Move event i in a cc/pb/at column to (toRow, toVal). `i` indexes
+        -- the *visible* event sequence (events with `hidden` skipped), matching
+        -- what the lane strip hovers and anchors over; hidden absorber pbs
+        -- don't constrain horizontal motion. Caller passes toRow as either an
+        -- integer (snap-to-row) or a fractional row (shift-drag, off-grid).
+        -- Identity-by-visible-index survives the post-flush rebuild because
+        -- the ppq is clamped strictly inside the visible neighbours' ppqs and
+        -- the visible sequence's order is preserved across flush.
+    @api vm:addLaneEvent(col, colIdx, ppq, val)
+        -- Insert a new cc/pb/at event at `ppq` with value `val`, inheriting the
+        -- envelope shape of the previous *visible* event (so the existing curve
+        -- shape from prev→next is preserved across the new midpoint). Returns
+        -- the visible index of the new event after flush, for the lane-strip
+        -- to seed a drag on.
+    @api vm:deleteLaneEvent(col, i)
+        -- Delete the i-th *visible* event in a cc/pb/at column.
+    @api vm:setLaneTension(col, i, tension)
+        -- Set bezier tension on the i-th visible event. Forces shape to bezier
+        -- so the tension is honoured (REAPER ignores tension on other shapes).
+    -- Interpolation
+    @api vm:cycleLaneShape(col, i)
+        -- Cycle the segment-owner's shape on the i-th visible event in a
+        -- cc/pb/at column. Segment-owner = left endpoint (REAPER convention:
+        -- A.shape governs the curve from A to next).
+    -- Duration & position
+    -- Reswing / quantize
+    @api vm:reswingSelection()
+    @api vm:reswingAll()
+    @api vm:quantizeSelection()
+    @api vm:quantizeAll()
+    @api vm:quantizeKeepRealisedSelection()
+    @api vm:quantizeKeepRealisedAll()
+    @api vm:reswingPreset(name)
+    -- Nudge
+    -- Deletion
+    -- Duplicate
+    @api vm:ec()
+    @api vm:clipboard()
+    -- Accessors for renderManager
+    @api vm:rowPerBar()
+    @api vm:takeName()
+    @api vm:activeTemper()
+    @api vm:noteProjection(evt)
+    @api vm:rowBeatInfo(row)
+    @api vm:barBeatSub(row)
+    @api vm:ppqToRow(ppq, chan)
+    @api vm:rowToPPQ(row, chan)
+    @api vm:sampleCurve(A, B, ppq)
+    @api vm:timeSig()
+    -- Non-command callbacks from renderManager
+    @api vm:setGridSize(w, h)
+    -- Columns
+    @api vm:addExtraCol(type, cc)
+        -- Applies to every unique channel covered by ec:eachSelectedCol
+        -- (selection's channels, or the cursor's channel as 1×1 fallback).
+    @api vm:hideExtraCol()
+    @api vm:showDelay()
+        -- Enables delay sub-col on every note col covered by
+        -- ec:eachSelectedCol (selection's note cols, or cursor's col as fallback).
+    -- Command table
+    -- Rebuild
+    @api vm:rebuild(takeChanged)
+
+  # REAPER API surface
+    @reaper Undo_BeginBlock, Undo_EndBlock
+    @reaper time_precise
+    @reaper StuffMIDIMessage
+    @reaper ShowMessageBox

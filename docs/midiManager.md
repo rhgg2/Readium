@@ -161,12 +161,12 @@ kind and receive only the payloads of that kind.
 { kind = 'valueRebound',     ppq,     oldVal, newVal }   -- stage 2
 { kind = 'consensusRebound', ppq,     offset }           -- stage 3
 { kind = 'guessedRebound',   ppq }                       -- stage 4
-{ kind = 'ambiguous',        candidatePpqs = {...} }     -- stage 4 (no bind)
-{ kind = 'orphaned',         lastPpq }                   -- stage 4 (no bind)
+{ kind = 'ambiguous',        candidateppqs = {...} }     -- stage 4 (no bind)
+{ kind = 'orphaned',         lastppq }                   -- stage 4 (no bind)
 ```
 
 `ppq` on the rebind kinds is the bound cc's ppq (where the metadata now
-lives). `lastPpq` on `orphaned` is the sidecar's own ppq (where the cc
+lives). `lastppq` on `orphaned` is the sidecar's own ppq (where the cc
 *was*); orphaned/ambiguous events have no bound cc to point at. A
 subscriber that wants only the data-loss subset filters on
 `kind == 'orphaned' or 'ambiguous'`.

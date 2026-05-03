@@ -1,0 +1,212 @@
+@module editCursor  src=editCursor.lua  loc=973  sha=4f21dd7
+@deps util
+
+# Module-level functions (private)
+  @fn print(...)
+
+@factory newEditCursor(deps)
+
+  # Private state
+    @state grid = deps.grid
+    @state cm = deps.cm
+    @state getRPBar = deps.rowPerBar
+    @state moveHook = deps.moveHook or function () end
+    @state ec = {}
+
+  # Private functions
+    @fn clampPos()
+    @fn partAt(col, stop)
+    @fn cursorPart()
+    @fn firstStopForPart(col, part)
+    @fn isSticky()
+    @fn selStart()
+    @fn selUpdate()
+    @fn selClear()
+    @fn cycleHBlock()
+    @fn cycleVBlock()
+    @fn swapEnds()
+    @fn moveRow(n, selecting)
+    @fn moveStop(n, selecting)
+    @fn moveUnit(n, toFirstStop, toLastStop)
+    @fn chanRange()
+    @fn selectSpan(scope, col, stop1, stop2)
+    @fn partsFor(type, showDelay, trackerMode)   -- Parts list per col type. One char of separator sits between adjacent parts in the rendered
+    @fn save(clip)
+    @fn load()
+    @fn collect()
+    @fn rowOf(p, pL, chan)   -- ppqL is the exact authoring-frame coordinate; dividing it skips the ppqToRow round-trip's 
+    @fn noteEvent(evt, chan, endppq)   -- Note clip event: the whole source note minus reserved keys, plus a row-relative position. 
+    @fn scalarEvent(evt, chan)   -- Scalar (pb/cc/at/pc) clip event: the whole source minus reserved keys. `val` rides through
+    @fn velEvent(evt, chan)   -- Vel-mode clip event: a deliberate scalar abstraction over a note. Only `val` (= source vel
+    @fn pasteVelocities(events, dstCol, startppq, endppq)
+    @fn pasteSingle(clip)
+    @fn pasteMulti(clip)
+    @fn infoFor(chan)
+    @fn resolve(clipCol)   -- Resolve a clip col to a dst target, or nil if out of 1..16.   note: { type='note', chan, l
+    @fn pasteClip(clip)
+    @fn trimTop(clip, trim)   -- Drop the top `trim` rows of a clip in place, re-indexing surviving events. A note whose st
+    @fn filter(events)
+
+  # Public API
+    -- Position
+    -- Parts
+    -- Selection
+    -- Movement
+    -- Position
+    @api ec:row()
+    @api ec:col()
+    @api ec:pos()
+    @api ec:setPos(row, col, stop)
+    @api ec:clampPos()
+    @api ec:rescaleRow(oldRPB, newRPB)
+    @api ec:reset()
+    -- Part & Region
+    @api ec:cursorPart()
+    @api ec:hasSelection()
+    @api ec:isSticky()
+    @api ec:region()
+        -- The rect to operate on, part-typed. Degenerates to 1x1 at cursor when
+        -- no selection — `hasSelection()` is the bit when that distinction matters.
+    @api ec:regionStart()
+        -- (col, stop) of the region's top-left corner. Returns a pair so callers
+        -- can splat directly into setPos: `ec:setPos(row, ec:regionStart())`.
+        -- Degenerates to the cursor's col/stop when no selection.
+    @api ec:eachSelectedCol()
+        -- Iterator over the cols an op should target: the selection's cols if
+        -- a selection is active, otherwise just the cursor's col (or nothing if
+        -- it's nil). Skips nil cols. Callers that need to distinguish a real
+        -- selection from the cursor-fallback case still have ec:hasSelection().
+    @api ec:setSelection(r)
+    @api ec:selectionStopSpan(col)
+        -- Stop range in `col` covered by the current selection. On boundary cols
+        -- we narrow to the boundary part by name; on interior cols (or HBlock=2/3
+        -- whole-channel/whole-row scopes whose part1/part2 don't match any real
+        -- part), the whole col falls through.
+    @api ec:selClear()
+    @api ec:unstick()
+    @api ec:extendTo(row, col, stop)
+        -- Extend the selection to land on (row, col, stop), creating a fresh
+        -- 1x1 sel anchored at the current cursor first if none was active.
+        -- Mouse shift-click and drag both speak this verb.
+    @api ec:shiftSelection(rowDelta)
+    -- Motion
+    @api ec:advance()
+    @api ec:selectChannel(chan)
+    @api ec:selectColumn(col)
+    -- Commands
+    @api ec:registerCommands(cmgr)
+    -- Decoration
+    @api ec:decorateCol(col)
+    -- CLIPBOARD
+    @api clipboard:collect()
+    @api clipboard:copy()
+    @api clipboard:pasteClip(clip)
+    @api clipboard:trimTop(clip, trim)
+    @api clipboard:registerCommands(cmgr)
+
+  # REAPER API surface
+    @reaper SetExtState
+    @reaper GetExtState
+@factory newClipboard(deps)
+
+  # Private state
+    @state grid = deps.grid
+    @state cm = deps.cm
+    @state getRPBar = deps.rowPerBar
+    @state moveHook = deps.moveHook or function () end
+    @state ec = {}
+
+  # Private functions
+    @fn clampPos()
+    @fn partAt(col, stop)
+    @fn cursorPart()
+    @fn firstStopForPart(col, part)
+    @fn isSticky()
+    @fn selStart()
+    @fn selUpdate()
+    @fn selClear()
+    @fn cycleHBlock()
+    @fn cycleVBlock()
+    @fn swapEnds()
+    @fn moveRow(n, selecting)
+    @fn moveStop(n, selecting)
+    @fn moveUnit(n, toFirstStop, toLastStop)
+    @fn chanRange()
+    @fn selectSpan(scope, col, stop1, stop2)
+    @fn partsFor(type, showDelay, trackerMode)   -- Parts list per col type. One char of separator sits between adjacent parts in the rendered
+    @fn save(clip)
+    @fn load()
+    @fn collect()
+    @fn rowOf(p, pL, chan)   -- ppqL is the exact authoring-frame coordinate; dividing it skips the ppqToRow round-trip's 
+    @fn noteEvent(evt, chan, endppq)   -- Note clip event: the whole source note minus reserved keys, plus a row-relative position. 
+    @fn scalarEvent(evt, chan)   -- Scalar (pb/cc/at/pc) clip event: the whole source minus reserved keys. `val` rides through
+    @fn velEvent(evt, chan)   -- Vel-mode clip event: a deliberate scalar abstraction over a note. Only `val` (= source vel
+    @fn pasteVelocities(events, dstCol, startppq, endppq)
+    @fn pasteSingle(clip)
+    @fn pasteMulti(clip)
+    @fn infoFor(chan)
+    @fn resolve(clipCol)   -- Resolve a clip col to a dst target, or nil if out of 1..16.   note: { type='note', chan, l
+    @fn pasteClip(clip)
+    @fn trimTop(clip, trim)   -- Drop the top `trim` rows of a clip in place, re-indexing surviving events. A note whose st
+    @fn filter(events)
+
+  # Public API
+    -- Position
+    -- Parts
+    -- Selection
+    -- Movement
+    -- Position
+    @api ec:row()
+    @api ec:col()
+    @api ec:pos()
+    @api ec:setPos(row, col, stop)
+    @api ec:clampPos()
+    @api ec:rescaleRow(oldRPB, newRPB)
+    @api ec:reset()
+    -- Part & Region
+    @api ec:cursorPart()
+    @api ec:hasSelection()
+    @api ec:isSticky()
+    @api ec:region()
+        -- The rect to operate on, part-typed. Degenerates to 1x1 at cursor when
+        -- no selection — `hasSelection()` is the bit when that distinction matters.
+    @api ec:regionStart()
+        -- (col, stop) of the region's top-left corner. Returns a pair so callers
+        -- can splat directly into setPos: `ec:setPos(row, ec:regionStart())`.
+        -- Degenerates to the cursor's col/stop when no selection.
+    @api ec:eachSelectedCol()
+        -- Iterator over the cols an op should target: the selection's cols if
+        -- a selection is active, otherwise just the cursor's col (or nothing if
+        -- it's nil). Skips nil cols. Callers that need to distinguish a real
+        -- selection from the cursor-fallback case still have ec:hasSelection().
+    @api ec:setSelection(r)
+    @api ec:selectionStopSpan(col)
+        -- Stop range in `col` covered by the current selection. On boundary cols
+        -- we narrow to the boundary part by name; on interior cols (or HBlock=2/3
+        -- whole-channel/whole-row scopes whose part1/part2 don't match any real
+        -- part), the whole col falls through.
+    @api ec:selClear()
+    @api ec:unstick()
+    @api ec:extendTo(row, col, stop)
+        -- Extend the selection to land on (row, col, stop), creating a fresh
+        -- 1x1 sel anchored at the current cursor first if none was active.
+        -- Mouse shift-click and drag both speak this verb.
+    @api ec:shiftSelection(rowDelta)
+    -- Motion
+    @api ec:advance()
+    @api ec:selectChannel(chan)
+    @api ec:selectColumn(col)
+    -- Commands
+    @api ec:registerCommands(cmgr)
+    -- Decoration
+    @api ec:decorateCol(col)
+    -- CLIPBOARD
+    @api clipboard:collect()
+    @api clipboard:copy()
+    @api clipboard:pasteClip(clip)
+    @api clipboard:trimTop(clip, trim)
+    @api clipboard:registerCommands(cmgr)
+
+  # REAPER API surface
+    @reaper SetExtState
+    @reaper GetExtState

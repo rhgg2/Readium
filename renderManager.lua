@@ -543,8 +543,29 @@ function newRenderManager(vm, cm, cmgr, sv)
   end
 
   local function drawSampleToolbarBits()
-    -- Sample-mode toolbar bits will land alongside the sample browser.
-    -- Empty for now: the mode switcher alone occupies the toolbar.
+    -- Track picker — lists tracks carrying the Continuum Sampler FX.
+    -- Selecting one rekeys cm (via sv:setTrack) to that track's
+    -- track-tier config so the slot list reflects its stored entries.
+    local tracks  = sv:listTracks()
+    local current = sv:getTrack()
+    local label   = '(no track)'
+    for _, e in ipairs(tracks) do
+      if e.track == current then label = e.name; break end
+    end
+
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, 'Track:')
+    ImGui.SameLine(ctx, 0, 8)
+    ImGui.SetNextItemWidth(ctx, 240)
+    if ImGui.BeginCombo(ctx, '##sampleTrack', label) then
+      pickerActive = true
+      for _, e in ipairs(tracks) do
+        if ImGui.Selectable(ctx, e.name, e.track == current) then
+          sv:setTrack(e.track)
+        end
+      end
+      ImGui.EndCombo(ctx)
+    end
   end
 
   local function drawTrackerToolbarBits()

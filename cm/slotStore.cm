@@ -1,0 +1,27 @@
+@module slotStore  src=slotStore.lua  loc=84  sha=d066917
+@deps util, fs
+
+# Module-level functions (private)
+  @fn rand8()
+  @fn relForSrc(srcBase)
+
+@factory newSlotStore(cm, fileOps, loadSlot)
+  -- fileOps: { copy(src,dst)→bool, move(src,dst)→bool, mkdir(dir)→() }
+  -- loadSlot: (idx, relPath) → ()  -- the gmem load mailbox writer.
+  --   Continuum publishes the project prefix separately (samplerSetPrefix),
+  --   so loadSlot only needs the project-relative path; the JSFX composes
+  --   the absolute and persists the rel directly into @serialize.
+
+  # Private state
+    @state store = {}
+
+  # Private functions
+    @fn setEntry(idx, fields)
+
+  # Public API
+    @api store:assign(idx, srcPath, projectPath)
+    @api store:sweep()
+    @api store:migrate(projectPath, oldProjectPath)
+        -- Move slot files when the project's media folder changes (typically
+        -- the empty→saved transition). cm paths are relative so they survive
+        -- the move untouched; only the bytes need to follow.

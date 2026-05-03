@@ -1,0 +1,22 @@
+@module continuum  src=continuum.lua  loc=288  sha=d066917
+@deps util, configManager, midiManager, trackerManager, commandManager, editCursor, viewManager, slotStore, sampleView, renderManager
+
+# Module-level constants
+  @const SAMPLER_FX = 'Continuum Sampler'
+  @const CTM_GMEM_NS = 'Continuum_sampler'
+  @const CTM_GMEM_MAGIC = 1717658484
+  @const CTM_GMEM_NAMES_BASE = 1024
+  @const CTM_GMEM_NAME_STRIDE = 64
+  @const CTM_N_SAMPLES = 64
+  @const CTM_GMEM_PREVIEW_BASE = 5120
+  @const CTM_GMEM_PREFIX_BASE = 6144
+  @const CTM_PREVIEW_SLOT_IDX = CTM_N_SAMPLES
+  @const fileOps = {
+
+# Module-level functions (private)
+  @fn print(...)
+  @fn err_handler(err)
+  @fn run(fn)
+  @fn writeGmemPath(base, path)
+  @fn copyFileBytes(src, dst)   -- Filesystem ops for slotStore. Stream-copy in 64KB chunks so big samples don't al
+

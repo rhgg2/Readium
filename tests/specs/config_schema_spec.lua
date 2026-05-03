@@ -227,6 +227,69 @@ return {
       t.eq(cm2:getAt('transient', 'pbRange'), nil, 'transient cache is empty on reload')
     end,
   },
+  --------------------------------------------------------------------
+  -- clearTake / setTrack: take-independent context for sample view
+  --------------------------------------------------------------------
+  {
+    name = 'clearTake empties take cache; lower tiers and track tier survive',
+    run = function(harness)
+      local h = harness.mk{
+        config = {
+          project = { pbRange = 3 },
+          track   = { pbRange = 4 },
+          take    = { pbRange = 5 },
+        },
+      }
+      t.eq(h.cm:get('pbRange'), 5, 'take wins to begin with')
+      h.cm:clearTake()
+      t.eq(h.cm:get('pbRange'), 4, 'after clearTake, track tier is effective')
+      t.eq(h.cm:getAt('take', 'pbRange'), nil, 'take cache is empty')
+      t.eq(h.cm:getAt('track', 'pbRange'), 4, 'track cache survives')
+      t.eq(h.cm:getAt('project', 'pbRange'), 3, 'project cache survives')
+    end,
+  },
+  {
+    name = 'setTrack rebinds the track tier to a different track\'s P_EXT',
+    run = function(harness)
+      local h = harness.mk{
+        config = { track = { pbRange = 4 } },
+      }
+      -- Plant a different value on a second track via raw ext-state.
+      local otherTrack = 'other/track'
+      h.reaper._state.trackExt[otherTrack .. '/P_EXT:ctm_config'] =
+        util.serialise({ pbRange = 9 })
+
+      t.eq(h.cm:getAt('track', 'pbRange'), 4, 'track1 value initially')
+      h.cm:setTrack(otherTrack)
+      t.eq(h.cm:getAt('track', 'pbRange'), 9, 'track-tier now reflects otherTrack')
+    end,
+  },
+  {
+    name = 'setTrack is independent of take — take cache stays put',
+    run = function(harness)
+      local h = harness.mk{
+        config = { take = { pbRange = 5 } },
+      }
+      h.cm:setTrack('some/other/track')
+      t.eq(h.cm:getAt('take', 'pbRange'), 5, 'take cache untouched by setTrack')
+    end,
+  },
+  {
+    name = 'clearTake and setTrack both fire configChanged (keyless)',
+    run = function(harness)
+      local h = harness.mk()
+      local seen = {}
+      h.cm:subscribe('configChanged', function(d) seen[#seen+1] = d end)
+      h.cm:clearTake()
+      h.cm:setTrack('another/track')
+      t.eq(#seen, 2,            'two broadcasts')
+      t.eq(seen[1].key,   nil,  'clearTake carries no key')
+      t.eq(seen[1].level, nil,  'clearTake carries no level')
+      t.eq(seen[2].key,   nil,  'setTrack carries no key')
+      t.eq(seen[2].level, nil,  'setTrack carries no level')
+    end,
+  },
+
   {
     name = 'cm fires changes with their level on the broadcast',
     run = function(harness)

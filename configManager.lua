@@ -323,6 +323,25 @@ function newConfigManager()
     fire('configChanged', {})
   end
 
+  -- Drops the take half of the context, leaving track/global/project
+  -- unchanged. Used by sample view, which is take-independent: it keys
+  -- track-tier reads against an explicitly chosen track (see setTrack)
+  -- and has no business reading take-tier values.
+  function cm:clearTake()
+    take = nil
+    cache.take = {}
+    fire('configChanged', {})
+  end
+
+  -- Sets the track context independently of any take. Reloads the track
+  -- cache so subsequent reads resolve against the new track's P_EXT.
+  -- setContext continues to derive track from take for tracker view.
+  function cm:setTrack(newTrack)
+    track = newTrack
+    cache.track = loaders.track()
+    fire('configChanged', {})
+  end
+
   ----- Reading
 
   function cm:get(key)

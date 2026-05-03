@@ -1,0 +1,19 @@
+@module fs  src=fs.lua  loc=60  sha=ceefc8e
+
+# Module-level constants
+  @const AUDIO_EXTS = {
+
+# Module-level functions (private)
+  @fn ciLess(a, b)
+
+# Public API (fs.*)
+  @api fs.isAudio(name)
+  @api fs.basename(path)
+  @api fs.parent(path)
+      -- Returns the parent directory, or '' for a path with no separator.
+      -- Trailing separators on the input are not stripped — caller is
+      -- expected to pass canonical paths.
+  @api fs.join(a, b)
+  @api fs.listDirs(path)
+  @api fs.listAudioFiles(path)
+
