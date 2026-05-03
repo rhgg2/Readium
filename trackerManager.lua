@@ -8,6 +8,59 @@ local function print(...)
   return util.print(...)
 end
 
+-- Groups note records by realised ppq, leftmost lane wins.
+-- records: list of { ppq, lane, sample, key } (key is opaque — caller
+-- uses it to identify shadowed records).
+-- Returns (pcs, shadowed): pcs sorted by ppq; shadowed keyed by record.key.
+local function synthesisePCs(chan, records)
+  local winners, order, shadowed = {}, {}, {}
+  for _, r in ipairs(records) do
+    local w = winners[r.ppq]
+    if not w then
+      winners[r.ppq] = r
+      util.add(order, r.ppq)
+    elseif r.lane < w.lane then
+      shadowed[w.key] = true
+      winners[r.ppq] = r
+    else
+      shadowed[r.key] = true
+    end
+  end
+  table.sort(order)
+  local pcs = {}
+  for _, ppq in ipairs(order) do
+    util.add(pcs, { ppq = ppq, val = winners[ppq].sample,
+                    msgType = 'pc', chan = chan, fake = true })
+  end
+  return pcs, shadowed
+end
+
+-- Synthesise + diff against the existing PC list for one channel. Carries
+-- locs through unchanged where (ppq, val, fake) matches, so steady state
+-- produces empty toRemove/toAdd. Pure — callers route the resulting writes
+-- through whatever path their context demands (mm:modify in rebuild, the
+-- um's flush queue at runtime).
+local function reconcilePCsForChan(chan, records, existing)
+  local desired, shadowed = synthesisePCs(chan, records)
+  local byPpq = {}
+  for _, e in ipairs(existing) do byPpq[e.ppq] = e end
+  for _, want in ipairs(desired) do
+    local have = byPpq[want.ppq]
+    if have and have.val == want.val and have.fake then
+      want.loc = have.loc
+      byPpq[want.ppq] = nil
+    end
+  end
+  local toRemove, toAdd = {}, {}
+  for _, have in ipairs(existing) do
+    if byPpq[have.ppq] then util.add(toRemove, have) end
+  end
+  for _, want in ipairs(desired) do
+    if not want.loc then util.add(toAdd, want) end
+  end
+  return desired, shadowed, toRemove, toAdd
+end
+
 function newTrackerManager(mm, cm)
 
   ---------- PRIVATE
@@ -57,6 +110,8 @@ function newTrackerManager(mm, cm)
     local deletes = {}
     local chans = {}
     local notesByLoc = {}
+    local dirtyPcChans = {}   -- { [chan] = true } — set on any note mutation
+                              -- whose effect on the PC stream is non-local.
     local ccsByLoc = {}
 
     ----- Accessors
@@ -299,7 +354,14 @@ function newTrackerManager(mm, cm)
       if next(rest) then assignLowlevel('pb', pb, rest) end
     end
 
+    -- Any add/delete/sample-or-realised-onset change affects the channel's
+    -- PC synthesis (which note wins each realised group, and what its
+    -- sample is). Coarser than fake-pb's per-boundary reconciliation
+    -- because PC group membership isn't local to a single boundary.
+    local function dirtyPc(chan) dirtyPcChans[chan] = true end
+
     local function addNote(n)
+      dirtyPc(n.chan)
       local D = n.detune
       if lastMuteSet[n.chan] then n.muted = true end
       if n.lane == 1 then
@@ -315,6 +377,7 @@ function newTrackerManager(mm, cm)
     end
 
     local function deleteNote(n, keepPAs)
+      dirtyPc(n.chan)
       if not keepPAs then forEachAttachedPA(n, function(evt) deleteLowlevel('pa', evt) end) end
       if n.lane ~= 1 then deleteLowlevel('note', n); return end
       local D1, D2 = detuneBefore(n.chan, n.ppq), detuneAt(n.chan, n.ppq)
@@ -389,6 +452,11 @@ function newTrackerManager(mm, cm)
       if update.chan then print('um: not allowed to change channel of notes'); return end
       if update.lane then print('um: not allowed to change lane of notes'); return end
 
+      -- update.ppq covers both direct ppq edits and delay edits
+      -- (realiseNoteUpdate maps delay→ppq before we get here). endppq
+      -- alone doesn't move the realised onset, so it doesn't dirty.
+      if update.sample ~= nil or update.ppq ~= nil then dirtyPc(n.chan) end
+
       if update.ppq ~= nil or update.endppq ~= nil then
         resizeNote(n, update.ppq or n.ppq, update.endppq or n.endppq)
         update.ppq, update.endppq = nil, nil
@@ -438,6 +506,46 @@ function newTrackerManager(mm, cm)
       for _, n in ipairs(toDelete)   do deleteNote(n) end
       for _, n in ipairs(toTruncate) do assignNote(n, { endppq = P }) end
       return clampEnd
+    end
+
+    ----- PC reconciliation (trackerMode mutation hook)
+
+    -- Per-chan synthesis at flush time. notesByLoc reflects assigns and
+    -- deletes; pending note adds live in `adds` until mm sees them — both
+    -- are needed for a complete view. Shadow flags must land on the lane
+    -- events (rendered objects), which are distinct from notesByLoc —
+    -- cross-walk by loc once and use the lane event as the record key.
+    local function reconcilePcs(chan)
+      local c = channels[chan].columns
+      local laneByLoc = {}
+      for _, lane in ipairs(c.notes) do
+        for _, evt in ipairs(lane.events) do
+          evt.sampleShadowed = nil
+          laneByLoc[evt.loc] = evt
+        end
+      end
+
+      local records = {}
+      for _, n in pairs(notesByLoc) do
+        if n.chan == chan then
+          util.add(records, { ppq = n.ppq, lane = n.lane,
+                              sample = n.sample or 0, key = laneByLoc[n.loc] or n })
+        end
+      end
+      for _, a in ipairs(adds) do
+        if a.type == 'note' and a.evt.chan == chan then
+          local n = a.evt
+          util.add(records, { ppq = n.ppq, lane = n.lane,
+                              sample = n.sample or 0, key = n })
+        end
+      end
+
+      local desired, shadowed, toRemove, toAdd =
+        reconcilePCsForChan(chan, records, (c.pc and c.pc.events) or {})
+      for evt in pairs(shadowed) do evt.sampleShadowed = true end
+      for _, have in ipairs(toRemove) do deleteLowlevel('pc', have) end
+      for _, want in ipairs(toAdd)    do addLowlevel('pc', want)    end
+      c.pc = { events = desired }
     end
 
     ----- Public interface
@@ -523,6 +631,10 @@ function newTrackerManager(mm, cm)
     local flushing = false
 
     function um:flush()
+      if cm:get('trackerMode') and next(dirtyPcChans) then
+        for chan in pairs(dirtyPcChans) do reconcilePcs(chan) end
+        dirtyPcChans = {}
+      end
       if #adds == 0 and #assigns == 0 and #deletes == 0 then return end
 
       -- Snapshot+clear before mm:modify: its callbacks can re-enter this
@@ -693,14 +805,39 @@ function newTrackerManager(mm, cm)
       channels[i] = { chan = i, columns = { notes = {}, ccs = {} } }
     end
 
-    -- 1) Seed detune/delay defaults (metadata-only write bypasses the lock)
-    --    and truncate same-key overlaps so later passes see clean intervals.
+    -- 1) Seed detune/delay/sample defaults (metadata-only write bypasses
+    --    the lock) and truncate same-key overlaps so later passes see
+    --    clean intervals. Under trackerMode, missing `sample` derives
+    --    from the prevailing PC at the note's realised onset — this is
+    --    the on-toggle reverse-derive path and the steady-state default
+    --    in one rule.
     do
+      local trackerMode = cm:get('trackerMode')
+      local pcByChan
+      if trackerMode then
+        pcByChan = {}
+        for _, cc in mm:ccs() do
+          if cc.msgType == 'pc' then
+            local lst = pcByChan[cc.chan] or {}
+            pcByChan[cc.chan] = lst
+            util.add(lst, { ppq = cc.ppq, val = cc.val })
+          end
+        end
+        for _, lst in pairs(pcByChan) do sortByPPQ(lst) end
+      end
+
       local groups, work = {}, {}
       for loc, note in mm:notes() do
-        if note.detune == nil or note.delay == nil then
-          mm:assignNote(loc, { detune = note.detune or 0, delay = note.delay or 0 })
+        local update
+        if note.detune == nil then update = update or {}; update.detune = 0 end
+        if note.delay  == nil then update = update or {}; update.delay  = 0 end
+        if trackerMode and note.sample == nil then
+          local realisedPpq = note.ppq + delayToPPQ(note.delay or 0)
+          local prev = util.seek(pcByChan[note.chan] or {}, 'at-or-before', realisedPpq)
+          update = update or {}
+          update.sample = (prev and prev.val) or 0
         end
+        if update then mm:assignNote(loc, update) end
         util.bucket(groups, note.chan .. '|' .. note.pitch,
                     { loc = loc, ppq = note.ppq, endppq = note.endppq })
       end
@@ -809,6 +946,51 @@ function newTrackerManager(mm, cm)
         end
       end
       if grew then cm:set('take', 'extraColumns', extras) end
+    end
+
+    -- 4.5) PC synthesis (trackerMode only). Lane events are still in
+    --      realised frame here, so realised(n) = n.ppq directly. The
+    --      synthesised PCs land at realised ppq with delay=0; tidyCol
+    --      below leaves them alone (delay=0 → no shift). The reconcile
+    --      helper carries locs forward where val matches, so steady
+    --      state produces no mm writes.
+    if cm:get('trackerMode') then
+      local toDelete, toAdd = {}, {}
+      for chan = 1, 16 do
+        local c = channels[chan].columns
+        local records = {}
+        for L, lane in ipairs(c.notes) do
+          for _, n in ipairs(lane.events) do
+            n.sampleShadowed = nil
+            util.add(records, { ppq = n.ppq, lane = L,
+                                sample = n.sample or 0, key = n })
+          end
+        end
+        local desired, shadowed, rems, adds_ =
+          reconcilePCsForChan(chan, records, (c.pc and c.pc.events) or {})
+        for n in pairs(shadowed) do n.sampleShadowed = true end
+        for _, r in ipairs(rems)  do util.add(toDelete, r.loc) end
+        for _, a in ipairs(adds_) do util.add(toAdd, a) end
+        c.pc = { events = desired }
+      end
+
+      if #toDelete > 0 or #toAdd > 0 then
+        table.sort(toDelete, function(a, b) return a > b end)
+        mm:modify(function()
+          for _, loc in ipairs(toDelete) do mm:deleteCC(loc) end
+          for _, pc  in ipairs(toAdd)    do mm:addCC(pc) end
+        end)
+        -- mm:modify reindexes ccs by (ppq, chan, ...), so locs captured
+        -- during add are pre-sort and unreliable. Refresh c.pc.events
+        -- against the post-modify state so flush-time reconciles can
+        -- delete by loc safely. Walks all ccs once; PCs are sparse.
+        for chan = 1, 16 do channels[chan].columns.pc = { events = {} } end
+        for loc, cc in mm:ccs() do
+          if cc.msgType == 'pc' then
+            util.add(channels[cc.chan].columns.pc.events, projectCC(cc, loc))
+          end
+        end
+      end
     end
 
     -- 5) Shift into intent frame and sort by intent ppq. Endppq is

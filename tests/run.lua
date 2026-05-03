@@ -30,6 +30,7 @@ local specs = {
   'tm_tuning_spec',
   'tm_swing_spec',
   'tm_clear_same_key_spec',
+  'tm_pc_synthesis_spec',
   'timing_period_spec',
   'timing_atoms_spec',
   'vm_grid_spec',

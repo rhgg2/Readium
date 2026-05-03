@@ -215,9 +215,12 @@ Reentrancy-guarded by `rebuilding`. Steps:
 
 1. **Seed + normalise notes.** Walk mm notes once. Any note lacking
    `detune`/`delay` is seeded with `0` via metadata-only `assignNote`
-   (no lock). Build `(chan,pitch)` groups, then truncate overlaps
-   under a single `mm:modify` so every subsequent walk sees clean
-   intervals.
+   (no lock). Under `trackerMode`, missing `sample` is also seeded —
+   from the prevailing PC at the note's realised onset (or `0` if no
+   prior PC). Same rule serves the on-toggle reverse-derive and the
+   steady-state default. Build `(chan,pitch)` groups, then truncate
+   overlaps under a single `mm:modify` so every subsequent walk sees
+   clean intervals.
 2. **Allocate lanes.** `allocateNoteColumn` prefers the persisted
    `note.lane`; falls through to first-fit, then spills to a new
    column. If the preferred lane doesn't exist yet, columns are pushed
@@ -241,11 +244,51 @@ Reentrancy-guarded by `rebuilding`. Steps:
    allocation exceeded it; pad empty note lanes; materialise
    user-opened singletons/ccs that carry no events. Writes back via
    `cm:set` if the high-water mark grew.
+4½. **PC synthesis (trackerMode only).** For each channel, group lane
+   events (still in realised frame here, so `realised(n) = n.ppq`
+   directly) by realised ppq. Leftmost lane wins: its sample becomes
+   the PC val, others get `n.sampleShadowed = true` for renderer
+   dimming. Synthesised PCs land at realised ppq with `delay=0`, so
+   tidyCol below is a no-op for them. The reconcile helper
+   (`reconcilePCsForChan`) carries locs forward where `(ppq, val)`
+   matches existing fake PCs — steady state writes nothing. After the
+   `mm:modify`, mm's reindex moves PC locs around (sort by `(ppq,
+   chan, ...)`), so `c.pc.events` is refreshed from a fresh
+   `mm:ccs()` walk to give flush-time reconciles stable locs.
 5. **tidyCol.** Strip delay into intent frame and sort each column's
    events by intent ppq.
 
 Then `um = createUpdateManager()` and tm fires the `'rebuild'` signal
 (no payload).
+
+## PC synthesis under trackerMode
+
+`note.sample` is per-note authoring intent (which sample the note
+plays); the PC stream is the realisation MIDI synths consume. tm owns
+the reconciliation. Synthesis runs in two places:
+
+- **Rebuild step 4½** does the full sweep: re-derives every channel's
+  PC stream from current note state and writes the delta to mm.
+- **Flush-time reconcile** (in `um:flush`, gated on `dirtyPcChans`)
+  does the same per-channel for any channel whose notes mutated since
+  the last flush. `addNote`, `deleteNote`, and `assignNote` updates
+  to `sample` / `ppq` (where ppq covers delay too — `realiseNoteUpdate`
+  maps delay→ppq before assignNote sees it) all dirty the channel.
+
+Both call sites build a `records` list `{ ppq, lane, sample, key }`
+from their available source (lane events for rebuild; `notesByLoc` +
+pending adds for flush) and feed it through the same pure
+`reconcilePCsForChan` helper. The `key` is a record-identity opaque
+to the helper — callers receive a `shadowed` set keyed by it and
+stamp `sampleShadowed = true` on whichever object should render
+dimmed. At flush time that's the lane event found via a one-pass
+`loc → laneEvent` cross-walk; at rebuild it's the lane event itself.
+
+Group membership is by **realised** ppq, not intent — same-channel
+simultaneity is a MIDI-realisation constraint (one PC stream per
+channel at any moment), so the leftmost-wins rule fires only when
+realised onsets actually collide. Notes split apart by delay get
+their own PC each, even if their intent ppqs match.
 
 ## Column allocation rules
 
