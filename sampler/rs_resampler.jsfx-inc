@@ -3,9 +3,13 @@ desc:Continuum Sampler — sinc resampling kernels
 
 KERNEL_PHASES = 256;
 
-// Indices into the per-voice FIR state block (37 floats: 13 even + 24 odd taps).
+// Per-voice FIR state block (37 floats):
+//   s[0..11]  : 12-deep ring buffer for the even (x0) polyphase
+//   s[12]     : ring cursor (oldest slot — next read & next write hit it)
+//   s[13..36] : 24-deep shift register for the odd (x1) polyphase
 // The block lives inside each voice; we pass a base pointer into the FIR fns.
-FIR_ODD_BASE = 13;
+FIR_EVEN_CURSOR = 12;
+FIR_ODD_BASE    = 13;
 
 function sinc(x)
   ( x == 0 ? 1 : sin($pi * x) / ($pi * x); );
@@ -24,16 +28,16 @@ function build_sinc_table(mem, length, cutoff)
   local(phase, frac, sum, tap, window, x, denom, alpha)
   global(KERNEL_PHASES)
 (
-  phase = 0; denom = i0_approx(8);
+  phase = 0; denom = i0_approx(8); alpha = (length - 1) * 0.5;
   mem[0] = length; mem += 1;
 
   loop(KERNEL_PHASES,
     frac = phase / KERNEL_PHASES; sum = 0; tap = 0;
-    alpha = (length - 1) * 0.5;
+    // Window centered on the sinc center (floor(L/2) + frac), not on the
+    // fixed midpoint — keeps window/sinc aligned at every phase.
     loop(length,
-      x = (tap - alpha) / alpha;
-      window = i0_approx(8 * sqrt(max(0, 1 - x * x))) / denom;
       x = tap - frac - floor(length / 2);
+      window = i0_approx(8 * sqrt(max(0, 1 - x * x / (alpha * alpha)))) / denom;
       mem[2*tap] = sinc(x * cutoff) * window;
       mem[2*tap + 1] = 0;
       sum += mem[2*tap];
@@ -55,7 +59,7 @@ function build_all_sinc_tables(mem)
   nextmem = mem + 14;
   scale = 40000 / srate;
 
-  interpolation < 3 ? (
+  interpolation < 2 ? (
     sinc_tables[0]  = nextmem; nextmem = build_sinc_table(nextmem, 64, 1);
     sinc_tables[1]  = nextmem; nextmem = build_sinc_table(nextmem, 32, 1);
     sinc_tables[2]  = nextmem; nextmem = build_sinc_table(nextmem, 16, 1);
@@ -132,33 +136,54 @@ function sinc_interp(start_ptr, position, channel, sinc_table, table_len, at_bas
 );
 
 // Downsample FIR — `s` is a 37-float state pointer (caller-owned).
+//
+// The 25-tap windowed-sinc half-band is symmetric and has only one nonzero
+// even-indexed coefficient (the centre, 0.5). Branch 2a of the caller feeds
+// (2*sinc, 0) — only the centre tap contributes, so unity gain follows from
+// 0.5 * 2 = 1 directly. Branch 2b feeds two real samples, where the gain is
+// the full impulse-response sum; the published coefficients fall ~0.04 dB
+// short of unity, so we compensate by scaling the odd-tap pair sum to 0.5
+// (factor 1.01020422). Centre tap stays at 0.5, so branch 2a is unaffected
+// and the half-band property H(pi/2)=0.5 (which depends only on symmetry +
+// zero even taps) is preserved.
+//
+// Even-polyphase history (the centre-tap delay) is stored as a 12-slot ring
+// rather than a shift register. Per call we read s[c] (= x0 from 12 calls
+// ago), overwrite that same slot with the new x0, and advance c — no copies.
 function downsample_fir_step(s, x0, x1)
-  local(i)
-  global(FIR_ODD_BASE)
+  local(i, c, out)
+  global(FIR_ODD_BASE, FIR_EVEN_CURSOR)
 (
-  i = 12; loop(12, s[i] = s[i-1]; i -= 1; );
   i = 23; loop(23, s[FIR_ODD_BASE + i] = s[FIR_ODD_BASE + i - 1]; i -= 1; );
-  s[0] = x0; s[FIR_ODD_BASE] = x1;
+  s[FIR_ODD_BASE] = x1;
 
-  -0.00410257623761148 * (s[FIR_ODD_BASE+0]  + s[FIR_ODD_BASE+23]) +
-   0.00395055104797943 * (s[FIR_ODD_BASE+1]  + s[FIR_ODD_BASE+22]) +
-  -0.00580787578939173 * (s[FIR_ODD_BASE+2]  + s[FIR_ODD_BASE+21]) +
-   0.00823497890520802 * (s[FIR_ODD_BASE+3]  + s[FIR_ODD_BASE+20]) +
-  -0.0113722265131996  * (s[FIR_ODD_BASE+4]  + s[FIR_ODD_BASE+19]) +
-   0.01547155714097370 * (s[FIR_ODD_BASE+5]  + s[FIR_ODD_BASE+18]) +
-  -0.0209449963986892  * (s[FIR_ODD_BASE+6]  + s[FIR_ODD_BASE+17]) +
-   0.0285680781320342  * (s[FIR_ODD_BASE+7]  + s[FIR_ODD_BASE+16]) +
-  -0.0400151439056141  * (s[FIR_ODD_BASE+8]  + s[FIR_ODD_BASE+15]) +
-   0.0596695194318312  * (s[FIR_ODD_BASE+9]  + s[FIR_ODD_BASE+14]) +
-  -0.103669138691865   * (s[FIR_ODD_BASE+10] + s[FIR_ODD_BASE+13]) +
-   0.317491986549921   * (s[FIR_ODD_BASE+11] + s[FIR_ODD_BASE+12]) +
-   0.5 * s[12];
+  c = s[FIR_EVEN_CURSOR];
+
+  out =
+    1.01020422 * (
+      -0.00410257623761148 * (s[FIR_ODD_BASE+0]  + s[FIR_ODD_BASE+23]) +
+       0.00395055104797943 * (s[FIR_ODD_BASE+1]  + s[FIR_ODD_BASE+22]) +
+      -0.00580787578939173 * (s[FIR_ODD_BASE+2]  + s[FIR_ODD_BASE+21]) +
+       0.00823497890520802 * (s[FIR_ODD_BASE+3]  + s[FIR_ODD_BASE+20]) +
+      -0.0113722265131996  * (s[FIR_ODD_BASE+4]  + s[FIR_ODD_BASE+19]) +
+       0.01547155714097370 * (s[FIR_ODD_BASE+5]  + s[FIR_ODD_BASE+18]) +
+      -0.0209449963986892  * (s[FIR_ODD_BASE+6]  + s[FIR_ODD_BASE+17]) +
+       0.0285680781320342  * (s[FIR_ODD_BASE+7]  + s[FIR_ODD_BASE+16]) +
+      -0.0400151439056141  * (s[FIR_ODD_BASE+8]  + s[FIR_ODD_BASE+15]) +
+       0.0596695194318312  * (s[FIR_ODD_BASE+9]  + s[FIR_ODD_BASE+14]) +
+      -0.103669138691865   * (s[FIR_ODD_BASE+10] + s[FIR_ODD_BASE+13]) +
+       0.317491986549921   * (s[FIR_ODD_BASE+11] + s[FIR_ODD_BASE+12])
+    ) +
+    0.5 * s[c];
+
+  s[c] = x0;
+  s[FIR_EVEN_CURSOR] = c >= 11 ? 0 : c + 1;
+
+  out;
 );
 
 function reset_fir(s)
   local(i)
-  global(FIR_ODD_BASE)
 (
-  i = 0; loop(13, s[i] = 0; i += 1; );
-  i = 0; loop(24, s[FIR_ODD_BASE + i] = 0; i += 1; );
+  i = 0; loop(37, s[i] = 0; i += 1; );
 );

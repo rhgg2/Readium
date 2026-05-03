@@ -21,9 +21,7 @@ in_pin:right input
 out_pin:left output
 out_pin:right output
 
-slider1:interpolation=2<0,3,1{Draft,Low,Medium,High}>Resampling quality
-slider2:fade_in_slider=8<0,16,1{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536}>Fade in (samples)
-slider3:fade_out_slider=8<0,16,1{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536}>Fade out (samples)
+slider1:interpolation=2<0,2,1{Low,Medium,High}>Resampling quality
 
 import rs_resampler.jsfx-inc
 
@@ -68,29 +66,29 @@ V_SAMPLE_IDX     = 3;
 V_VEL            = 4;
 V_POSITION       = 5;
 V_SPEED          = 6;
-V_FADE_POSITION  = 7;
-V_FADE_LEVEL     = 8;
+V_RESIDUE_L      = 7;     // additive click-suppression residue, L
+V_RESIDUE_R      = 8;     // additive click-suppression residue, R
 V_CLEFT          = 9;
 V_CRIGHT         = 10;
 V_START_PTR      = 11;
 V_STOP_POSITION  = 12;
-V_FADE_START     = 13;
-V_LOOP_START     = 14;
-V_LOOP_STOP      = 15;
-V_LOOP_TYPE      = 16;
-V_NEXT           = 17;
-V_PREV           = 18;
-V_OUTL           = 19;
-V_OUTR           = 20;
-V_SINC_TABLE     = 21;
-V_TABLE_LEN      = 22;
-V_AT_BASE_RATE   = 23;
+V_LOOP_START     = 13;
+V_LOOP_STOP      = 14;
+V_LOOP_TYPE      = 15;
+V_NEXT           = 16;
+V_PREV           = 17;
+V_OUTL           = 18;
+V_OUTR           = 19;
+V_SINC_TABLE     = 20;
+V_TABLE_LEN      = 21;
+V_AT_BASE_RATE   = 22;
 V_FIR_L_BASE     = 32;             // 37 floats
 V_FIR_R_BASE     = 80;             // 37 floats; both well within 128
 
 VS_FREE       = 0;
 VS_PLAYING    = 1;
 VS_FADING_OUT = 2;
+VS_STARTING   = 3;
 
 // Channel struct
 CHAN_FIELDS       = 8;
@@ -130,7 +128,20 @@ build_all_sinc_tables(sinc_tables_mem);
 
 heap_top = freemem;
 
-dc_coeff = exp(-2 * $pi * 10 / srate);     // 10 Hz DC blocker
+// @init re-fires on transport play and on srate/channel/reset events while
+// mem[] is preserved. samplelocs[] still holds the previous run's pointers,
+// all ≥ the original heap_top initial, so without this sweep ensure_slot()
+// would hand a fresh slot the same address as a still-referenced old one,
+// silently merging two slots (shared buffer, handles, preview).
+ifix = 0;
+loop(N_SAMPLES,
+  samplelocs[ifix] >= heap_top ?
+    heap_top = samplelocs[ifix] + SAMPLE_SLOT_SIZE;
+  ifix += 1;
+);
+
+dc_coeff    = exp(-2 * $pi * 10 / srate);   // 10 Hz steady-state DC / infrasonic HPF
+click_decay = exp(-1 / (0.001 * srate));    // ~1 ms per-voice click-suppression decay
 
 // ============================================================
 // Slot allocation (lazy)
@@ -276,19 +287,19 @@ function voice_set_speed(vb, new_speed)
 //   one-shot regardless of slot loop metadata (used by UI preview).
 function voice_start(v_idx, sample_idx, channel, note, vel,
                      start_override, end_override, ignore_loop)
-  local(vb, sl, fs, base_note, len, start_pos, end_pos)
+  local(vb, sl, c, fs, base_note, len, start_pos, end_pos, seed_idx)
   global(samplelocs, voice_pool_base, VOICE_FIELDS, srate,
-         fade_in_samples, fade_out_samples,
+         chan_base, CHAN_FIELDS, C_VOL, C_LPAN, C_RPAN,
          SH_LENGTH, SH_FS, SH_BASENOTE, SH_START, SH_END,
          SH_LOOP_START, SH_LOOP_STOP, SH_LOOP_TYPE,
          SAMPLE_HEADER_SIZE,
          V_STATE, V_CHANNEL, V_NOTE, V_SAMPLE_IDX, V_VEL,
-         V_POSITION, V_FADE_POSITION, V_FADE_LEVEL,
-         V_START_PTR, V_STOP_POSITION, V_FADE_START,
+         V_POSITION, V_RESIDUE_L, V_RESIDUE_R,
+         V_START_PTR, V_STOP_POSITION,
          V_LOOP_START, V_LOOP_STOP, V_LOOP_TYPE,
          V_CLEFT, V_CRIGHT,
          V_FIR_L_BASE, V_FIR_R_BASE,
-         VS_PLAYING)
+         VS_STARTING)
 (
   vb = voice_pool_base + v_idx * VOICE_FIELDS;
   sl = samplelocs[sample_idx];
@@ -314,12 +325,6 @@ function voice_start(v_idx, sample_idx, channel, note, vel,
     end_pos < 1 ? end_pos = len / 2 - 2;
     vb[V_STOP_POSITION] = end_pos;
 
-    // Auto-fade trigger lands fade_out_samples before end_pos. Click suppression
-    // at start/end is delegated to V_FADE_LEVEL ramping (fade_in/out sliders) —
-    // no zero-crossing snap, so the SH_START/SH_END handles are honoured literally.
-    vb[V_FADE_START] = max(vb[V_START_PTR],
-                           vb[V_START_PTR] + 2 * (end_pos - fade_out_samples));
-
     vb[V_LOOP_START] = ignore_loop ? 0 : sl[SH_LOOP_START];
     vb[V_LOOP_STOP]  = ignore_loop ? 0 : sl[SH_LOOP_STOP];
     vb[V_LOOP_TYPE]  = ignore_loop ? 0 : sl[SH_LOOP_TYPE];
@@ -327,60 +332,59 @@ function voice_start(v_idx, sample_idx, channel, note, vel,
     vb[V_POSITION] = start_pos;
     voice_set_speed(vb, 2 ^ ((note - base_note) / 12) * (fs / srate));
 
-    vb[V_FADE_POSITION] = fade_in_samples;
-    vb[V_FADE_LEVEL]    = 0;
-    vb[V_CLEFT]         = 0;
-    vb[V_CRIGHT]        = 0;
+    // Set channel level to its target immediately. The click suppressor below
+    // handles the start step additively, so we don't need voice_smooth to ramp
+    // gain from zero (which would dull percussive attacks).
+    c = chan_base + channel * CHAN_FIELDS;
+    vb[V_CLEFT]  = vel * c[C_VOL] * c[C_LPAN];
+    vb[V_CRIGHT] = vel * c[C_VOL] * c[C_RPAN];
+
+    // Seed the cancellation residue from sample[floor(start_pos)] so the first
+    // audible tick outputs raw + residue ≈ 0; residue then decays by click_decay
+    // each tick, revealing the signal without ever multiplying it.
+    seed_idx = 2 * floor(start_pos);
+    vb[V_RESIDUE_L] = -vb[V_START_PTR][seed_idx];
+    vb[V_RESIDUE_R] = -vb[V_START_PTR][seed_idx + 1];
 
     reset_fir(vb + V_FIR_L_BASE);
     reset_fir(vb + V_FIR_R_BASE);
 
-    vb[V_STATE] = VS_PLAYING;
+    vb[V_STATE] = VS_STARTING;
     play_list_append(v_idx);
   );
 );
 
 function voice_release(v_idx)
   local(vb)
-  global(voice_pool_base, VOICE_FIELDS, fade_out_samples,
-         V_STATE, V_FADE_POSITION,
-         VS_PLAYING, VS_FADING_OUT)
+  global(voice_pool_base, VOICE_FIELDS,
+         V_STATE, V_OUTL, V_OUTR, V_RESIDUE_L, V_RESIDUE_R,
+         VS_STARTING, VS_PLAYING, VS_FADING_OUT)
 (
   vb = voice_pool_base + v_idx * VOICE_FIELDS;
-  vb[V_STATE] == VS_PLAYING ? (
-    vb[V_FADE_POSITION] = -fade_out_samples;
+  (vb[V_STATE] == VS_PLAYING || vb[V_STATE] == VS_STARTING) ? (
+    // Capture the current voice output as the decay seed — output continues
+    // from here and tails to zero, leaving no step at note-off.
+    vb[V_RESIDUE_L] += vb[V_OUTL];
+    vb[V_RESIDUE_R] += vb[V_OUTR];
     vb[V_STATE] = VS_FADING_OUT;
   );
 );
 
 function voice_render(v_idx)
-  local(vb, frac, ism1, is0, is1, is2, id0, id1, id2, id3, fade_fraction, read_ptr, sp)
-  global(voice_pool_base, VOICE_FIELDS, fade_in_samples, fade_out_samples,
-         interpolation,
-         V_STATE, V_FADE_POSITION, V_FADE_LEVEL, V_POSITION, V_SPEED,
-         V_START_PTR, V_STOP_POSITION, V_FADE_START,
+  local(vb, frac, ism1, is0, is1, is2, id0, id1, id2, id3, raw_l, raw_r, read_ptr)
+  global(voice_pool_base, VOICE_FIELDS, click_decay, interpolation,
+         V_STATE, V_POSITION, V_SPEED,
+         V_START_PTR, V_STOP_POSITION,
          V_LOOP_START, V_LOOP_STOP, V_LOOP_TYPE,
-         V_OUTL, V_OUTR, V_SINC_TABLE, V_TABLE_LEN, V_AT_BASE_RATE,
+         V_OUTL, V_OUTR, V_RESIDUE_L, V_RESIDUE_R,
+         V_SINC_TABLE, V_TABLE_LEN, V_AT_BASE_RATE,
          V_FIR_L_BASE, V_FIR_R_BASE,
-         VS_FREE, VS_PLAYING, VS_FADING_OUT)
+         VS_FREE, VS_STARTING, VS_PLAYING, VS_FADING_OUT)
 (
   vb = voice_pool_base + v_idx * VOICE_FIELDS;
 
-  // ---------- Envelope / loop / end-detection ----------
-  vb[V_FADE_POSITION] > 0.01 ? (
-    fade_fraction = 1 - (vb[V_FADE_POSITION] - 1) / fade_in_samples;
-    vb[V_FADE_LEVEL] = 10*fade_fraction^3 - 15*fade_fraction^4 + 6*fade_fraction^5;
-    vb[V_FADE_POSITION] -= 1;
-  ) : vb[V_FADE_POSITION] < -0.01 ? (
-    fade_fraction = max(0, 1 + (vb[V_FADE_POSITION] + 1) / fade_out_samples);
-    vb[V_FADE_LEVEL] = 1 - 10*fade_fraction^3 + 15*fade_fraction^4 - 6*fade_fraction^5;
-    vb[V_FADE_POSITION] += 1;
-    (vb[V_FADE_POSITION] == 0 || vb[V_POSITION] > vb[V_STOP_POSITION]) ? (
-      vb[V_STATE] = VS_FREE;     // marks for cleanup in @sample loop
-      vb[V_SPEED] = 0;
-    );
-  ) : vb[V_STATE] == VS_PLAYING ? (
-    vb[V_FADE_LEVEL] = 1;
+  // ---------- Loop wrap / end-of-sample detection ----------
+  vb[V_STATE] == VS_PLAYING ? (
     vb[V_LOOP_START] > 0 ? (
       vb[V_LOOP_TYPE] == 0 ? (
         vb[V_POSITION] > vb[V_LOOP_STOP] ?
@@ -389,73 +393,74 @@ function voice_render(v_idx)
         vb[V_POSITION] > vb[V_LOOP_STOP] ? vb[V_SPEED] = -vb[V_SPEED]
         : vb[V_POSITION] < vb[V_LOOP_START] ? vb[V_SPEED] = abs(vb[V_SPEED]);
       );
-    ) : (
-      sp = vb[V_START_PTR] + 2 * floor(vb[V_POSITION]);
-      ((sp > vb[V_FADE_START]) && (vb[V_SPEED] > 0)) ||
-      ((sp < vb[V_START_PTR] - 2 * vb[V_SPEED] * fade_out_samples) && (vb[V_SPEED] < 0)) ? (
-        vb[V_FADE_POSITION] = -fade_out_samples;
-        vb[V_STATE] = VS_FADING_OUT;
-      );
+    ) : vb[V_POSITION] > vb[V_STOP_POSITION] ? (
+      // Reached end_pos: capture last good output as decay seed, switch to tail.
+      vb[V_RESIDUE_L] += vb[V_OUTL];
+      vb[V_RESIDUE_R] += vb[V_OUTR];
+      vb[V_STATE] = VS_FADING_OUT;
     );
   );
 
-  // ---------- Sample read ----------
-  (vb[V_STATE] == VS_PLAYING || vb[V_STATE] == VS_FADING_OUT) ? (
+  // ---------- Sample read OR fade-out tail ----------
+  (vb[V_STATE] == VS_PLAYING || vb[V_STATE] == VS_STARTING) ? (
     interpolation == 0 ? (
       frac = vb[V_POSITION] - floor(vb[V_POSITION]);
       read_ptr = vb[V_START_PTR] + 2 * floor(vb[V_POSITION]) - 2;
-      vb[V_OUTL] = vb[V_FADE_LEVEL] * (read_ptr[]  * (1 - frac) + frac * read_ptr[2]);
-      vb[V_OUTR] = vb[V_FADE_LEVEL] * (read_ptr[1] * (1 - frac) + frac * read_ptr[3]);
-    ) : interpolation == 1 ? (
-      frac = vb[V_POSITION] - floor(vb[V_POSITION]);
-      read_ptr = vb[V_START_PTR] + 2 * floor(vb[V_POSITION]) - 8;
       ism1 = read_ptr[];  is0 = read_ptr[2]; is1 = read_ptr[4]; is2 = read_ptr[6];
       id0 = is0;
       id1 = 0.5 * (is1 - ism1);
       id2 = ism1 - 2.5*is0 + 2*is1 - 0.5*is2;
       id3 = 0.5 * (is2 - ism1) + 1.5 * (is0 - is1);
-      vb[V_OUTL] = vb[V_FADE_LEVEL] * (((id3*frac + id2)*frac + id1)*frac + id0);
+      raw_l = ((id3*frac + id2)*frac + id1)*frac + id0;
       ism1 = read_ptr[1]; is0 = read_ptr[3]; is1 = read_ptr[5]; is2 = read_ptr[7];
       id0 = is0;
       id1 = 0.5 * (is1 - ism1);
       id2 = ism1 - 2.5*is0 + 2*is1 - 0.5*is2;
       id3 = 0.5 * (is2 - ism1) + 1.5 * (is0 - is1);
-      vb[V_OUTR] = vb[V_FADE_LEVEL] * (((id3*frac + id2)*frac + id1)*frac + id0);
-    ) : interpolation == 2 ? (
-      vb[V_OUTL] = vb[V_FADE_LEVEL] *
-        sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
-                    vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]);
-      vb[V_OUTR] = vb[V_FADE_LEVEL] *
-        sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
-                    vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]);
+      raw_r = ((id3*frac + id2)*frac + id1)*frac + id0;
+    ) : interpolation == 1 ? (
+      raw_l = sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
+                          vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]);
+      raw_r = sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
+                          vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]);
     ) : (
       abs(vb[V_SPEED]) <= 1 ? (
-        vb[V_OUTL] = downsample_fir_step(vb + V_FIR_L_BASE,
-          2 * vb[V_FADE_LEVEL] *
-          sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
-                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]), 0);
-        vb[V_OUTR] = downsample_fir_step(vb + V_FIR_R_BASE,
-          2 * vb[V_FADE_LEVEL] *
-          sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
-                      vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]), 0);
+        raw_l = downsample_fir_step(vb + V_FIR_L_BASE,
+          2 * sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
+                          vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]), 0);
+        raw_r = downsample_fir_step(vb + V_FIR_R_BASE,
+          2 * sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
+                          vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]), 0);
       ) : (
-        vb[V_OUTL] = downsample_fir_step(vb + V_FIR_L_BASE,
-          vb[V_FADE_LEVEL] *
+        raw_l = downsample_fir_step(vb + V_FIR_L_BASE,
           sinc_interp(vb[V_START_PTR], vb[V_POSITION], 0,
                       vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]),
-          vb[V_FADE_LEVEL] *
           sinc_interp(vb[V_START_PTR], vb[V_POSITION] + vb[V_SPEED]/2, 0,
                       vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]));
-        vb[V_OUTR] = downsample_fir_step(vb + V_FIR_R_BASE,
-          vb[V_FADE_LEVEL] *
+        raw_r = downsample_fir_step(vb + V_FIR_R_BASE,
           sinc_interp(vb[V_START_PTR], vb[V_POSITION], 1,
                       vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]),
-          vb[V_FADE_LEVEL] *
           sinc_interp(vb[V_START_PTR], vb[V_POSITION] + vb[V_SPEED]/2, 1,
                       vb[V_SINC_TABLE], vb[V_TABLE_LEN], vb[V_AT_BASE_RATE]));
       );
     );
+
+    vb[V_OUTL] = raw_l + vb[V_RESIDUE_L];
+    vb[V_OUTR] = raw_r + vb[V_RESIDUE_R];
+    vb[V_RESIDUE_L] *= click_decay;
+    vb[V_RESIDUE_R] *= click_decay;
     vb[V_POSITION] += vb[V_SPEED];
+    vb[V_STATE] == VS_STARTING ? vb[V_STATE] = VS_PLAYING;
+
+  ) : vb[V_STATE] == VS_FADING_OUT ? (
+    vb[V_OUTL] = vb[V_RESIDUE_L];
+    vb[V_OUTR] = vb[V_RESIDUE_R];
+    vb[V_RESIDUE_L] *= click_decay;
+    vb[V_RESIDUE_R] *= click_decay;
+    abs(vb[V_RESIDUE_L]) + abs(vb[V_RESIDUE_R]) < 0.00001 ? (
+      vb[V_STATE] = VS_FREE;     // marks for cleanup in @sample loop
+      vb[V_SPEED] = 0;
+    );
   );
 );
 
@@ -760,9 +765,7 @@ preview_request_slot   = -1;    // -1 none, else sample idx to preview at next @
 preview_request_bounds = 0;     // 0 = play full file, 1 = honour SH_START/SH_END
 
 @slider
-fade_in_samples  = 2 ^ fade_in_slider;
-fade_out_samples = 2 ^ fade_out_slider;
-interpolation > 2 ? (pdc_delay = 24; pdc_bot_ch = 0; pdc_top_ch = 2;);
+interpolation > 1 ? (pdc_delay = 24; pdc_bot_ch = 0; pdc_top_ch = 2;);
 // Rebuild in place — sinc_tables_mem reserved SINC_RESERVE floats at @init,
 // so growing into high-quality tables won't disturb the sample heap above it.
 build_all_sinc_tables(sinc_tables_mem);
@@ -869,7 +872,9 @@ while (vit >= 0 && vnit < 4 * N_VOICES) (
   vnit += 1;
 );
 
-// 10 Hz DC blocker
+// 10 Hz steady-state DC / infrasonic HPF. Click suppression is handled
+// per-voice by the residue mechanism in voice_render — this filter only
+// cleans up baked-in DC offset and sub-audible content from source material.
 dc_tmp = ssl;
 ssl -= dc_xL - dc_coeff * dc_yL;
 dc_yL = ssl;
