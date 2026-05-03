@@ -2308,7 +2308,15 @@ function newRenderManager(vm, cm, cmgr, sv)
           drawTracker()
           ImGui.PopFont(ctx)
         elseif mode == 'sample' then
+          -- Push the chrome palette so sv emits text/buttons/borders in
+          -- the toolbar style, and override Col_ChildBg so its inner
+          -- BeginChild panes get the opaque parchment fill (editor.bg)
+          -- rather than ImGui's default dark grey.
+          pushChromeStyles()
+          ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, colour('editor.bg'))
           sv:draw(ctx)
+          ImGui.PopStyleColor(ctx, 1)
+          popChromeStyles()
         end
         ImGui.Unindent(ctx, CHROME_PAD_X)
 

@@ -121,7 +121,7 @@ function Main()
   end)
 
   local vm = newViewManager(tm, cm, cmgr)
-  local sv = newSampleView()
+  local sv = newSampleView(cm, samplerLoadSlot)
   local renderer = newRenderManager(vm, cm, cmgr, sv)
   probeTrackerMode(mm, cm)
   renderer:init()

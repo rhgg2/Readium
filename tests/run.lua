@@ -40,6 +40,7 @@ local specs = {
   'vm_tracker_mode_spec',
   'view_mode_spec',
   'sample_view_spec',
+  'fs_spec',
   'edit_cursor_spec',
   'clipboard_spec',
   'vm_transient_frame_spec',

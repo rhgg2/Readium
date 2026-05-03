@@ -40,6 +40,7 @@ local declarations = {
   -- null-defaulted (declared, no initial value)
   { 'temper',          nil   },
   { 'swing',           nil   },
+  { 'sampleBrowserRoot', nil },
 
   -- table-valued
   { 'colSwing',        {}    },
