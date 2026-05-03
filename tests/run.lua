@@ -35,6 +35,7 @@ local specs = {
   'vm_grid_spec',
   'vm_editing_spec',
   'view_context_spec',
+  'parts_spec',
   'edit_cursor_spec',
   'clipboard_spec',
   'vm_transient_frame_spec',

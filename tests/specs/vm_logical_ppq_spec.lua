@@ -109,7 +109,7 @@ return {
               frame = { swing = nil, colSwing = nil, rpb = 4 } },
           },
         },
-        config = { take = { rowPerBeat = 4 } },
+        config = { take = { rowPerBeat = 4, noteDelay = { [1] = { [1] = true } } } },
       }
       h.vm:setGridSize(80, 40)
 
@@ -183,9 +183,9 @@ return {
       }
       h.vm:setGridSize(80, 40)
 
-      -- Multi-col copy: row 10, cols 1..2 pitch kind.
+      -- Multi-col copy: row 10, cols 1..2 pitch part.
       h.ec:setSelection{ row1=10, row2=10, col1=1, col2=2,
-                          kind1='pitch', kind2='pitch' }
+                          part1='pitch', part2='pitch' }
       h.cmgr.commands.copy()
       h.ec:setPos(4, 1, 1)
       h.cmgr.commands.paste()

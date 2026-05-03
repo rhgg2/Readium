@@ -26,7 +26,7 @@ return {
       }
       h.vm:setGridSize(80, 40)
       -- Col 1 is chan-1 lane-1 note col with delay enabled (7 stops,
-      -- selGroups = {1,1,2,2,3,3,3}). Stop 5 → selGrp 3.
+      -- partAt = {pitch×2, vel×2, delay×3}). Stop 5 → first delay stop.
       h.ec:setPos(1, 1, 5)
       h.cmgr.commands.delete()
 
@@ -195,7 +195,7 @@ return {
     end,
   },
 
-  -- Single-cell pitch delete on a PA cell is a no-op: pitch kind targets
+  -- Single-cell pitch delete on a PA cell is a no-op: pitch part targets
   -- notes only, even when the cell under the cursor is a PA.
   {
     name = 'delete on pitch over a PA cell is a no-op',
@@ -225,7 +225,7 @@ return {
   },
 
   -- Selection pitch delete operates on notes only; PAs in the rectangle
-  -- are left alone (vel-kind delete is the channel for removing PAs).
+  -- are left alone (vel-part delete is the channel for removing PAs).
   -- Host note sits outside the selection so its survival isolates what the
   -- queue function does on its own — no cascade-from-host noise.
   {
@@ -246,7 +246,7 @@ return {
       h.vm:setGridSize(80, 40)
       -- Selection rows 1..3 (ppq [60, 240)) excludes the host note (row 0)
       -- and includes the PA (row 2).
-      h.ec:setSelection{ row1=1, row2=3, col1=1, col2=1, kind1='pitch', kind2='pitch' }
+      h.ec:setSelection{ row1=1, row2=3, col1=1, col2=1, part1='pitch', part2='pitch' }
 
       h.cmgr.commands.deleteSel()
 
@@ -256,7 +256,7 @@ return {
       for _, c in ipairs(dump.ccs) do
         if c.msgType == 'pa' and c.ppq == 120 then stillPA = true end
       end
-      t.truthy(stillPA, 'PA preserved under pitch-kind selection delete')
+      t.truthy(stillPA, 'PA preserved under pitch-part selection delete')
     end,
   },
 
@@ -277,7 +277,7 @@ return {
       }
       h.vm:setGridSize(80, 40)
       -- Rows 1..3 covers the PA cell (row 2) but not the host note (row 0).
-      h.ec:setSelection{ row1=1, row2=3, col1=1, col2=1, kind1='vel', kind2='vel' }
+      h.ec:setSelection{ row1=1, row2=3, col1=1, col2=1, part1='vel', part2='vel' }
 
       h.cmgr.commands.deleteSel()
 
@@ -287,7 +287,7 @@ return {
       for _, c in ipairs(dump.ccs) do
         if c.msgType == 'pa' and c.ppq == 120 then paGone = false end
       end
-      t.truthy(paGone, 'PA in vel-kind selection deleted')
+      t.truthy(paGone, 'PA in vel-part selection deleted')
     end,
   },
 

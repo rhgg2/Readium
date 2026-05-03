@@ -8,7 +8,7 @@ local t = require('support')
 
 return {
 
-  -- 1. collect() over a 1×1 pitch-kind sel returns a single-mode clip
+  -- 1. collect() over a 1×1 pitch-part sel returns a single-mode clip
   -- whose one event carries (row, pitch, vel, endRow) relative to the
   -- selection's top row. Pins the encoding so pasteClip's decoder
   -- (rowToPPQ on r + ce.row) stays compatible.
@@ -92,8 +92,8 @@ return {
         }},
       }
       h.vm:setGridSize(80, 40)
-      -- Select cols 1..3 (each chan's first note col), pitch kind.
-      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=3, kind1='pitch', kind2='pitch' }
+      -- Select cols 1..3 (each chan's first note col), pitch part.
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=3, part1='pitch', part2='pitch' }
 
       local clip = h.clipboard:collect()
       t.eq(clip.mode,       'multi', 'mode')
@@ -124,7 +124,7 @@ return {
         }},
       }
       h.vm:setGridSize(80, 40)
-      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=1, kind1='pitch', kind2='pitch' }
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=1, part1='pitch', part2='pitch' }
 
       local clip = h.clipboard:collect()
       -- Custom fields land in the clip event verbatim.
@@ -173,7 +173,7 @@ return {
       t.truthy(ccCol, 'cc#74 column present in grid')
 
       h.ec:setSelection{ row1=0, row2=0, col1=ccCol, col2=ccCol,
-                         kind1='val', kind2='val' }
+                         part1='val', part2='val' }
 
       local clip = h.clipboard:collect()
       t.eq(clip.events[1].mood, 'blue', 'mood preserved in clip')

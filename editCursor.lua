@@ -28,45 +28,28 @@ function newEditCursor(deps)
     cursorStop = util.clamp(cursorStop, 1, #grid.cols[cursorCol].stopPos)
   end
 
-  ----- Kinds
+  ----- Parts
 
-  local function selGrpAt(col, stop)
+  -- A part is the editable axis at a stop: 'pitch' | 'vel' | 'delay' on
+  -- note cols, 'pb' on pb cols, 'val' on scalar cols (cc/at/pc/pa).
+  -- Decoration stamps col.partAt[stop] (name) and col.partStart[stop]
+  -- (stop index where this stop's part begins) — partStart doubles as the
+  -- ordering primitive when normalising selections within a column.
+
+  local function partAt(col, stop)
     local c = grid.cols[col]
-    return c and c.selGroups[stop] or 1
+    return c and c.partAt and c.partAt[stop] or 'val'
   end
 
-  local function cursorSelGrp() return selGrpAt(cursorCol, cursorStop) end
+  local function cursorPart() return partAt(cursorCol, cursorStop) end
 
-  local function firstStopForSelGrp(col, g)
+  local function firstStopForPart(col, part)
     local c = grid.cols[col]
     if not c then return 1 end
-    for s, gg in ipairs(c.selGroups) do
-      if gg == g then return s end
+    for s, name in ipairs(c.partAt) do
+      if name == part then return s end
     end
     return 1
-  end
-
-  -- Kind is the semantic name for a position's editable axis:
-  --   note col → 'pitch' | 'vel' | 'delay' (selgrp 1/2/3)
-  --   scalar col / missing col → 'val'
-  local NOTE_KIND_BY_SELGRP = { 'pitch', 'vel', 'delay' }
-  local SELGRP_BY_NOTE_KIND = { pitch = 1, vel = 2, delay = 3 }
-
-  local function isNoteCol(col)
-    local c = grid.cols[col]
-    return c and c.type == 'note'
-  end
-
-  local function kindFromSelGrp(col, g)
-    if not isNoteCol(col) then return 'val' end
-    return NOTE_KIND_BY_SELGRP[g] or 'pitch'
-  end
-
-  local function cursorKind() return kindFromSelGrp(cursorCol, selGrpAt(cursorCol, cursorStop)) end
-
-  local function firstStopForKind(col, kind)
-    if not isNoteCol(col) then return 1 end
-    return firstStopForSelGrp(col, SELGRP_BY_NOTE_KIND[kind] or 1)
   end
 
   ----- Selection
@@ -75,8 +58,8 @@ function newEditCursor(deps)
 
   local function selStart()
     selAnchor = { row = cursorRow, col = cursorCol, stop = cursorStop }
-    local g = cursorSelGrp()
-    sel = { row1 = cursorRow, row2 = cursorRow, col1 = cursorCol, col2 = cursorCol, selgrp1 = g, selgrp2 = g }
+    local p = cursorPart()
+    sel = { row1 = cursorRow, row2 = cursorRow, col1 = cursorCol, col2 = cursorCol, part1 = p, part2 = p }
   end
 
   local function selUpdate()
@@ -96,21 +79,31 @@ function newEditCursor(deps)
       if r1 > r2 then r1, r2 = r2, r1 end
     end
 
-    local c1, c2, g1, g2
+    -- The HBlock=2/3 cases need an end-part name that means "everything in
+    -- the col"; selectionStopSpan reads it via name equality, so any name
+    -- that doesn't match a real part falls through to s1=1 / s2=#stopPos.
+    local c1, c2, p1, p2
     if hBlockScope == 2 then
       local chan = grid.cols[cursorCol].midiChan
       c1, c2 = grid.chanFirstCol[chan], grid.chanLastCol[chan]
-      g1, g2 = 1, math.huge
+      p1, p2 = '*', '*'
     elseif hBlockScope == 3 then
       c1, c2 = 1, #grid.cols
-      g1, g2 = 1, math.huge
+      p1, p2 = '*', '*'
     else
       c1, c2 = a.col, cursorCol
-      g1, g2 = selGrpAt(a.col, a.stop), cursorSelGrp()
-      if c1 > c2 then c1, c2, g1, g2 = c2, c1, g2, g1
-      elseif c1 == c2 and g1 > g2 then g1, g2 = g2, g1 end
+      p1, p2 = partAt(a.col, a.stop), cursorPart()
+      if c1 > c2 then c1, c2, p1, p2 = c2, c1, p2, p1
+      elseif c1 == c2 then
+        -- normalise so p1 is at-or-before p2 in this col's parts list,
+        -- via partStart values (lower partStart = earlier part)
+        local col = grid.cols[c1]
+        if col and col.partStart[a.stop] > col.partStart[cursorStop] then
+          p1, p2 = p2, p1
+        end
+      end
     end
-    sel = { row1 = r1, row2 = r2, col1 = c1, col2 = c2, selgrp1 = g1, selgrp2 = g2 }
+    sel = { row1 = r1, row2 = r2, col1 = c1, col2 = c2, part1 = p1, part2 = p2 }
   end
 
   local function selClear()
@@ -218,14 +211,14 @@ function newEditCursor(deps)
       moveUnit(n,
         function()
           cursorStop = 1
-          if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
+          if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].parts == 1 then
             moveStop(1)
             cursorStop = #grid.cols[cursorCol].stopPos
           end
         end,
         function()
           cursorStop = #grid.cols[cursorCol].stopPos
-          if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].selGroups == 1 then
+          if isSticky() and cursorCol == selAnchor.col and #grid.cols[cursorCol].parts == 1 then
             moveStop(1)
             cursorStop = #grid.cols[cursorCol].stopPos
           end
@@ -289,24 +282,20 @@ function newEditCursor(deps)
     selClear()
   end
 
-  ----- Kind & Region
+  ----- Part & Region
 
-  function ec:cursorKind()    return cursorKind() end
+  function ec:cursorPart()    return cursorPart() end
   function ec:hasSelection()  return sel ~= nil end
   function ec:isSticky()      return isSticky() end
 
-  -- The rect to operate on, kind-typed. Internal sel stores selgrp
-  -- (selUpdate / selectionStopSpan need the numeric handle); the public
-  -- boundary speaks kinds. Degenerates to 1x1 at cursor when no selection
-  -- — `hasSelection()` is the bit when that distinction matters.
+  -- The rect to operate on, part-typed. Degenerates to 1x1 at cursor when
+  -- no selection — `hasSelection()` is the bit when that distinction matters.
   function ec:region()
     if sel then
-      return sel.row1, sel.row2, sel.col1, sel.col2,
-             kindFromSelGrp(sel.col1, sel.selgrp1),
-             kindFromSelGrp(sel.col2, sel.selgrp2)
+      return sel.row1, sel.row2, sel.col1, sel.col2, sel.part1, sel.part2
     end
-    local k = cursorKind()
-    return cursorRow, cursorRow, cursorCol, cursorCol, k, k
+    local p = cursorPart()
+    return cursorRow, cursorRow, cursorCol, cursorCol, p, p
   end
 
   -- (col, stop) of the region's top-left corner. Returns a pair so callers
@@ -314,8 +303,7 @@ function newEditCursor(deps)
   -- Degenerates to the cursor's col/stop when no selection.
   function ec:regionStart()
     if not sel then return cursorCol, cursorStop end
-    return sel.col1,
-           firstStopForKind(sel.col1, kindFromSelGrp(sel.col1, sel.selgrp1))
+    return sel.col1, firstStopForPart(sel.col1, sel.part1)
   end
 
   -- Iterator over the cols an op should target: the selection's cols if
@@ -344,28 +332,29 @@ function newEditCursor(deps)
   end
 
   function ec:setSelection(r)
-    local g1 = SELGRP_BY_NOTE_KIND[r.kind1] or 1
-    local g2 = SELGRP_BY_NOTE_KIND[r.kind2] or 1
     sel = { row1 = r.row1, row2 = r.row2, col1 = r.col1, col2 = r.col2,
-            selgrp1 = g1, selgrp2 = g2 }
-    selAnchor = { row = r.row1, col = r.col1, stop = firstStopForSelGrp(r.col1, g1) }
+            part1 = r.part1, part2 = r.part2 }
+    selAnchor = { row = r.row1, col = r.col1, stop = firstStopForPart(r.col1, r.part1) }
     hBlockScope, vBlockScope = 0, 0
   end
 
+  -- Stop range in `col` covered by the current selection. On boundary cols
+  -- we narrow to the boundary part by name; on interior cols (or HBlock=2/3
+  -- whole-channel/whole-row scopes whose part1/part2 don't match any real
+  -- part), the whole col falls through.
   function ec:selectionStopSpan(col)
     if not sel then return nil end
     local c = grid.cols[col]
     if not c then return nil end
     local s1, s2 = 1, #c.stopPos
     if col == sel.col1 then
-      for s, g in ipairs(c.selGroups) do
-        if g >= sel.selgrp1 then s1 = s; break end
+      for s, name in ipairs(c.partAt) do
+        if name == sel.part1 then s1 = s; break end
       end
     end
     if col == sel.col2 then
-      s2 = 1
-      for s = #c.selGroups, 1, -1 do
-        if c.selGroups[s] <= sel.selgrp2 then s2 = s; break end
+      for s = #c.partAt, 1, -1 do
+        if c.partAt[s] == sel.part2 then s2 = s; break end
       end
     end
     return s1, s2
@@ -446,27 +435,53 @@ function newEditCursor(deps)
 
   ----- Decoration
 
-  -- Stamp kind-shape fields onto a half-built grid column. ec owns both
-  -- the shape tables and the field names; addGridCol never names them.
+  -- Stamp shape fields onto a half-built grid column. ec owns the part
+  -- registry, the parts list per col type, and the derived layout
+  -- (stopPos / partAt / partStart / width); addGridCol never names them.
   do
-    local STOPS = {
-      note          = {0,2,4,5},          -- C-4 30
-      noteWithDelay = {0,2,4,5,7,8,9},    -- C-4 30 [040]
-      pb            = {0,1,2,3},
-      cc = {0,1}, pa = {0,1}, at = {0,1}, pc = {0,1},
+    -- Part primitives: char `width` and `stops` (cursor offsets within the
+    -- part). pitch's middle char ('-' between letter and octave) is
+    -- skipped — width 3, only 2 stops.
+    local PARTS = {
+      pitch  = { width = 3, stops = {0, 2}    },   -- C-4
+      vel    = { width = 2, stops = {0, 1}    },   -- 30
+      delay  = { width = 3, stops = {0, 1, 2} },   -- 040
+      pb     = { width = 4, stops = {0, 1, 2, 3} },
+      val    = { width = 2, stops = {0, 1}    },
     }
 
-    local SELGROUPS = {
-      note          = {1,1,2,2},
-      noteWithDelay = {1,1,2,2,3,3,3},
-      pb            = {1,1,1,1},
-      cc = {1,1}, pa = {1,1}, at = {1,1}, pc = {1,1},
-    }
+    -- Parts list per col type. One char of separator sits between adjacent
+    -- parts in the rendered cell.
+    local function partsFor(type, showDelay)
+      if type == 'note' then
+        return showDelay and {'pitch','vel','delay'} or {'pitch','vel'}
+      elseif type == 'pb' then
+        return {'pb'}
+      else
+        return {'val'}
+      end
+    end
 
     function ec:decorateCol(col)
-      local key = (col.type == 'note' and col.showDelay) and 'noteWithDelay' or col.type
-      col.stopPos   = STOPS[key]     or {0}
-      col.selGroups = SELGROUPS[key] or {0}
+      local parts = partsFor(col.type, col.showDelay)
+      col.parts = parts
+
+      local stopPos, partAt, partStart = {}, {}, {}
+      local x = 0
+      for _, name in ipairs(parts) do
+        local p = PARTS[name]
+        local first = #stopPos + 1
+        for _, off in ipairs(p.stops) do
+          util.add(stopPos,   x + off)
+          util.add(partAt,    name)
+          util.add(partStart, first)
+        end
+        x = x + p.width + 1   -- +1 inter-part separator
+      end
+      col.stopPos   = stopPos
+      col.partAt    = partAt
+      col.partStart = partStart
+      col.width     = x - 1   -- last separator was speculative
     end
   end
 
@@ -520,7 +535,7 @@ function newClipboard(deps)
 
   local function collect()
     local ctx = getCtx()
-    local r1, r2, c1, c2, kind1 = ec:region()
+    local r1, r2, c1, c2, part1 = ec:region()
     local numRows  = r2 - r1 + 1
     local logPerRow = ctx:ppqPerRow()
 
@@ -570,9 +585,9 @@ function newClipboard(deps)
       local clipType, events = nil, {}
       local emit
       local chan = col.midiChan
-      if col.type == 'note' and kind1 == 'pitch' then
+      if col.type == 'note' and part1 == 'pitch' then
         clipType, emit = 'note', function(e) return noteEvent(e, chan, endppq) end
-      elseif col.type == 'note' and kind1 == 'vel' then
+      elseif col.type == 'note' and part1 == 'vel' then
         clipType, emit = '7bit', function(e) return velEvent(e, chan) end
       elseif col.type == 'pb' then
         clipType, emit = 'pb',   function(e) return scalarEvent(e, chan) end
@@ -676,7 +691,7 @@ function newClipboard(deps)
     local r = ec:row()
     local startppq = ctx:rowToPPQ(r, chan)
     local endppq = ctx:rowToPPQ(r + clip.numRows, chan)
-    local kind = ec:cursorKind()
+    local part = ec:cursorPart()
     local logPerRow = ctx:ppqPerRow()
     local capRow = r + clip.numRows  -- logical row of endppq
 
@@ -701,7 +716,7 @@ function newClipboard(deps)
     end
     table.sort(events, function(a, b) return a.ppq < b.ppq end)
 
-    if clip.type == 'note' and dstCol.type == 'note' and kind == 'pitch' then
+    if clip.type == 'note' and dstCol.type == 'note' and part == 'pitch' then
       local velList = {}
       for evt in util.between(dstCol.events, startppq, endppq) do
         if evt.pitch and evt.vel > 0 then
@@ -745,7 +760,7 @@ function newClipboard(deps)
       return
     end
 
-    if clip.type == '7bit' and dstCol.type == 'note' and kind == 'vel' then
+    if clip.type == '7bit' and dstCol.type == 'note' and part == 'vel' then
       pasteVelocities(events, dstCol, startppq, endppq)
       return
     end
@@ -771,7 +786,7 @@ function newClipboard(deps)
     local ctx = getCtx()
     local cursor = grid.cols[ec:col()]
     if not cursor then return end
-    -- Notes need a note-col home; other kinds paste wherever, using cursor's
+    -- Notes need a note-col home; other parts paste wherever, using cursor's
     -- channel as the anchor.
     if clip.startType == 'note' and cursor.type ~= 'note' then return end
 

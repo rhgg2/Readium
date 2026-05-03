@@ -252,14 +252,14 @@ return {
     end,
   },
 
-  -- 4b. duplicate's sel path. pasteSingle branches on ec:cursorKind(),
+  -- 4b. duplicate's sel path. pasteSingle branches on ec:cursorPart(),
   -- which reads the stop ec lands on before paste. The invariant is
-  -- that the pre-paste stop shares a kind with sel.col1/kind1 — held
-  -- today by firstStopForKind(c1, kind1), and by the regionStart verb
+  -- that the pre-paste stop shares a part with sel.col1/part1 — held
+  -- today by firstStopForPart(c1, part1), and by the regionStart verb
   -- that replaces it. Pitch and vel probe distinct paste branches;
-  -- together they catch a kind-dispatch regression in the refactor.
+  -- together they catch a part-dispatch regression in the refactor.
   {
-    name = 'duplicateDown with 1x1 pitch-kind sel clones cursor-row note',
+    name = 'duplicateDown with 1x1 pitch-part sel clones cursor-row note',
     run = function(harness)
       local h = mkNoteHarness(harness)
       h.ec:setPos(4, 1, 1)  -- pitch stop
@@ -275,7 +275,7 @@ return {
       end
       t.truthy(orig,  'original preserved at ppq=240')
       t.truthy(clone, 'clone lands at ppq=300 (one row below)')
-      t.eq(clone.pitch, 60, 'pitch-kind paste reproduces pitch')
+      t.eq(clone.pitch, 60, 'pitch-part paste reproduces pitch')
       t.eq(clone.vel,   100)
     end,
   },
@@ -285,10 +285,10 @@ return {
   -- note at the target row, so seed two notes and verify the source vel
   -- is written onto the target note. Pinning this guards against a
   -- regionStart implementation that lands on stop 1 (pitch) instead of
-  -- the first stop of kind1 (vel) — the paste would silently take the
+  -- the first stop of part1 (vel) — the paste would silently take the
   -- pitch branch and blow away the target note.
   {
-    name = 'duplicateDown with 1x1 vel-kind sel copies vel to target-row note',
+    name = 'duplicateDown with 1x1 vel-part sel copies vel to target-row note',
     run = function(harness)
       local h = harness.mk{
         seed = {
@@ -689,7 +689,7 @@ return {
         }},
       }
       h.vm:setGridSize(80, 40)
-      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=3, kind1='pitch', kind2='pitch' }
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=3, part1='pitch', part2='pitch' }
 
       local got = {}
       for col, ci in h.ec:eachSelectedCol() do
@@ -716,7 +716,7 @@ return {
         }},
       }
       h.vm:setGridSize(80, 40)
-      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=2, kind1='pitch', kind2='pitch' }  -- chans 1..2
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=2, part1='pitch', part2='pitch' }  -- chans 1..2
 
       h.vm:showDelay()
       local nd = h.cm:get('noteDelay')
@@ -772,22 +772,22 @@ return {
     end,
   },
 
-  -- Pins the public-boundary contract: ec:region speaks kinds, not
-  -- selgroups. setSelection round-trips a vel-kind sel through region
-  -- and out the other side as kind='vel' (selgrp 2). A regression that
-  -- leaks selgrp through region would surface as kind1=2 here.
+  -- Pins the public-boundary contract: ec:region speaks parts. setSelection
+  -- round-trips a vel-part sel through region and out the other side as
+  -- part='vel'. A regression that leaks an internal selgrp ord through
+  -- region would surface as part1=2 here.
   {
-    name = 'setSelection / region round-trip preserves kind',
+    name = 'setSelection / region round-trip preserves part',
     run = function(harness)
       local h = mkNoteHarness(harness)
-      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=1, kind1='vel', kind2='vel' }
-      local r1, r2, c1, c2, k1, k2 = h.ec:region()
+      h.ec:setSelection{ row1=0, row2=0, col1=1, col2=1, part1='vel', part2='vel' }
+      local r1, r2, c1, c2, p1, p2 = h.ec:region()
       t.eq(r1, 0,     'row1')
       t.eq(r2, 0,     'row2')
       t.eq(c1, 1,     'col1')
       t.eq(c2, 1,     'col2')
-      t.eq(k1, 'vel', 'kind1 emerges as kind, not selgrp')
-      t.eq(k2, 'vel', 'kind2 emerges as kind, not selgrp')
+      t.eq(p1, 'vel', 'part1 emerges as part name')
+      t.eq(p2, 'vel', 'part2 emerges as part name')
     end,
   },
 }

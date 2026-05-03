@@ -352,9 +352,9 @@ function newViewManager(tm, cm, cmgr)
   ----- Show events by column, used by lots of selection ops
 
   local function eventsByCol()
-    local r1, r2, c1, c2, kind1, kind2 = ec:region()
-    local singleNoteKind = (c1 == c2 and kind1 == kind2
-      and grid.cols[c1] and grid.cols[c1].type == 'note') and kind1 or nil
+    local r1, r2, c1, c2, part1, part2 = ec:region()
+    local singleNotePart = (c1 == c2 and part1 == part2
+      and grid.cols[c1] and grid.cols[c1].type == 'note') and part1 or nil
 
     local result = {}
     for ci = c1, c2 do
@@ -369,8 +369,8 @@ function newViewManager(tm, cm, cmgr)
         locs[evt] = evt
       end
 
-      local kind = col.type == 'note' and (singleNoteKind or 'pitch') or 'val'
-      util.add(result, { col = col, locs = locs, kind = kind })
+      local part = col.type == 'note' and (singleNotePart or 'pitch') or 'val'
+      util.add(result, { col = col, locs = locs, part = part })
       ::nextCol::
     end
     return result
@@ -742,9 +742,15 @@ function newViewManager(tm, cm, cmgr)
         return update
       end
 
+      -- Within a part the cursor walks left-to-right (digit 0 = MS char,
+      -- digit (width-1) = LS char). setDigit speaks position-from-LS, so
+      -- the part's char-position is `(width - 1) - digit`.
+      local part  = col.partAt[stop]
+      local digit = stop - col.partStart[stop]
+
       if type == 'note' then
 
-        if stop == 1 then
+        if part == 'pitch' and digit == 0 then
           local nk = cmgr:noteChars(char); if not nk then return end
           local pitch = util.clamp((cm:get('currentOctave') + 1 + nk[2]) * 12 + nk[1], 0, 127)
           local detune = 0
@@ -778,7 +784,7 @@ function newViewManager(tm, cm, cmgr)
           placeNewNote(col, new)
           return commit(pitch, new.vel)
 
-        elseif stop == 2 then
+        elseif part == 'pitch' then  -- octave digit
           if not util.isNote(evt) then return end
           local oct
           if char == string.byte('-') then oct = -1
@@ -792,7 +798,7 @@ function newViewManager(tm, cm, cmgr)
           return commit(pitch, evt.vel)
 
         -- delay: signed decimal milli-QN, 3 digits, ±999
-        elseif stop == 5 or stop == 6 or stop == 7 then
+        elseif part == 'delay' then
           if not util.isNote(evt) then return end
           local old = evt.delay
 
@@ -804,7 +810,7 @@ function newViewManager(tm, cm, cmgr)
             local d = char - string.byte('0')
             if d < 0 or d > 9 then return end
             local sign = old < 0 and -1 or 1
-            local mag  = util.clamp(util.setDigit(math.abs(old), d, 7 - stop, 10, half), 0, 999)
+            local mag  = util.clamp(util.setDigit(math.abs(old), d, 2 - digit, 10, half), 0, 999)
             newDelay = sign * mag
           end
 
@@ -814,10 +820,10 @@ function newViewManager(tm, cm, cmgr)
           return commit()
 
         -- velocity nibble (on note) or PA value
-        else
+        else  -- part == 'vel'
           local d = hexDigit[char]; if not d then return end
           local function newVel(old)
-            return util.clamp(util.setDigit(old, d, 4 - stop, 16, half), 1, 127)
+            return util.clamp(util.setDigit(old, d, 1 - digit, 16, half), 1, 127)
           end
 
           if evt and evt.type == 'pa' then
@@ -850,7 +856,7 @@ function newViewManager(tm, cm, cmgr)
       local update
       if util.oneOf('cc at pc', type) then
         local d = hexDigit[char]; if not d then return end
-        update = { val = util.clamp(util.setDigit(evt and evt.val or 0, d, 2 - stop, 16, half), 0, 127) }
+        update = { val = util.clamp(util.setDigit(evt and evt.val or 0, d, 1 - digit, 16, half), 0, 127) }
       elseif type == 'pb' then
         local old = evt and evt.val or 0
         if char == string.byte('-') then
@@ -860,7 +866,7 @@ function newViewManager(tm, cm, cmgr)
           local d = char - string.byte('0')
           if d < 0 or d > 9 then return end
           local sign = old < 0 and -1 or 1
-          update = { val = sign * util.setDigit(math.abs(old), d, 4 - stop, 10, half) }
+          update = { val = sign * util.setDigit(math.abs(old), d, 3 - digit, 10, half) }
         end
       else
         return
@@ -1121,7 +1127,7 @@ function newViewManager(tm, cm, cmgr)
       end
 
       local col = grid.cols[ec:col()]
-      if not (col and col.type == 'note' and ec:cursorKind() == 'pitch') then return false end
+      if not (col and col.type == 'note' and ec:cursorPart() == 'pitch') then return false end
       local r = ec:row()
       local cursorppq     = ctx:rowToPPQ(r,     col.midiChan)
       local nextCursorPPQ = ctx:rowToPPQ(r + 1, col.midiChan)
@@ -1638,11 +1644,11 @@ function newViewManager(tm, cm, cmgr)
       if newVal ~= evt.val then tm:assignEvent(col.type, evt, { val = newVal }) end
     end
 
-    local function applyNudge(col, evt, kind, dir, coarse, audible)
-      if     kind == 'val'   then nudgeValue(col, evt, dir, coarse)
-      elseif kind == 'vel'   then nudgeVel(evt, dir, coarse)
-      elseif kind == 'delay' then nudgeDelay(col, evt, dir, coarse)
-      elseif kind == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
+    local function applyNudge(col, evt, part, dir, coarse, audible)
+      if     part == 'val'   then nudgeValue(col, evt, dir, coarse)
+      elseif part == 'vel'   then nudgeVel(evt, dir, coarse)
+      elseif part == 'delay' then nudgeDelay(col, evt, dir, coarse)
+      elseif part == 'pitch' then nudgePitch(col, evt, dir, coarse, audible) end
     end
 
     -- First event in col that starts anywhere in the cursor row. For note
@@ -1659,7 +1665,7 @@ function newViewManager(tm, cm, cmgr)
     -- Column-typed nudge. Selection rule: if any note event is selected,
     -- transpose / velocity- / delay-nudge the notes and leave value events
     -- alone; otherwise nudge val on every value event. Solo cursor: first
-    -- event in the cursor row, column- and kind-typed.
+    -- event in the cursor row, column- and part-typed.
     function nudge(dir, coarse)
       if ec:hasSelection() then
         local groups = eventsByCol()
@@ -1675,11 +1681,11 @@ function newViewManager(tm, cm, cmgr)
         end
 
         for _, g in ipairs(groups) do
-          local skip = g.kind == 'val' and anyNote
+          local skip = g.part == 'val' and anyNote
           if not skip then
             for _, e in pairs(g.locs) do
-              if g.kind == 'val' or util.isNote(e) then
-                applyNudge(g.col, e, g.kind, dir, coarse, false)
+              if g.part == 'val' or util.isNote(e) then
+                applyNudge(g.col, e, g.part, dir, coarse, false)
               end
             end
           end
@@ -1691,7 +1697,7 @@ function newViewManager(tm, cm, cmgr)
       local col = grid.cols[ec:col()]
       local evt = cursorRowEvent(col)
       if not evt then return end
-      applyNudge(col, evt, ec:cursorKind(), dir, coarse, true)
+      applyNudge(col, evt, ec:cursorPart(), dir, coarse, true)
       tm:flush()
     end
   end
@@ -1765,7 +1771,7 @@ function newViewManager(tm, cm, cmgr)
       for _, evt in pairs(locs) do tm:deleteEvent(col.type, evt) end
     end
 
-    local DELETE_BY_KIND = {
+    local DELETE_BY_PART = {
       pitch = queueDeleteNotes,
       vel   = queueResetVelocities,
       delay = queueResetDelays,
@@ -1786,14 +1792,14 @@ function newViewManager(tm, cm, cmgr)
         end
         return
       end
-      local kind = col.type == 'note' and ec:cursorKind() or 'val'
-      DELETE_BY_KIND[kind](col, { [evt] = evt })
+      local part = col.type == 'note' and ec:cursorPart() or 'val'
+      DELETE_BY_PART[part](col, { [evt] = evt })
       tm:flush()
     end
 
     function deleteSelection()
       for _, g in ipairs(eventsByCol()) do
-        DELETE_BY_KIND[g.kind](g.col, g.locs)
+        DELETE_BY_PART[g.part](g.col, g.locs)
       end
       tm:flush()
       ec:selClear()
@@ -1814,7 +1820,7 @@ function newViewManager(tm, cm, cmgr)
   local function duplicate(dir)
     local clip = clipboard:collect()
     if not clip then return end
-    local r1, r2, c1, c2, kind1, kind2 = ec:region()
+    local r1, r2, c1, c2, part1, part2 = ec:region()
     local numRows   = r2 - r1 + 1
     local targetRow = dir > 0 and r2 + 1 or r1 - numRows
     local trim      = targetRow < 0 and -targetRow or 0
@@ -1833,7 +1839,7 @@ function newViewManager(tm, cm, cmgr)
     ec:setPos(savedRow + shift, savedCol, savedStop)
     if ec:hasSelection() then
       ec:setSelection{ row1 = targetRow, row2 = targetRow + effRows - 1,
-                       col1 = c1, col2 = c2, kind1 = kind1, kind2 = kind2 }
+                       col1 = c1, col2 = c2, part1 = part1, part2 = part2 }
     end
   end
 
@@ -2056,13 +2062,10 @@ function newViewManager(tm, cm, cmgr)
           label     = LABELS[type] or '',
           events    = events or {},
           showDelay = showDelay,
-          width     = type == 'note' and (showDelay and 10 or 6)
-                   or type == 'pb' and 4
-                   or 2,
           midiChan  = chan,
           cells     = {},
         }
-        ec:decorateCol(gridCol)
+        ec:decorateCol(gridCol)   -- stamps parts/stopPos/partAt/partStart/width
         util.add(grid.cols, gridCol)
         grid.chanFirstCol[chan] = grid.chanFirstCol[chan] or #grid.cols
         grid.chanLastCol[chan]  = #grid.cols

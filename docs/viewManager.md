@@ -79,7 +79,7 @@ Each column:
   lane      = <int>  (note only)    key = lane
   cc        = <int>  (cc only)      key = cc number
   label, events, width,
-  stopPos, selGroups,               -- see below
+  parts, stopPos, partAt, partStart,   -- see below
   showDelay = bool,                 -- note only
   cells     = { [y] = evt },        -- y is 0-indexed row
   overflow  = { [y] = true },       -- >1 event landed on row
@@ -93,37 +93,42 @@ Each column:
 are flagged via `overflow`. `offGrid` marks cells whose snapped row
 disagrees with their intent ppq (swing, delay, or both).
 
-Column widths: note = 6 (10 with delay), pb = 4, everything else = 2.
-
 ## Cursor & selection
 
 The cursor is `(row, col, stop)`. **Stop** indexes into `col.stopPos`,
 the list of character offsets inside the column where the caret can
-sit (e.g. `{0,2,4,5}` for `C-4 30`). **Selgroup** is the semantic axis
-at that stop, read from `col.selGroups[stop]`:
+sit (e.g. `{0,2,4,5}` for `C-4 30`). A column is composed of one or
+more **parts** — contiguous editable axes — listed in order in
+`col.parts`. `col.partAt[stop]` names the part the caret sits in;
+`col.partStart[stop]` is the stop index of the first stop in that
+part, and doubles as the ordering primitive (lower partStart = earlier
+part within the column). `col.width` is the rendered character width.
 
-| type             | stops                  | selgroups           |
-|------------------|------------------------|---------------------|
-| note             | `{0,2,4,5}`            | `{1,1,2,2}`         |
-| note with delay  | `{0,2,4,5,7,8,9}`      | `{1,1,2,2,3,3,3}`   |
-| pb               | `{0,1,2,3}`            | `{1,1,1,1}`         |
-| cc / at / pa / pc| `{0,1}`                | `{1,1}`             |
+| type             | parts                       | stopPos                | partAt                                                | partStart           |
+|------------------|-----------------------------|------------------------|-------------------------------------------------------|---------------------|
+| note             | `{pitch, vel}`              | `{0,2,4,5}`            | `{pitch,pitch,vel,vel}`                               | `{1,1,3,3}`         |
+| note with delay  | `{pitch, vel, delay}`       | `{0,2,4,5,7,8,9}`      | `{pitch,pitch,vel,vel,delay,delay,delay}`             | `{1,1,3,3,5,5,5}`   |
+| pb               | `{pb}`                      | `{0,1,2,3}`            | `{pb,pb,pb,pb}`                                       | `{1,1,1,1}`         |
+| cc / at / pa / pc| `{val}`                     | `{0,1}`                | `{val,val}`                                           | `{1,1}`             |
 
-Note selgroups: 1 = pitch, 2 = velocity, 3 = delay. `(col, selgrp)`
-picks which typed edit a keypress performs (pitch vs velocity vs
-delay) and which clipboard / nudge semantics apply.
+`(col, part)` picks which typed edit a keypress performs (pitch vs
+velocity vs delay) and which clipboard / nudge semantics apply. ec
+owns both the part registry and the parts list per col type;
+`ec:decorateCol(col)` derives all five tables (parts/stopPos/partAt/
+partStart/width) from `col.type` + `col.showDelay`.
 
 A selection extends the caret into a rectangle. Internally:
 
 ```
-sel = { row1, row2, col1, col2, selgrp1, selgrp2 }   -- or nil
+sel = { row1, row2, col1, col2, part1, part2 }   -- or nil
 ```
 
-At the public boundary `ec:region()` returns
-`row1, row2, col1, col2, kind1, kind2` (with cursor-degenerate fallback
+`part1`/`part2` are part names — `'pitch' | 'vel' | 'delay'` on note
+cols, `'pb'` on pb cols, `'val'` on scalar cols. `ec:region()` returns
+`row1, row2, col1, col2, part1, part2` (with cursor-degenerate fallback
 to a 1×1 rect — `ec:hasSelection()` is the bit when that distinction
-matters), and `ec:setSelection{ row1, row2, col1, col2, kind1, kind2 }`
-takes a kind-typed record. selgrps stay internal.
+matters), and `ec:setSelection{ row1, row2, col1, col2, part1, part2 }`
+takes a part-typed record.
 
 `selAnchor` is the fixed end; the cursor is the moving end. Sticky
 block scopes cycle orthogonally:
@@ -149,8 +154,9 @@ ec owns: position (`row/col/pos/setPos/clampPos`),
 motion (`advance` for advance-by; `moveStop/Col/Channel` and
 `cycleHBlock/VBlock/swapEnds` are command-internal), selection
 (`selClear/isSticky/unstick/extendTo/setSelection/shiftSelection/selectChannel/Column/eachSelectedCol`),
-kind (`cursorKind/region/regionStart/selectionStopSpan`),
-grid-column kind decoration (`decorateCol`), lifecycle
+part (`cursorPart/region/regionStart/selectionStopSpan`),
+grid-column part decoration (`decorateCol` — stamps `parts`,
+`stopPos`, `partAt`, `partStart`, `width`), lifecycle
 (`reset/rescaleRow`), and command registration (`registerCommands`).
 Cursor-axis clamping lives in `ec:clampPos`; viewport follow stays
 vm-side because it touches scrollRow/scrollCol and runs through the
@@ -297,7 +303,7 @@ and optionally auditions the new pitch.
 
 The clipboard lives in a `newClipboard` factory in `editCursor.lua`
 (co-located with ec, since clipboard reads ec's region/eachSelectedCol/
-cursorKind to drive collect and paste). vm constructs it once over
+cursorPart to drive collect and paste). vm constructs it once over
 `{ ec, grid, tm, cm, currentFrame, getCtx, getLength }` and exposes it
 via `vm:clipboard()`. Public surface: `collect`, `copy`, `paste`,
 `pasteClip(clip)` (paste a given clip without touching ExtState — used

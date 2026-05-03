@@ -226,8 +226,8 @@ return {
       local col = h.vm.grid.cols[1]
       t.eq(col.type, 'note')
       t.falsy(col.showDelay, 'showDelay off by default')
-      t.deepEq(col.stopPos,   { 0, 2, 4, 5 })
-      t.deepEq(col.selGroups, { 1, 1, 2, 2 })
+      t.deepEq(col.stopPos, { 0, 2, 4, 5 })
+      t.deepEq(col.partAt,  { 'pitch', 'pitch', 'vel', 'vel' })
       t.eq(col.width, 6)
     end,
   },
@@ -244,8 +244,8 @@ return {
       local col = h.vm.grid.cols[1]
       t.eq(col.type, 'note')
       t.truthy(col.showDelay, 'showDelay flag derived from cfg.noteDelay')
-      t.deepEq(col.stopPos,   { 0, 2, 4, 5, 7, 8, 9 })
-      t.deepEq(col.selGroups, { 1, 1, 2, 2, 3, 3, 3 })
+      t.deepEq(col.stopPos, { 0, 2, 4, 5, 7, 8, 9 })
+      t.deepEq(col.partAt,  { 'pitch', 'pitch', 'vel', 'vel', 'delay', 'delay', 'delay' })
       t.eq(col.width, 10)
     end,
   },
