@@ -13,7 +13,7 @@ end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua'
 local ImGui = require 'imgui' '0.10'
 
-function newRenderManager(vm, cm, cmgr)
+function newRenderManager(vm, cm, cmgr, sv)
 
   ---------- PRIVATE
 
@@ -2308,7 +2308,7 @@ function newRenderManager(vm, cm, cmgr)
           drawTracker()
           ImGui.PopFont(ctx)
         elseif mode == 'sample' then
-          ImGui.Text(ctx, 'Sample mode — coming soon.')
+          sv:draw(ctx)
         end
         ImGui.Unindent(ctx, CHROME_PAD_X)
 

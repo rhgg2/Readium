@@ -13,6 +13,7 @@ loadModule('trackerManager')
 loadModule('commandManager')
 loadModule('editCursor')
 loadModule('viewManager')
+loadModule('sampleView')
 loadModule('renderManager')
 
 local function print(...)
@@ -120,13 +121,17 @@ function Main()
   end)
 
   local vm = newViewManager(tm, cm, cmgr)
-  local renderer = newRenderManager(vm, cm, cmgr)
+  local sv = newSampleView()
+  local renderer = newRenderManager(vm, cm, cmgr, sv)
   probeTrackerMode(mm, cm)
   renderer:init()
 
   local function loop()
     probeTrackerMode(mm, cm)
     if cm:get('trackerMode') then readSamplerNames(cm) end
+    if cm:get('viewMode') == 'sample' then
+      sv:setTrack(reaper.GetSelectedTrack(0, 0))
+    end
     if renderer:loop() then
       reaper.defer(loop)
     end
