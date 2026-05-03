@@ -49,6 +49,19 @@ function M.new()
 
   function r.GetMediaItemTake_Item(take) return state.itemForTake[take] end
   function r.GetMediaItemTrack(item)     return state.trackForItem[item] end
+  function r.GetMediaItemTake_Track(take)
+    return state.trackForItem[state.itemForTake[take]]
+  end
+
+  -- Track FX list (used by samplerProbe to decide trackerMode).
+  state.fxByTrack = {}
+  function r.TrackFX_GetCount(track)
+    return #(state.fxByTrack[track] or {})
+  end
+  function r.TrackFX_GetFXName(track, idx)
+    local names = state.fxByTrack[track] or {}
+    return names[idx + 1] ~= nil, names[idx + 1] or ''
+  end
 
   -- Transport / cursor
 
@@ -244,6 +257,9 @@ function M.new()
   function r:bindTake(take, item, track)
     state.itemForTake[take]  = item
     state.trackForItem[item] = track
+  end
+  function r:setTrackFX(track, names)
+    state.fxByTrack[track] = names
   end
   function r:clearCalls()   state.calls = {} end
   function r:clearConsole() state.console = {} end

@@ -14,6 +14,7 @@ loadModule('commandManager')
 loadModule('editCursor')
 loadModule('viewManager')
 loadModule('renderManager')
+loadModule('samplerProbe')
 
 local function print(...)
   return util.print(...)
@@ -46,9 +47,11 @@ function Main()
 
   local vm = newViewManager(tm, cm, cmgr)
   local renderer = newRenderManager(vm, cm, cmgr)
+  probeTrackerMode(mm, cm)
   renderer:init()
 
   local function loop()
+    probeTrackerMode(mm, cm)
     if renderer:loop() then
       reaper.defer(loop)
     end

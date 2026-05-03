@@ -42,7 +42,7 @@ return {
             { ppq = 480, endppq = 720, chan = 1, pitch = 64, vel = 100, detune = 0, delay = 0, sample = 1 },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       t.deepEq(pcsOnChan(h.fm:dump(), 1),
         { { ppq = 0, val = 1 }, { ppq = 240, val = 2 }, { ppq = 480, val = 1 } })
@@ -56,7 +56,7 @@ return {
       -- so the realised onset is 100 + 120 = 220, and the PC must land there.
       local h = harness.mk{
         seed = { notes = {} },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.tm:addEvent('note', {
         ppq = 100, endppq = 300, chan = 1, pitch = 60, vel = 100,
@@ -79,7 +79,7 @@ return {
             { ppq = 240, endppq = 480, chan = 1, pitch = 62, vel = 100, detune = 0, delay = 0, sample = 2 },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       local loc = locOfNote(h.fm, 1, 62)
       h.tm:assignEvent('note', { loc = loc }, { sample = 9 })
@@ -99,7 +99,7 @@ return {
             { ppq = 240, endppq = 480, chan = 1, pitch = 62, vel = 100, detune = 0, delay = 0, sample = 2 },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       local loc = locOfNote(h.fm, 1, 62)
       h.tm:deleteEvent('note', loc)
@@ -126,7 +126,7 @@ return {
             { ppq = 0,   endppq = 240, chan = 2, pitch = 60, vel = 100, detune = 0, delay = 0, sample = 5 },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       local loc = locOfNote(h.fm, 1, 60)
       h.tm:assignEvent('note', { loc = loc }, { sample = 9 })
@@ -161,7 +161,7 @@ return {
           notes = { { ppq = 240, endppq = 480, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 } },
           ccs   = { { ppq = 0,   msgType = 'pc', chan = 1, val = 11 } },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       local n = h.fm:dump().notes[1]
       t.eq(n.sample, 11, 'sample seeded from PC at-or-before realised onset')
@@ -188,7 +188,7 @@ return {
             { ppq = 0, endppq = 480, chan = 1, pitch = 64, vel = 100, detune = 0, delay = 0, sample = 5 },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       -- Both notes share realised ppq 0 → leftmost (lane 1) wins.
       -- Move the lane-2 note off by 100 ppq so it has its own group.
@@ -211,7 +211,7 @@ return {
             { ppq = 0, endppq = 480, chan = 1, pitch = 64, vel = 100, detune = 0, delay = 0, sample = 0xB },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       t.deepEq(pcsOnChan(h.fm:dump(), 1), { { ppq = 0, val = 0xA } })
       local lane1 = laneEvent(h.tm, 1, 1, 1)
@@ -229,7 +229,7 @@ return {
       -- realised lane-2 = 0, realised lane-1 = 100 — distinct groups.
       local h = harness.mk{
         seed = { notes = {} },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.tm:addEvent('note', { ppq = 100, endppq = 480, chan = 1, pitch = 60, vel = 100,
                               detune = 0, delay = 0,    sample = 0xA, lane = 1 })
@@ -255,7 +255,7 @@ return {
             { ppq = 0, endppq = 480, chan = 1, pitch = 64, vel = 100, detune = 0, delay = 0, sample = 0xB },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       local shadowerLoc = locOfNote(h.fm, 1, 60)
       h.tm:deleteEvent('note', shadowerLoc)

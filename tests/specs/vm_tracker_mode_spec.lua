@@ -35,7 +35,7 @@ return {
           notes = { { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 } },
           ccs   = { { ppq = 0, msgType = 'pc', chan = 1, val = 7 } },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.vm:setGridSize(80, 40)
       for _, c in ipairs(h.vm.grid.cols) do
@@ -54,7 +54,7 @@ return {
         seed = {
           notes = { { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100, detune = 0, delay = 0 } },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.vm:setGridSize(80, 40)
       local lane1
@@ -77,7 +77,7 @@ return {
           notes = { { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100,
                       detune = 0, delay = 0, sample = 0 } },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.vm:setGridSize(80, 40)
 
@@ -113,7 +113,7 @@ return {
           notes = { { ppq = 0, endppq = 240, chan = 1, pitch = 60, vel = 100,
                       detune = 0, delay = 0, sample = 0 } },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.vm:setGridSize(80, 40)
       local col
@@ -137,7 +137,7 @@ return {
             { ppq = 0, endppq = 480, chan = 1, pitch = 64, vel = 90,  detune = 0, delay = 0, sample = 0 },
           },
         },
-        config = { track = { trackerMode = true } },
+        config = { transient = { trackerMode = true } },
       }
       h.vm:setGridSize(80, 40)
 
@@ -172,8 +172,8 @@ return {
       local h = harness.mk{
         seed = { notes = {} },
         config = {
-          track = { trackerMode = true },
-          take  = { currentSample = 0x12, currentOctave = 4 },
+          transient = { trackerMode = true },
+          take      = { currentSample = 0x12, currentOctave = 4 },
         },
       }
       h.vm:setGridSize(80, 40)
@@ -209,6 +209,44 @@ return {
       local notes = h.fm:dump().notes
       t.eq(#notes, 1, 'one note placed')
       t.falsy(notes[1].sample, 'no sample field stamped when trackerMode off')
+    end,
+  },
+
+  ----- inputSampleUp / inputSampleDown commands
+
+  {
+    name = 'inputSampleUp increments currentSample',
+    run = function(harness)
+      local h = harness.mk{ config = { take = { currentSample = 5 } } }
+      h.cmgr.commands.inputSampleUp()
+      t.eq(h.cm:get('currentSample'), 6)
+    end,
+  },
+
+  {
+    name = 'inputSampleUp clamps at 127',
+    run = function(harness)
+      local h = harness.mk{ config = { take = { currentSample = 127 } } }
+      h.cmgr.commands.inputSampleUp()
+      t.eq(h.cm:get('currentSample'), 127)
+    end,
+  },
+
+  {
+    name = 'inputSampleDown decrements currentSample',
+    run = function(harness)
+      local h = harness.mk{ config = { take = { currentSample = 5 } } }
+      h.cmgr.commands.inputSampleDown()
+      t.eq(h.cm:get('currentSample'), 4)
+    end,
+  },
+
+  {
+    name = 'inputSampleDown clamps at 0',
+    run = function(harness)
+      local h = harness.mk{ config = { take = { currentSample = 0 } } }
+      h.cmgr.commands.inputSampleDown()
+      t.eq(h.cm:get('currentSample'), 0)
     end,
   },
 }

@@ -425,7 +425,8 @@ in a single `cmgr:registerAll` at construction. Categories:
 - **transport** — `play`, `stop`, `playPause`, `playFromTop/Cursor`
 - **column management** — `addNoteCol`, `hideExtraCol`
 - **display** — `doubleRPB`, `halveRPB`,
-  `matchGridToCursor`, `inputOctaveUp/Down`, `advBy0..9`
+  `matchGridToCursor`, `inputOctaveUp/Down`, `inputSampleUp/Down`,
+  `advBy0..9`
 - **timing** — `setSwingComposite`, `reswingPreset`,
   `setSwingSlot`, `setColSwingSlot`
 - **tuning** — `setTemper`, `setTemperSlot`

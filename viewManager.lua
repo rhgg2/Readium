@@ -1994,6 +1994,8 @@ function newViewManager(tm, cm, cmgr)
     duplicateUp             = function() duplicate(-1) end,
     inputOctaveUp           = function() cm:set('take', 'currentOctave', util.clamp(cm:get('currentOctave')+1, -1, 9)) end,
     inputOctaveDown         = function() cm:set('take', 'currentOctave', util.clamp(cm:get('currentOctave')-1, -1, 9)) end,
+    inputSampleUp           = function() cm:set('take', 'currentSample', util.clamp(cm:get('currentSample')+1,  0, 127)) end,
+    inputSampleDown         = function() cm:set('take', 'currentSample', util.clamp(cm:get('currentSample')-1,  0, 127)) end,
     noteOff                 = noteOff,
     growNote                = function() adjustDuration(1) end,
     shrinkNote              = function() adjustDuration(-1) end,

@@ -16,6 +16,7 @@ Load order is bottom-up through the manager stack:
 ```
 util → configManager → midiManager → trackerManager
      → commandManager → viewManager → renderManager
+     → samplerProbe
 ```
 
 `util` comes first because everything else calls `util.installHooks`
@@ -44,11 +45,15 @@ constructs ec / clipboard from `newEditCursor` / `newClipboard`.
    - `renderer = newRenderManager(vm, cm, cmgr)` — registers rm's UX
      commands (modals, confirms, swing editor, quit), installs the
      default keymap, and creates the ImGui context.
-4. `renderer:init()` opens the window.
-5. A defer loop drives each frame: `renderer:loop()` returns `true`
-   while the script should keep running; `false` / `nil` ends the loop
-   (no explicit quit call needed — returning falsy from the command
-   handler suffices).
+4. `probeTrackerMode(mm, cm)` writes `transient.trackerMode` from the
+   track's FX list before the first rebuild reads it. See
+   `docs/samplerProbe.md`.
+5. `renderer:init()` opens the window.
+6. A defer loop drives each frame: the probe runs again at the top of
+   each tick (cheap; gated on change so it only fires
+   `configChanged` when the FX list actually flips), then
+   `renderer:loop()` returns `true` while the script should keep
+   running; `false` / `nil` ends the loop.
 
 ## Error handling
 

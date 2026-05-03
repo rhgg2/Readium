@@ -89,6 +89,7 @@ local declarations = {
   { 'colour.overflow',         'palette.caution'                  },
   { 'colour.negative',         'palette.danger'                   },
   { 'colour.inactive',         'palette.inactive'                 },
+  { 'colour.shadowed',         'colour.inactive'                  },
   { 'colour.cursor',           'palette.night'                    },
   { 'colour.cursorText',       'palette.nightText'                },
   { 'colour.rowNormal',        {'palette.bg',         0   }       },

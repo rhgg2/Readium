@@ -151,6 +151,8 @@ function newCommandManager(cm)
       hideExtraCol   = { {ImGui.Key_H, ImGui.Mod_Ctrl} },
       inputOctaveUp   = { {ImGui.Key_8, ImGui.Mod_Shift} },
       inputOctaveDown = { ImGui.Key_Slash },
+      inputSampleUp   = { {ImGui.Key_Period, ImGui.Mod_Shift} },  -- '>'
+      inputSampleDown = { {ImGui.Key_Comma,  ImGui.Mod_Shift} },  -- '<'
       playPause      = { ImGui.Key_Space },
       playFromTop    = { ImGui.Key_F6 },
       playFromCursor = { ImGui.Key_F7 },

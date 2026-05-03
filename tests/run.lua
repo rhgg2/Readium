@@ -31,6 +31,7 @@ local specs = {
   'tm_swing_spec',
   'tm_clear_same_key_spec',
   'tm_pc_synthesis_spec',
+  'sampler_probe_spec',
   'timing_period_spec',
   'timing_atoms_spec',
   'vm_grid_spec',

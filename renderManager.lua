@@ -114,22 +114,26 @@ function newRenderManager(vm, cm, cmgr)
     local sampleTxt = showSample and (' ' .. string.format('%02X', evt.sample or 0)) or ''
     local text      = noteTxt .. sampleTxt .. ' ' .. velTxt
 
+    -- Sample digits sit at fixed positions 5,6 (after 'C-4 '). Shadowed
+    -- and negative-delay overrides occupy disjoint ranges, so they coexist.
+    local overrides
+    if showSample and evt.sampleShadowed then
+      overrides = { [5] = 'shadowed', [6] = 'shadowed' }
+    end
+
     if showDelay then
       local d = evt.delay or 0
       if d == 0 then
-        return text .. ' ···'
+        return text .. ' ···', nil, overrides
       end
       text = text .. ' ' .. string.format('%03d', math.abs(d))
-      -- Three delay digits sit at the tail of the composed string.
-      -- Computing positions from #text keeps the override correct
-      -- regardless of upstream parts (sample slot in tracker mode,
-      -- '···' for pa, etc.).
       if d < 0 then
         local n = #text
-        return text, nil, { [n-2] = 'negative', [n-1] = 'negative', [n] = 'negative' }
+        overrides = overrides or {}
+        overrides[n-2], overrides[n-1], overrides[n] = 'negative', 'negative', 'negative'
       end
     end
-    return text
+    return text, nil, overrides
   end
 
   local function renderPB(evt)

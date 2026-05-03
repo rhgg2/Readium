@@ -73,7 +73,8 @@ paint over the tail pixels at the note head and foot.
   for negative pb or delay);
 - `overrides` — `{ [charIdx] = colour }` for per-character colouring
   (note renderer uses it to paint negative-delay digits without tinting
-  the note name).
+  the note name; under `trackerMode`, also dims the sample digits with
+  `shadowed` when `evt.sampleShadowed` is set).
 
 Colour resolution per cell, outermost-wins:
 
