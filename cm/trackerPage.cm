@@ -1,4 +1,4 @@
-@module trackerPage  src=trackerPage.lua  loc=2380  sha=untracked
+@module trackerPage  src=trackerPage.lua  loc=2397  sha=c0fd219
 @deps util, timing
 
 # Module-level constants
@@ -129,6 +129,13 @@
     -- Swing editor
     @api rm:init()
     @api rm:loop()
+    @api rm:bind(take)
+    @api rm:unbind()
+    @api rm:focusState()
+    @api rm:render()
+    @api rm:handleInput()
+    @api rm:save()
+    @api rm:load()
 
   # REAPER API surface
     @reaper ImGui_GetBuiltinPath

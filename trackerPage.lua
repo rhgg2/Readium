@@ -2376,5 +2376,22 @@ function newTrackerPage(vm, cm, cmgr, sv)
     return open and not quitting
   end
 
+  function rm:bind(take)
+    cm:setContext(take)
+  end
+
+  function rm:unbind()
+    cm:setContext(nil)
+  end
+
+  function rm:focusState()
+    return { suppressKbd = modalState ~= nil or pickerActive }
+  end
+
+  function rm:render()    end
+  function rm:handleInput() end
+  function rm:save()      end
+  function rm:load()      end
+
   return rm
 end

@@ -56,6 +56,7 @@ local specs = {
   'vm_quantize_keep_realised_lane_spec',
   'vm_insert_delete_row_lane_spec',
   'vm_take_properties_spec',
+  'tracker_page_spec',
 }
 
 local pass, fail, failures = 0, 0, {}
