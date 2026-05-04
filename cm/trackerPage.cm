@@ -1,4 +1,4 @@
-@module renderManager  src=renderManager.lua  loc=2380  sha=ceefc8e
+@module trackerPage  src=trackerPage.lua  loc=2380  sha=untracked
 @deps util, timing
 
 # Module-level constants
@@ -7,7 +7,7 @@
 # Module-level functions (private)
   @fn print(...)
 
-@factory newRenderManager(vm, cm, cmgr, sv)
+@factory newTrackerPage(vm, cm, cmgr, sv)
 
   # Private state
     @state GUTTER = 4   -- in grid chars

@@ -61,7 +61,7 @@ local declarations = {
   -- its full cm key, optionally overriding alpha. One-off colours that
   -- earn no good function name live inline at the role.
   --
-  -- Entry forms (resolved by renderManager's resolveColour):
+  -- Entry forms (resolved by trackerPage's resolveColour):
   --   {r,g,b,a}     atom — terminal RGBA
   --   'fullKey'     pure alias — recursive cm:get, alpha inherited
   --   {'fullKey',a} alias with alpha override (outermost wins)

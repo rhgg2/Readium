@@ -1,4 +1,10 @@
 -- See docs/midiManager.md for the model and API reference.
+--@cm:invariant channels are 1..16 internally; +1 applied on read from REAPER, -1 on write
+--@cm:invariant locations are 1-indexed snapshots of REAPER event order at load time; not stable across reloads
+--@cm:invariant mm holds the realisation frame — delay already baked into note-on ppq (see docs/timing.md)
+--@cm:invariant mm holds raw pb only; cents/detune conversions and the fake-pb absorber live in tm (see docs/tuning.md)
+--@cm:invariant muted is true-or-absent; false is coerced to nil on every write path; callers pass muted=false to clear
+--@cm:invariant per-event metadata (fields beyond the structural set) is persisted to take extension data via util:serialise; loaded back via util:unserialise on take read
 
 loadModule('util')
 
@@ -6,6 +12,7 @@ local function print(...)
   return util.print(...)
 end
 
+--@cm:invariant chanMsgTypes is derived from chanMsgLUT so the two directions can't drift
 local chanMsgLUT = { pa = 0xA0, cc = 0xB0, pc = 0xC0, at = 0xD0, pb = 0xE0 }
 local chanMsgTypes = {}
 for k, v in pairs(chanMsgLUT) do chanMsgTypes[v] = k end
@@ -40,9 +47,10 @@ function newMidiManager(take)
   local lock       = false
   local pendingSysexDeletes  -- list of uuids; non-nil only inside a modify()
 
+  --@cm:contract INTERNALS fields (idx, uuidIdx) are stripped from all shallow clones returned to callers
   local INTERNALS = { idx = true, uuidIdx = true }
 
-  -- REAPER MIDI_SetCCShape codes 0..5
+  --@cm:invariant shapeNames is derived from shapeLUT so the two directions can't drift
   local shapeLUT = { step = 0, linear = 1, slow = 2, ['fast-start'] = 3, ['fast-end'] = 4, bezier = 5 }
   local shapeNames = {}
   for k, v in pairs(shapeLUT) do shapeNames[v] = k end
@@ -105,6 +113,8 @@ function newMidiManager(take)
     end
   end
 
+  --@cm:shape ccSidecarBody = '}RDM' <typeNib:byte> <chan-1:byte> <id:byte> <val_lo7:byte> <val_hi7:byte> <uuid-base36:string>
+  --@cm:shape noteSidecarBody = 'NOTE <chan-1> <pitch> custom ctm_<uuid-base36>'  -- REAPER text event type 15
   local noteSidecarEncode, noteSidecarDecode, ccSidecarEncode, ccSidecarDecode do
     local SIDECAR_MAGIC = '\x7D\x52\x44\x4D'  -- '}RDM'
     local function idOf(cc) return cc.cc or cc.pitch or 0 end
@@ -178,8 +188,7 @@ function newMidiManager(take)
     return tbl
   end
 
-  -- Stripped when serialising per-event metadata. saveMetadatum picks the
-  -- right set by entry shape (msgType marks a cc).
+  -- saveMetadatum strips these before serialising; msgType presence selects the right set
   local noteEventFields = {
     idx = true, ppq = true, endppq = true, chan = true,
     pitch = true, vel = true, muted = true, uuid = true, uuidIdx = true,
@@ -204,7 +213,7 @@ function newMidiManager(take)
     local strip = evt.msgType and ccEventFields or noteEventFields
     reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_' .. uuidTxt, util.serialise(evt, strip), true)
 
-    -- Ensure this UUID is in the keys list so loadMetadata() finds it on reload
+    -- Ensure uuid is in the keys list so loadMetadata() finds it on reload
     local ok, keysText = reaper.GetSetMediaItemTakeInfo_String(take, 'P_EXT:ctm_keys', '', false)
     if not ok or not keysText or not keysText:find(uuidTxt, 1, true) then
       local keys = (ok and keysText and keysText ~= '') and (keysText .. ',' .. uuidTxt) or uuidTxt
@@ -215,7 +224,6 @@ function newMidiManager(take)
   local function saveMetadata()
     if not take then return end
 
-    -- Collect uuids as both a set (for stale-key check) and a list (for serialisation)
     local newKeys, keyList = {}, {}
     for uuid in pairs(eventsByUuid) do
       local uuidTxt = toBase36(uuid)
@@ -254,6 +262,17 @@ function newMidiManager(take)
   end
 
   ---------- PUBLIC
+
+  --@cm:shape note = { ppq=number, endppq=number, chan=1..16, pitch=0..127, vel=0..127, [muted=true], [uuid=number], [<metadata...>] }
+  --@cm:shape cc   = { ppq=number, msgType=string, chan=1..16, [cc=0..127], [pitch=0..127], val=number, [muted=true], shape=string, [tension=number], [uuid=number], [<metadata...>] }
+  --@cm:shape noteSidecarPayload = { ppq, chan, pitch, droppedCount }          -- notesDeduped event
+  --@cm:shape uuidsReassignedEvent = { ppq, chan, pitch, oldUuid, newUuid }
+  --@cm:shape ccDedupEvent = { ppq, chan, msgType, cc, pitch, droppedCount }   -- ccsDeduped event
+  --@cm:shape reconcileEvent.valueRebound    = { kind, uuid, chan, msgType, [cc], [pitch], ppq, oldVal, newVal }
+  --@cm:shape reconcileEvent.consensusRebound = { kind, uuid, chan, msgType, [cc], [pitch], ppq, offset }
+  --@cm:shape reconcileEvent.guessedRebound  = { kind, uuid, chan, msgType, [cc], [pitch], ppq }
+  --@cm:shape reconcileEvent.ambiguous       = { kind, uuid, candidateppqs={...} }
+  --@cm:shape reconcileEvent.orphaned        = { kind, uuid, chan, msgType, [cc], [pitch], lastppq }
 
   local mm = {}
   local fire = util.installHooks(mm)
@@ -432,6 +451,7 @@ function newMidiManager(take)
     ----- clones; what's left in `sidecars` after stage 4 is unmatched
     ----- and queued for deletion.
     if next(ccSidecars) then
+      --@cm:contract stage-3 consensus threshold: winning offset must have ≥ max(2, ceil(0.5 × bucketSize)) votes and be unique (no tie)
       local THRESHOLD_FRAC, THRESHOLD_MIN = 0.5, 2
       local scsWorking, ccsWorking = util.clone(ccSidecars), util.clone(ccs)
       local scBuckets, ccBuckets
@@ -622,11 +642,19 @@ function newMidiManager(take)
     ----- Persist + signals
     saveMetadata()
 
+    --@cm:contract signal order per load: takeSwapped → notesDeduped → uuidsReassigned → ccsDeduped → ccsReconciled → reload
+    --@cm:contract dedup/reconcile signals fire only when at least one event of that kind is present
+    --@cm:emits takeSwapped    -- nil; only when load received a different take
     if takeSwapped           then fire('takeSwapped',     nil) end
+    --@cm:emits notesDeduped   -- { events = [{ppq, chan, pitch, droppedCount}, ...] }
     if #noteDedupEvents > 0  then fire('notesDeduped',    { events = noteDedupEvents }) end
+    --@cm:emits uuidsReassigned -- { events = [{ppq, chan, pitch, oldUuid, newUuid}, ...] }
     if #reassignEvents > 0   then fire('uuidsReassigned', { events = reassignEvents })  end
+    --@cm:emits ccsDeduped     -- { events = [{ppq, chan, msgType, cc, pitch, droppedCount}, ...] }
     if #ccDedupEvents > 0    then fire('ccsDeduped',      { events = ccDedupEvents })   end
+    --@cm:emits ccsReconciled  -- { events = [reconcileEvent, ...] }; five kinds: valueRebound/consensusRebound/guessedRebound/ambiguous/orphaned
     if #reconcileEvents > 0  then fire('ccsReconciled',   { events = reconcileEvents }) end
+    --@cm:emits reload         -- nil; every load, including after modify()
     fire('reload', nil)
   end
 
@@ -638,15 +666,17 @@ function newMidiManager(take)
 
   ----- Locking
 
+  --@cm:contract all write paths (add*, delete*, assign* structural) must run inside mm:modify(fn)
+  --@cm:contract modify disables MIDI sort, runs fn under lock, flushes pending sidecar deletes, re-sorts, then reloads (fires callbacks)
   local function checkLock()
     assert(lock, 'Error! You must call modification functions via modify()!')
     return true
   end
 
-  -- Resolve pending sidecar deletes by walking REAPER's live sysex array
-  -- and matching uuids. Avoids the stale-uuidIdx trap when multiple deletes
-  -- (or a note delete's cascaded notation event) shift sysex idxs during
-  -- fn. Sort idxs desc so deleting one doesn't invalidate the next.
+  -- Resolve pending sidecar deletes by walking REAPER's live sysex array and
+  -- matching uuids. Avoids the stale-uuidIdx trap: a mid-fn sidecar insert
+  -- shifts idxs, so uuidIdx values stamped before the insert point at the
+  -- wrong sysex. Sorting desc means each delete doesn't invalidate the next.
   local function flushPendingSysexDeletes()
     if not pendingSysexDeletes or #pendingSysexDeletes == 0 then return end
     local toDelete = {}
@@ -699,6 +729,7 @@ function newMidiManager(take)
     end
   end
 
+  --@cm:contract deleteNote relies on REAPER to cascade-delete the associated notation event; the cascade shifts sysex idxs, which is why flushPendingSysexDeletes re-scans by uuid rather than using cached uuidIdx
   function mm:deleteNote(loc)
     if not (take and checkLock()) then return end
 
@@ -706,22 +737,19 @@ function newMidiManager(take)
     if not note then return end
 
     reaper.MIDI_DeleteNote(take, note.idx)
-
-    -- clean up internal tables
     eventsByUuid[note.uuid] = nil
     notes[loc] = nil
   end
 
+  --@cm:contract assignNote metadata-only carve-out: if t touches none of {ppq,endppq,pitch,vel,chan,muted}, skips the lock and writes straight to extension data
   function mm:assignNote(loc, t)
     if not take then return end
 
     if not (t.ppq or t.endppq or t.pitch or t.vel or t.chan or t.muted ~= nil) then
-      -- just metadata, allow without lock
       local note = notes[loc]
       if not note then return end
 
       util.assign(note, t)
-
       saveMetadatum(note.uuid)
       return
     end
@@ -747,6 +775,7 @@ function newMidiManager(take)
     saveMetadatum(note.uuid)
   end
 
+  --@cm:contract addNote always allocates a uuid and inserts a notation event (unconditional, unlike addCC)
   function mm:addNote(t)
     if not (take and checkLock()) then return end
 
@@ -830,13 +859,14 @@ function newMidiManager(take)
     return msg2, msg3
   end
 
+  --@cm:contract assignCC metadata-only carve-out: if t touches none of the structural CC fields AND the cc already has a uuid, skips the lock
+  --@cm:contract first metadata stamp on a plain cc (no uuid yet) requires the lock — it inserts a sidecar sysex, which is a structural mutation
   function mm:assignCC(loc, t)
     if not take then return end
 
     local msg = ccs[loc]
     if not msg then return end
 
-    -- ccEventFields is the structural set; any other key is metadata.
     local hasStructural = t.ppq or t.msgType or t.chan or t.cc or t.pitch
                           or t.val or t.muted ~= nil or t.shape or t.tension
     local hasMetadata = false
@@ -844,7 +874,6 @@ function newMidiManager(take)
       if not ccEventFields[k] then hasMetadata = true; break end
     end
 
-    -- Lockless metadata-only carve-out (mirrors assignNote).
     if not hasStructural and msg.uuid then
       util.assign(msg, t)
       saveMetadatum(msg.uuid)
@@ -898,6 +927,7 @@ function newMidiManager(take)
     if msg.uuid then saveMetadatum(msg.uuid) end
   end
 
+  --@cm:contract addCC lazy-sidecar: uuid and sidecar allocated only if t carries any non-structural key; plain ccs skip allocation entirely
   function mm:addCC(t)
     if not (take and checkLock()) then return end
 
@@ -1040,7 +1070,8 @@ function newMidiManager(take)
     local result = {}
     local count = reaper.CountTempoTimeSigMarkers(0)
 
-    -- find the last marker at or before the take start for the initial time sig
+    -- Scan for the last time-sig marker at or before take start; fall back to
+    -- TimeMap_GetTimeSigAtTime if none precedes it (covers takes at project start).
     local initNum, initDenom
     for i = 0, count - 1 do
       local _, pos, _, _, _, num, denom, _ = reaper.GetTempoTimeSigMarker(0, i)
@@ -1049,7 +1080,6 @@ function newMidiManager(take)
       end
     end
 
-    -- fall back to project default if no marker precedes the take
     if not initNum then
       local num, denom, _ = reaper.TimeMap_GetTimeSigAtTime(0, startTime)
       initNum, initDenom = num, denom

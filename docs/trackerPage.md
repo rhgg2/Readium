@@ -1,6 +1,6 @@
-# renderManager
+# trackerPage
 
-ImGui rendering and input for one viewManager. Owns no tracker state; pulls
+ImGui rendering and input for one trackerView. Owns no tracker state; pulls
 everything from `vm` each frame and routes all writes back through `vm` or
 `cmgr.commands`.
 
@@ -184,7 +184,7 @@ and a `toRow` that depends on the modifier:
 
 `vm:moveLaneEvent(col, i, toRow, toVal)` is the only write surface;
 identity-by-index survives the per-frame flush via the ppq clamp (see
-`docs/viewManager.md`). Drag ends when the button releases.
+`docs/trackerView.md`). Drag ends when the button releases.
 
 ## Input
 
@@ -360,7 +360,7 @@ One-off colours that earn no good function name (the yellow editCursor,
 faded steel, faded red) live inline at the role rather than as palette
 atoms.
 
-`renderManager.resolveColour(key)` chases the chain to an atom, raising
+`trackerPage.resolveColour(key)` chases the chain to an atom, raising
 on cycles or unknown keys. The `colour(name)` wrapper takes a bare role
 name, prepends the `colour.` namespace, resolves, and caches the U32 by
 role name. The cache invalidates on `'configChanged'`, so a palette edit
@@ -394,7 +394,7 @@ are derived on the first frame and held.
 ### Construction & lifecycle
 
 ```
-newRenderManager(vm, cm, cmgr)
+newTrackerPage(vm, cm, cmgr)
 rm:init()    -- create ImGui context + font; call once
 rm:loop()   -> false when the user closes the window; true otherwise
 ```

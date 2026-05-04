@@ -39,7 +39,7 @@ boundary with neighbours.
 |------------------|-------------------------------|------------------------------------------------------------------------------------------------|
 | `midiManager`    | realisation                   | none — REAPER's storage frame                                                                  |
 | `trackerManager` | intent (public surface), realisation (`um` and rebuild) | `tidyCol` strips delay on read; `um:add/assignEvent` restores it on write to mm |
-| `viewManager`    | intent (timing math), logical (authoring stamps) | `ctx:ppqToRow` / `ctx:rowToPPQ` run swing; `stamping` records `ppqL` on authored events     |
+| `trackerView`    | intent (timing math), logical (authoring stamps) | `ctx:ppqToRow` / `ctx:rowToPPQ` run swing; `stamping` records `ppqL` on authored events     |
 | `editCursor`     | logical (rows)                | none — talks to vm in row units                                                                |
 
 The two conversion boundaries:

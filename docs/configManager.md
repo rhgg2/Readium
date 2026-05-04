@@ -49,7 +49,7 @@ one they contribute nothing to the merge.
 
 `transient` is the most-specific tier and never persists. It is reserved
 for view-layer overrides that should auto-vanish when the script
-reloads (e.g. `viewManager`'s match-grid-to-cursor frame override). On
+reloads (e.g. `trackerView`'s match-grid-to-cursor frame override). On
 `setContext` the transient cache reloads to empty along with the rest.
 
 ## Storage backends
@@ -88,7 +88,7 @@ cm fires one signal, `'configChanged'`. Payload shape varies by call site:
 
 - `{ key = <name>, level = <level> }` — targeted writes (`set`, `remove`).
   Consumers can filter on the keys they depend on, and on `level` to
-  distinguish their own writes from others' (`viewManager` uses this to
+  distinguish their own writes from others' (`trackerView` uses this to
   skip self-release on its own transient-tier writes).
 - `{ level = <level> }` — bulk `assign` (keyless).
 - `{}` — `setContext` reload. No `level`; treat as "any key may have changed".

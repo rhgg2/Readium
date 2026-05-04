@@ -4,7 +4,7 @@
 -- vm-integration tests live in vm_grid_spec.
 
 local t = require('support')
-require('viewManager')        -- registers global newViewContext
+require('trackerView')        -- registers global newViewContext
 
 ---------- BUILDERS
 

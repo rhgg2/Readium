@@ -1,4 +1,4 @@
--- See docs/viewManager.md for the model and API reference.
+-- See docs/trackerView.md for the model and API reference.
 
 loadModule('util')
 

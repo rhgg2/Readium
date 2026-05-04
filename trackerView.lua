@@ -1,4 +1,4 @@
--- See docs/viewManager.md for the model and API reference.
+-- See docs/trackerView.md for the model and API reference.
 
 loadModule('util')
 loadModule('midiManager')
@@ -116,7 +116,7 @@ function newViewContext(args)
   return ctx
 end
 
-function newViewManager(tm, cm, cmgr)
+function newTrackerView(tm, cm, cmgr)
 
   ---------- PRIVATE
 
@@ -513,7 +513,7 @@ function newViewManager(tm, cm, cmgr)
     cm:set('track', 'rowPerBeat', n)
   end
 
-  -- Apply a take-properties dialog submission. Rows are a viewManager concept;
+  -- Apply a take-properties dialog submission. Rows are a trackerView concept;
   -- convert here, then hand the structural change to tm.
   -- props = { name, rows, mode = 'resize'|'rescale'|'tile' }; mode defaults to 'resize'.
   function vm:applyTakeProperties(props)
@@ -1875,7 +1875,7 @@ function newViewManager(tm, cm, cmgr)
   function vm:ec()        return ec end
   function vm:clipboard() return clipboard end
 
-  ----- Accessors for renderManager
+  ----- Accessors for trackerPage
 
   function vm:rowPerBar()      return rowPerBar end
   function vm:takeName()       return tm:name() end
@@ -1891,7 +1891,7 @@ function newViewManager(tm, cm, cmgr)
     return ts.num, ts.denom
   end
 
-  ----- Non-command callbacks from renderManager
+  ----- Non-command callbacks from trackerPage
 
   function vm:setGridSize(w, h)
     gridWidth, gridHeight = w, h

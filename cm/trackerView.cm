@@ -1,4 +1,4 @@
-@module viewManager  src=viewManager.lua  loc=2255  sha=4e70ca0
+@module trackerView  src=trackerView.lua  loc=2255  sha=1a802ec
 @deps util, midiManager, trackerManager, tuning, commandManager, editCursor
 
 # Module-level functions (private)
@@ -98,7 +98,7 @@
     -- Frames & timing
     @api vm:setRowPerBeat(n)
     @api vm:applyTakeProperties(props)
-        -- Apply a take-properties dialog submission. Rows are a viewManager concept;
+        -- Apply a take-properties dialog submission. Rows are a trackerView concept;
         -- convert here, then hand the structural change to tm.
         -- props = { name, rows, mode = 'resize'|'rescale'|'tile' }; mode defaults to 'resize'.
     @api vm:setSwingSlot(name)
@@ -161,7 +161,7 @@
     -- Duplicate
     @api vm:ec()
     @api vm:clipboard()
-    -- Accessors for renderManager
+    -- Accessors for trackerPage
     @api vm:rowPerBar()
     @api vm:takeName()
     @api vm:activeTemper()
@@ -172,7 +172,7 @@
     @api vm:rowToPPQ(row, chan)
     @api vm:sampleCurve(A, B, ppq)
     @api vm:timeSig()
-    -- Non-command callbacks from renderManager
+    -- Non-command callbacks from trackerPage
     @api vm:setGridSize(w, h)
     -- Columns
     @api vm:addExtraCol(type, cc)
@@ -191,7 +191,7 @@
     @reaper time_precise
     @reaper StuffMIDIMessage
     @reaper ShowMessageBox
-@factory newViewManager(tm, cm, cmgr)
+@factory newTrackerView(tm, cm, cmgr)
 
   # Private state
     @state swing = args.swing
@@ -285,7 +285,7 @@
     -- Frames & timing
     @api vm:setRowPerBeat(n)
     @api vm:applyTakeProperties(props)
-        -- Apply a take-properties dialog submission. Rows are a viewManager concept;
+        -- Apply a take-properties dialog submission. Rows are a trackerView concept;
         -- convert here, then hand the structural change to tm.
         -- props = { name, rows, mode = 'resize'|'rescale'|'tile' }; mode defaults to 'resize'.
     @api vm:setSwingSlot(name)
@@ -348,7 +348,7 @@
     -- Duplicate
     @api vm:ec()
     @api vm:clipboard()
-    -- Accessors for renderManager
+    -- Accessors for trackerPage
     @api vm:rowPerBar()
     @api vm:takeName()
     @api vm:activeTemper()
@@ -359,7 +359,7 @@
     @api vm:rowToPPQ(row, chan)
     @api vm:sampleCurve(A, B, ppq)
     @api vm:timeSig()
-    -- Non-command callbacks from renderManager
+    -- Non-command callbacks from trackerPage
     @api vm:setGridSize(w, h)
     -- Columns
     @api vm:addExtraCol(type, cc)

@@ -20,11 +20,11 @@ wrap existing commands without threading through the dispatch loop.
 
 ```
 newCommandManager(cm)                  -- empty commands + empty keymap
-  → newViewManager(tm, cm, cmgr)       -- vm registers editing commands;
+  → newTrackerView(tm, cm, cmgr)        -- vm registers editing commands;
                                        --   ec / clipboard self-register
                                        --   navigation + clipboard commands;
                                        --   then vm applies wrap(...)
-  → newRenderManager(vm, cm, cmgr)     -- rm registers UX commands and
+  → newTrackerPage(vm, cm, cmgr)       -- rm registers UX commands and
                                        --   calls installDefaultKeymap(ImGui)
 ```
 

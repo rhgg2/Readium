@@ -1,8 +1,8 @@
-# viewManager
+# trackerView
 
 Projects tm's channel/column tree onto a 2D display grid, owns cursor /
 selection / clipboard, and exposes the editing command surface. Produces
-`vm.grid` for rm to read each frame; does no ImGui work itself.
+`vm.grid` for trackerPage to read each frame; does no ImGui work itself.
 
 ## viewContext
 
@@ -478,7 +478,7 @@ vm then applies three families of `cmgr:wrap`:
 ### Construction & lifecycle
 
 ```
-newViewManager(tm, cm, cmgr)   -- wires callbacks on tm/cm and rebuilds
+newTrackerView(tm, cm, cmgr)   -- wires callbacks on tm/cm and rebuilds
 vm:rebuild(changed)            -- manual rebuild; defaults to { take=false, data=true }
 vm:tick()                      -- called each frame by rm; kills stale audition
 ```

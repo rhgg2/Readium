@@ -8,7 +8,7 @@ sampler JSFX (driven via gmem mailboxes).
 ## Identity model
 
 Sample mode keys against a **REAPER track**, not a take. The track is
-chosen explicitly through the toolbar picker drawn by `renderManager`,
+chosen explicitly through the toolbar picker drawn by `trackerPage`,
 which lists tracks carrying the Continuum Sampler FX (supplied by the
 `listSamplerTracks` injection from `continuum.lua`). On entry to
 sample mode `continuum.lua` defaults the picked track to the parent
@@ -64,7 +64,7 @@ sv:getSelectedFile()      → path | nil
 sv:loadSelectedIntoCurrent() → bool   -- false if no file selected
 sv:auditionPath(path)     → bool      -- false if path is nil
 sv:auditionSlot(idx)      → ()        -- always with bounds=1
-sv:draw(ctx)              → ()        -- entry point from renderManager
+sv:draw(ctx)              → ()        -- entry point from trackerPage
 ```
 
 `auditionPath` and `auditionSlot` are thin enough that their bodies are

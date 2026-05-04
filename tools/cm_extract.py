@@ -36,6 +36,14 @@ RETURN_TBL_RE = re.compile(r"^\s*return\s+(\w+)\s*$")
 INVERSE_RE = re.compile(
     r"for\s+\w+\s*,\s*\w+\s+in\s+pairs\(\s*(\w+)\s*\)\s+do\s+(\w+)\[\w+\]\s*=\s*\w+\s+end"
 )
+# --@cm:KIND BODY  or  --@cm?:KIND BODY
+CM_ANN_RE = re.compile(r"^\s*--@cm(\??):(\w+)\s+(.*?)\s*$")
+EMITS_BODY_RE = re.compile(r"^(\w+)\s*(?:--\s*(.*))?$")
+
+ATTACH_GAP = 3   # max line gap between an annotation and the element it attaches to
+
+
+Annotation = tuple[str, str, bool]   # (kind, body, has_question)
 
 
 @dataclass
@@ -47,6 +55,16 @@ class Block:
     args: str = ''
     line: int = 0
     doc: list[str] = field(default_factory=list)
+    annotations: list[Annotation] = field(default_factory=list)
+
+
+@dataclass
+class Decl:
+    name: str
+    init: str = ''
+    line: int = 0
+    inline_doc: str = ''
+    annotations: list[Annotation] = field(default_factory=list)
 
 
 @dataclass
@@ -59,21 +77,31 @@ class CmFile:
     factories: list[Block] = field(default_factory=list)
     module_fns: list[Block] = field(default_factory=list)
     module_api: list[Block] = field(default_factory=list)   # function TBL.X(...)
-    module_consts: list[tuple[str, str]] = field(default_factory=list)
+    module_consts: list[Decl] = field(default_factory=list)
     private_fns: list[Block] = field(default_factory=list)   # inside factory
-    private_state: list[tuple[str, str, str]] = field(default_factory=list)  # (name, init, doc)
+    private_state: list[Decl] = field(default_factory=list)
     methods: list[Block] = field(default_factory=list)       # mm:foo
     method_owner: str = ''
     sections: list[tuple[int, int, str]] = field(default_factory=list)  # (line, indent, label)
     signals: list[str] = field(default_factory=list)
     reaper_calls: list[str] = field(default_factory=list)
+    module_annotations: list[Annotation] = field(default_factory=list)
+    factory_annotations: list[Annotation] = field(default_factory=list)
+    shape_annotations: list[Annotation] = field(default_factory=list)
+    signal_payloads: dict[str, str] = field(default_factory=dict)
+    pending_annotations: list[tuple[int, str, str, bool]] = field(default_factory=list)
 
 
 def collect_doc(lines: list[str], i: int) -> list[str]:
-    """Walk backwards from line i collecting contiguous comment lines."""
+    """Walk backwards from line i collecting contiguous comment lines.
+    Skips --@cm: annotation lines (they're collected separately and rendered
+    as structured entries; including them here would duplicate the content)."""
     out: list[str] = []
     j = i - 1
     while j >= 0:
+        if CM_ANN_RE.match(lines[j]):
+            j -= 1
+            continue
         m = COMMENT_RE.match(lines[j])
         if not m:
             break
@@ -112,6 +140,18 @@ def parse(path: Path) -> CmFile:
 
     for i, raw in enumerate(lines):
         if not raw.strip():
+            continue
+
+        # --@cm[?]?:KIND BODY  — accumulate; attached after parse by line proximity
+        ma = CM_ANN_RE.match(raw)
+        if ma:
+            has_q = ma.group(1) == '?'
+            kind, body = ma.group(2), ma.group(3)
+            cm.pending_annotations.append((i + 1, kind, body, has_q))
+            if kind == 'emits':
+                em = EMITS_BODY_RE.match(body)
+                if em:
+                    cm.signal_payloads[em.group(1)] = (em.group(2) or '').strip()
             continue
 
         # loadModule deps
@@ -208,7 +248,8 @@ def parse(path: Path) -> CmFile:
                             inline_doc = tail
                     if len(init) > 60:
                         init = init[:57] + '...'
-                    cm.private_state.append((md.group(2), init, inline_doc))
+                    cm.private_state.append(Decl(name=md.group(2), init=init,
+                                                  line=i + 1, inline_doc=inline_doc))
 
         # module-level constants (indent 0, before factory)
         if not in_factory:
@@ -217,23 +258,80 @@ def parse(path: Path) -> CmFile:
                 init = md.group(3).strip()
                 if len(init) > 80:
                     init = init[:77] + '...'
-                cm.module_consts.append((md.group(2), init))
+                cm.module_consts.append(Decl(name=md.group(2), init=init, line=i + 1))
 
         # Loop-built inverse: `for k,v in pairs(Y) do X[v]=k end`
-        # Rewrites a prior `@const X = {}` entry to "inverse of Y".
+        # Rewrites a prior @const X = {} entry to "inverse of Y" (module or private).
         mi = INVERSE_RE.search(raw)
         if mi:
             src_tbl, dst_tbl = mi.group(1), mi.group(2)
-            for j, (name, init) in enumerate(cm.module_consts):
-                if name == dst_tbl and init == '{}':
-                    cm.module_consts[j] = (name, f'-- inverse of {src_tbl}')
+            for d in cm.module_consts:
+                if d.name == dst_tbl and d.init == '{}':
+                    d.init = f'-- inverse of {src_tbl}'
+                    break
+            for d in cm.private_state:
+                if d.name == dst_tbl and d.init == '{}':
+                    d.init = f'-- inverse of {src_tbl}'
                     break
 
+    attach_annotations(cm)
     return cm
+
+
+def attach_annotations(cm: CmFile) -> None:
+    """Attach pending annotations to nearest following structural element.
+
+    Rules:
+      - shape  → always rendered standalone (under # Shapes), never attached.
+      - emits  → consumed into cm.signal_payloads during parse; not attached.
+      - other (contract, invariant) → attach to next element with line ≥ ann_line
+        and (target.line - ann_line) ≤ ATTACH_GAP. Otherwise drop into module_annotations
+        (if before factory) or factory_annotations (if inside, unattached).
+    """
+    targets: list = []
+    targets.extend(cm.module_consts)
+    targets.extend(cm.private_state)
+    targets.extend(cm.factories)
+    targets.extend(cm.methods)
+    targets.extend(cm.module_fns)
+    targets.extend(cm.module_api)
+    targets.extend(cm.private_fns)
+    targets.sort(key=lambda t: t.line)
+
+    factory_line = cm.factories[0].line if cm.factories else 10**9
+
+    for ann_line, kind, body, has_q in cm.pending_annotations:
+        if kind == 'emits':
+            continue
+        if kind == 'shape':
+            cm.shape_annotations.append((kind, body, has_q))
+            continue
+        target = None
+        for t in targets:
+            if t.line >= ann_line:
+                target = t
+                break
+        if target and target.line - ann_line <= ATTACH_GAP:
+            target.annotations.append((kind, body, has_q))
+        elif ann_line < factory_line:
+            cm.module_annotations.append((kind, body, has_q))
+        else:
+            cm.factory_annotations.append((kind, body, has_q))
 
 
 def fmt_args(args: str) -> str:
     return f"({args})" if args else "()"
+
+
+def fmt_ann(ann: Annotation) -> str:
+    kind, body, q = ann
+    mark = '?' if q else ''
+    return f"@cm{mark}:{kind}  {body}"
+
+
+def emit_annotations(out: list[str], anns: list[Annotation], indent: str) -> None:
+    for ann in anns:
+        out.append(f"{indent}{fmt_ann(ann)}")
 
 
 def emit(cm: CmFile) -> str:
@@ -245,13 +343,19 @@ def emit(cm: CmFile) -> str:
         add(f"@deps {', '.join(cm.deps)}")
     add('')
 
+    if cm.module_annotations:
+        add("# Invariants & contracts (module)")
+        emit_annotations(out, cm.module_annotations, '  ')
+        add('')
+
     if cm.module_consts:
         add("# Module-level constants")
-        for name, init in cm.module_consts:
-            if init.startswith('--'):
-                add(f"  @const {name}   {init}")
+        for d in cm.module_consts:
+            if d.init.startswith('--'):
+                add(f"  @const {d.name}   {d.init}")
             else:
-                add(f"  @const {name} = {init}")
+                add(f"  @const {d.name} = {d.init}")
+            emit_annotations(out, d.annotations, '      ')
         add('')
 
     if cm.module_fns:
@@ -261,14 +365,15 @@ def emit(cm: CmFile) -> str:
             if f.doc:
                 line += f"   -- {' '.join(f.doc)[:80]}"
             add(line)
+            emit_annotations(out, f.annotations, '      ')
         add('')
 
     if cm.module_api:
         # Resolve `local M = <alias>` to <alias>.X for legibility.
         alias_target: str | None = None
-        for name, init in cm.module_consts:
-            if init and init.isidentifier():
-                alias_target = init
+        for d in cm.module_consts:
+            if d.init and d.init.isidentifier():
+                alias_target = d.init
                 break
         owners = sorted({(alias_target if a.owner == 'M' and alias_target else a.owner)
                          for a in cm.module_api})
@@ -281,6 +386,7 @@ def emit(cm: CmFile) -> str:
             if f.doc:
                 for d in f.doc:
                     add(f"      -- {d}")
+            emit_annotations(out, f.annotations, '      ')
         add('')
 
     for fac in cm.factories:
@@ -288,17 +394,28 @@ def emit(cm: CmFile) -> str:
         if fac.doc:
             for d in fac.doc:
                 add(f"  -- {d}")
+        emit_annotations(out, fac.annotations, '  ')
+        emit_annotations(out, cm.factory_annotations, '  ')
+
+        if cm.shape_annotations:
+            add("")
+            add("  # Shapes")
+            for ann in cm.shape_annotations:
+                _, body, q = ann
+                mark = '?' if q else ''
+                add(f"    @shape{mark}  {body}")
 
         if cm.private_state:
             add("")
             add("  # Private state")
-            for name, init, doc in cm.private_state:
-                head = f"    @state {name}"
-                if init:
-                    head += f" = {init}"
-                if doc:
-                    head += f"   -- {doc}"
+            for d in cm.private_state:
+                head = f"    @state {d.name}"
+                if d.init:
+                    head += f" = {d.init}"
+                if d.inline_doc:
+                    head += f"   -- {d.inline_doc}"
                 add(head)
+                emit_annotations(out, d.annotations, '        ')
 
         if cm.private_fns:
             add("")
@@ -308,6 +425,7 @@ def emit(cm: CmFile) -> str:
                 if f.doc:
                     line += f"   -- {' '.join(f.doc)[:90]}"
                 add(line)
+                emit_annotations(out, f.annotations, '        ')
 
         if cm.methods:
             add("")
@@ -343,6 +461,7 @@ def emit(cm: CmFile) -> str:
                 if m.doc:
                     for d in m.doc:
                         add(f"        -- {d}")
+                emit_annotations(out, m.annotations, '        ')
                 for sec in inside:
                     add(f"        · {sec[2]}")
 
@@ -350,7 +469,11 @@ def emit(cm: CmFile) -> str:
             add("")
             add("  # Signals emitted (via util.installHooks)")
             for s in cm.signals:
-                add(f"    @emits {s}")
+                payload = cm.signal_payloads.get(s)
+                if payload:
+                    add(f"    @emits {s}   -- {payload}")
+                else:
+                    add(f"    @emits {s}")
 
         if cm.reaper_calls:
             add("")

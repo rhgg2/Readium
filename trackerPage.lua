@@ -1,4 +1,4 @@
--- See docs/renderManager.md for the model and API reference.
+-- See docs/trackerPage.md for the model and API reference.
 
 loadModule('util')
 loadModule('timing')
@@ -13,7 +13,7 @@ end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua'
 local ImGui = require 'imgui' '0.10'
 
-function newRenderManager(vm, cm, cmgr, sv)
+function newTrackerPage(vm, cm, cmgr, sv)
 
   ---------- PRIVATE
 

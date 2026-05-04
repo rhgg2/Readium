@@ -1,5 +1,5 @@
-@module continuum  src=continuum.lua  loc=288  sha=d066917
-@deps util, configManager, midiManager, trackerManager, commandManager, editCursor, viewManager, slotStore, sampleView, renderManager
+@module continuum  src=continuum.lua  loc=288  sha=d35b052
+@deps util, configManager, midiManager, trackerManager, commandManager, editCursor, trackerView, slotStore, sampleView, trackerPage
 
 # Module-level constants
   @const SAMPLER_FX = 'Continuum Sampler'

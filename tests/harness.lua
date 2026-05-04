@@ -1,4 +1,4 @@
--- Pure-Lua test harness for trackerManager and viewManager. Stubs out
+-- Pure-Lua test harness for trackerManager and trackerView. Stubs out
 -- REAPER and midiManager; loads the real tm/vm/cm modules unchanged.
 --
 -- Caller sets package.path (see run.lua) before requiring this module.
@@ -23,7 +23,7 @@ require('tuning')
 require('configManager')
 require('trackerManager')
 require('commandManager')
-require('viewManager')
+require('trackerView')
 
 -- Build a fresh scenario. Keys:
 --   seed      : seed payload for the fake mm (notes, ccs, resolution, length, timeSigs)
@@ -57,7 +57,7 @@ function harness.mk(opts)
 
   local tm = newTrackerManager(mm, cm)
   local cmgr = newCommandManager(cm)
-  local vm = newViewManager(tm, cm, cmgr)
+  local vm = newTrackerView(tm, cm, cmgr)
 
   return { fm = mm, cm = cm, tm = tm, vm = vm, ec = vm:ec(),
            clipboard = vm:clipboard(), cmgr = cmgr, reaper = fakeReaper }
